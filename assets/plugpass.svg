@@ -1,0 +1,11 @@
+<svg width="16" height="16" viewBox="0 0 16 16" fill="none" xmlns="http://www.w3.org/2000/svg">
+<g clip-path="url(#plugpass-clip)">
+<path d="M6 12.0004H0.5C0.22399 12.0004 0.000214804 11.7764 0 11.5004V10.0004C0 9.72426 0.223858 9.5004 0.5 9.5004H6V12.0004ZM6 6.5004H0.5C0.22399 6.5004 0.000214804 6.27636 0 6.0004V4.5004C0 4.22426 0.223858 4.0004 0.5 4.0004H6V6.5004Z" fill="#6C48FF"/>
+<path d="M14.2988 8L6 14.0352V1.96387L14.2988 8Z" fill="#6C48FF" stroke="#6C48FF" stroke-width="2"/>
+</g>
+<defs>
+<clipPath id="plugpass-clip">
+<rect width="16" height="16" fill="white"/>
+</clipPath>
+</defs>
+</svg>

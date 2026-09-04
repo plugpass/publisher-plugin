@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "plugpass-publisher": {
+      "type": "http",
+      "url": "https://publisher.plugpass.ai/mcp"
+    }
+  }
+}

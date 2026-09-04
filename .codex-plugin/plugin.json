@@ -1,0 +1,20 @@
+{
+  "name": "plugpass",
+  "version": "0.0.0",
+  "description": "Monetize your AI plugins.",
+  "author": { "name": "Plugpass" },
+  "license": "LicenseRef-Plugpass-Publisher-Plugin-1.0",
+  "skills": "./skills/",
+  "mcpServers": "./.mcp.json",
+  "interface": {
+    "displayName": "Plugpass",
+    "developerName": "Plugpass",
+    "category": "Productivity",
+    "capabilities": ["Read", "Write", "Edit", "Bash"],
+    "shortDescription": "Monetize your AI plugins.",
+    "longDescription": "Monetize your AI plugins with Plugpass.\n\nPlugpass will help you get users, limit features, and earn subscriptions.\n\nRun $plugpass-sync-plugin to get started.",
+    "composerIcon": "./assets/plugpass.svg",
+    "logo": "./assets/plugpass.svg",
+    "logoDark": "./assets/plugpass.svg"
+  }
+}
