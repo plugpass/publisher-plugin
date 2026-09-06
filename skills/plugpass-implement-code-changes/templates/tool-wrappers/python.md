@@ -1,6 +1,6 @@
 # Python scaffolding template
 
-The developer's server becomes an **OAuth-protected resource server** using the official MCP SDK's built-in auth: a `TokenVerifier` + `AuthSettings` make FastMCP serve the RFC 9728 PRM document itself and answer `/mcp` requests without a valid bearer with the `401` + `WWW-Authenticate` challenge (`error="invalid_token"`, `resource_metadata="…"` — the exact shape MCP clients key OAuth discovery off). Standalone source, no platform package. Version pins: **`mcp>=1.28.1,<2`** (v2 is imminent and breaks FastMCP/auth surfaces — the `<2` pin is load-bearing), `pyjwt[crypto]>=2.13.0`, `httpx`.
+The publisher's server becomes an **OAuth-protected resource server** using the official MCP SDK's built-in auth: a `TokenVerifier` + `AuthSettings` make FastMCP serve the RFC 9728 PRM document itself and answer `/mcp` requests without a valid bearer with the `401` + `WWW-Authenticate` challenge (`error="invalid_token"`, `resource_metadata="…"` — the exact shape MCP clients key OAuth discovery off). Standalone source, no platform package. Version pins: **`mcp>=1.28.1,<2`** (v2 is imminent and breaks FastMCP/auth surfaces — the `<2` pin is load-bearing), `pyjwt[crypto]>=2.13.0`, `httpx`.
 
 **Two structural decisions carry the whole design — never undo them:**
 
@@ -94,9 +94,11 @@ class PlugpassTokenVerifier:
 # Result: {"status": "ok", "remaining": int|None}
 #       | {"status": "reauth_required"}
 #       | {"status": "non_authorized", "result_text": str}
+#       | {"status": "unavailable"}   ← Plugpass could not answer; the caller GRANTS
 # 5s timeout PER ATTEMPT, with ONE retry after a 2s backoff on a transport
-# error or a 5xx — a transient upstream blip must not surface as a denial; 4xx
-# are terminal and never retried.
+# error or a 5xx; 4xx are terminal and never retried. Every failure past that
+# maps to "unavailable": the call is server-to-server from this host, so the end
+# user cannot have caused it.
 async def entitlement(bearer: str, body: dict, op: str, cfg: PlugpassConfig) -> dict:
     for attempt in range(2):
         try:
@@ -114,12 +116,18 @@ async def entitlement(bearer: str, body: dict, op: str, cfg: PlugpassConfig) -> 
             if attempt == 0:
                 await asyncio.sleep(2)
                 continue
-            raise
+            return {"status": "unavailable"}
+        except Exception:
+            return {"status": "unavailable"}
         if res.status_code == 401:
             return {"status": "reauth_required"}
-        res.raise_for_status()  # non-200 → the caller's unavailable deny (never fail open)
-        return res.json()
-    raise RuntimeError("unreachable")
+        if res.status_code != 200:
+            return {"status": "unavailable"}
+        try:
+            return res.json()
+        except Exception:
+            return {"status": "unavailable"}
+    return {"status": "unavailable"}
 
 
 def non_authorized_text(result: dict) -> str:
@@ -129,7 +137,10 @@ def non_authorized_text(result: dict) -> str:
     return str(result["result_text"])
 
 
-UNAVAILABLE_DENY = "<the unavailable deny text from TOOLS.md>"
+# The check proxy's unavailable grant — Plugpass could not answer, so the check
+# grants and the paid skill runs. A wrapped tool needs no equivalent: it just
+# runs its body.
+UNAVAILABLE_CHECK_GRANT = "<the unavailable grant text from TOOLS.md>"
 
 
 class ReauthTo401Middleware:
@@ -217,15 +228,14 @@ async def check_premium_access(
 ) -> str:
     request = ctx.request_context.request
     bearer = request.user.access_token.token
-    try:
-        result = await entitlement(
-            bearer,
-            {"plugin_id": plugin_id,
-             "feature_id": feature_id, "plugin_version": plugin_version},
-            "check_premium_access", cfg,
-        )
-    except Exception:
-        return UNAVAILABLE_DENY
+    result = await entitlement(
+        bearer,
+        {"plugin_id": plugin_id,
+         "feature_id": feature_id, "plugin_version": plugin_version},
+        "check_premium_access", cfg,
+    )
+    if result["status"] == "unavailable":
+        return UNAVAILABLE_CHECK_GRANT
     if result["status"] == "reauth_required":
         request.state.plugpass_reauth_required = True   # → transport-level 401 via the middleware
         return "Re-authentication required."            # discarded by the swap
@@ -245,24 +255,22 @@ async def check_premium_access(
 async def paid_tool(..., ctx: Context) -> str:
     request = ctx.request_context.request
     sub = request.user.access_token.subject
-    try:
-        result = await entitlement(
-            request.user.access_token.token,
-            {"plugin_id": "<plugin-plugpass-id>", "feature_id": "<plugpass_id>"},
-            "track_usage", cfg,
-        )
-    except Exception:
-        return UNAVAILABLE_DENY
+    result = await entitlement(
+        request.user.access_token.token,
+        {"plugin_id": "<plugin-plugpass-id>", "feature_id": "<plugpass_id>"},
+        "track_usage", cfg,
+    )
     if result["status"] == "reauth_required":
         request.state.plugpass_reauth_required = True
         return "Re-authentication required."
-    if result["status"] != "ok":
+    if result["status"] == "non_authorized":
         return non_authorized_text(result)
-    # ...existing tool body — keyed / scoped to `sub`...
+    # ...existing tool body — keyed / scoped to `sub`; "unavailable" consumed
+    # nothing and grants...
 ```
 
-**Paired-tool add side** (`operation: add`): same shape but `feature_id: "<custom-entitlement-plugpass-id>"` (the add tool's `database_record.custom_entitlement_id` — its `custom_` prefix carries the feature type; **not** `database_record.plugpass_id`, and **not** the tool's own `_meta` id), always **`check_remaining`**, passing the user's current count from the developer's own store (scoped to `sub`) as `current_count` — see TOOLS.md → Reading the user's current count.
+**Paired-tool add side** (`operation: add`): same shape but `feature_id: "<custom-entitlement-plugpass-id>"` (the add tool's `database_record.custom_entitlement_id` — its `custom_` prefix carries the feature type; **not** `database_record.plugpass_id`, and **not** the tool's own `_meta` id), always **`check_remaining`**, passing the user's current count from the publisher's own store (scoped to `sub`) as `current_count` — see TOOLS.md → Reading the user's current count.
 
 **Identity tool** (the paired remove side, or any per-user free tool): no Entitlement API call — read `ctx.request_context.request.user.access_token.subject` and scope the body to it.
 
-**Placement guidance.** A FastMCP server keeps its existing tool modules; the verifier + middleware live in `premium_feature_access_check.py`; the entry file gains the `FastMCP(...)` auth kwargs + the two-line app assembly. When the developer mounts the MCP app inside a larger Starlette/FastAPI app instead, `Mount("/…", mcp.streamable_http_app())` works but the **parent** app's lifespan must run `mcp.session_manager.run()`, and the reauth middleware wraps the parent. Invariants regardless of layout: `stateless_http=True, json_response=True`; `resource_server_url` includes `/mcp`; wrapped tools keep `meta={"plugpass_component_id": …}`, declare `structured_output=False`, and never declare an output schema.
+**Placement guidance.** A FastMCP server keeps its existing tool modules; the verifier + middleware live in `premium_feature_access_check.py`; the entry file gains the `FastMCP(...)` auth kwargs + the two-line app assembly. When the publisher mounts the MCP app inside a larger Starlette/FastAPI app instead, `Mount("/…", mcp.streamable_http_app())` works but the **parent** app's lifespan must run `mcp.session_manager.run()`, and the reauth middleware wraps the parent. Invariants regardless of layout: `stateless_http=True, json_response=True`; `resource_server_url` includes `/mcp`; wrapped tools keep `meta={"plugpass_component_id": …}`, declare `structured_output=False`, and never declare an output schema.

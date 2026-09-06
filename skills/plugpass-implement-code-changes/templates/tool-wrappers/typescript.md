@@ -1,6 +1,6 @@
 # TypeScript scaffolding template
 
-The developer's server becomes an **OAuth-protected resource server**: every `/mcp` request carries `Authorization: Bearer …`, validated locally against Plugpass's JWKS with `jose`; requests without a valid bearer get the `401` + `WWW-Authenticate` challenge; the RFC 9728 PRM document serves at `/.well-known/oauth-protected-resource/mcp`. Emitted as standalone source in the dev's repo (no platform-package dependency). Version pins: `@modelcontextprotocol/sdk` **^1.29.0 (stay on 1.x — v2 splits the packages and breaks this surface)**, `jose` ^6.2.3 (Node ≥ 20 or Workers), `@hono/mcp` ^0.3.0 for Hono servers, `zod` (v3.25+ or v4).
+The publisher's server becomes an **OAuth-protected resource server**: every `/mcp` request carries `Authorization: Bearer …`, validated locally against Plugpass's JWKS with `jose`; requests without a valid bearer get the `401` + `WWW-Authenticate` challenge; the RFC 9728 PRM document serves at `/.well-known/oauth-protected-resource/mcp`. Emitted as standalone source in the publisher's repo (no platform-package dependency). Version pins: `@modelcontextprotocol/sdk` **^1.29.0 (stay on 1.x — v2 splits the packages and breaks this surface)**, `jose` ^6.2.3 (Node ≥ 20 or Workers), `@hono/mcp` ^0.3.0 for Hono servers, `zod` (v3.25+ or v4).
 
 **Two structural decisions carry the whole design — never undo them:**
 
@@ -100,7 +100,10 @@ export type EntitlementResult =
   // result_text is the complete server-composed check result — emitted
   // VERBATIM as the tool's text (never parsed or re-serialized).
   | { status: 'non_authorized'; result_text: string }
-  | { status: 'reauth_required' };
+  | { status: 'reauth_required' }
+  // Plugpass could not answer. Server-to-server from this host, so the end user
+  // cannot have caused it: the caller GRANTS, having consumed nothing.
+  | { status: 'unavailable' };
 
 // One POST attempt per call is not enough: a transient upstream blip (a worker
 // reload, a brief network fault) must not surface as a denial. Each request
@@ -126,18 +129,22 @@ export async function entitlementPost(url: string, bearer: string, body: unknown
 
 // POSTs to `${entitlementApiOrigin}/entitlement/${op}` forwarding the request's
 // bearer via entitlementPost (5s timeout per attempt, one 2s-backoff retry
-// on a thrown request or a 5xx). A 401 maps to reauth; any other non-200
-// throws, which the wrapper surfaces as the unavailable deny — never fail open.
+// on a thrown request or a 5xx). A 401 maps to reauth; every other failure maps
+// to `unavailable`, which grants.
 export async function entitlement(
   bearer: string,
   body: { plugin_id: string; feature_id: string; current_count?: number },
   op: 'check_remaining' | 'track_usage',
   cfg: PlugpassConfig,
 ): Promise<EntitlementResult> {
-  const res = await entitlementPost(`${cfg.entitlementApiOrigin}/entitlement/${op}`, bearer, body);
-  if (res.status === 401) return { status: 'reauth_required' };
-  if (!res.ok) throw new Error(`entitlement ${op}: ${res.status}`);
-  return (await res.json()) as EntitlementResult;
+  try {
+    const res = await entitlementPost(`${cfg.entitlementApiOrigin}/entitlement/${op}`, bearer, body);
+    if (res.status === 401) return { status: 'reauth_required' };
+    if (!res.ok) return { status: 'unavailable' };
+    return (await res.json()) as EntitlementResult;
+  } catch {
+    return { status: 'unavailable' };
+  }
 }
 
 // non_authorized → result_text verbatim — a single-field pipe (the trigger keys
@@ -149,8 +156,11 @@ export function nonAuthorizedToolResponse(r: Extract<EntitlementResult, { status
   return { content: [{ type: 'text', text: r.result_text }] };
 }
 
-export function unavailableToolResponse(): CallToolResult {
-  return { isError: true, content: [{ type: 'text', text: '<the unavailable deny text from TOOLS.md>' }] };
+// The check proxy's unavailable grant — Plugpass could not answer, so the check
+// grants and the paid skill runs. A wrapped tool needs no equivalent: it just
+// runs its body.
+export function unavailableCheckGrant(): CallToolResult {
+  return { content: [{ type: 'text', text: '<the unavailable grant text from TOOLS.md>' }] };
 }
 ```
 
@@ -242,7 +252,7 @@ export function registerCheckPremiumAccess(server: McpServer, cfg: PlugpassConfi
     },
     async (args, extra) => {
       const bearer = extra.authInfo?.token;
-      if (!bearer) return unavailableToolResponse(); // unreachable behind the gate; fail closed
+      if (!bearer) return unavailableCheckGrant(); // unreachable behind the gate
       try {
         const res = await entitlementPost(
           `${cfg.entitlementApiOrigin}/entitlement/check_premium_access`,
@@ -250,12 +260,12 @@ export function registerCheckPremiumAccess(server: McpServer, cfg: PlugpassConfi
           args
         );
         if (res.status === 401) { reauth.triggered = true; return { content: [{ type: 'text', text: 'Re-authentication required.' }] }; }
-        if (!res.ok) return unavailableToolResponse();
+        if (!res.ok) return unavailableCheckGrant();
         const data = (await res.json()) as { status: 'ok'; result_text: string } | { status: 'reauth_required' };
         if (data.status === 'reauth_required') { reauth.triggered = true; return { content: [{ type: 'text', text: 'Re-authentication required.' }] }; }
         return { content: [{ type: 'text', text: data.result_text }] }; // verbatim — byte-identical to the native tool
       } catch {
-        return unavailableToolResponse();
+        return unavailableCheckGrant();
       }
     },
   );
@@ -277,23 +287,19 @@ server.registerTool(
   },
   async (args, extra) => {
     const auth = extra.authInfo;
-    if (!auth?.token) return unavailableToolResponse();
-    const sub = auth.extra?.sub as string;
-    let r: EntitlementResult;
-    try {
-      r = await entitlement(auth.token, { plugin_id: '<plugin-plugpass-id>', feature_id: '<plugpass_id>' }, 'track_usage', cfg);
-    } catch {
-      return unavailableToolResponse();
-    }
+    const sub = auth?.extra?.sub as string;
+    const r: EntitlementResult = auth?.token
+      ? await entitlement(auth.token, { plugin_id: '<plugin-plugpass-id>', feature_id: '<plugpass_id>' }, 'track_usage', cfg)
+      : { status: 'unavailable' };
     if (r.status === 'reauth_required') { reauth.triggered = true; return { content: [{ type: 'text', text: 'Re-authentication required.' }] }; }
-    if (r.status !== 'ok') return nonAuthorizedToolResponse(r);
-    /* …existing tool body — keyed / scoped to `sub`… */
+    if (r.status === 'non_authorized') return nonAuthorizedToolResponse(r);
+    /* …existing tool body — keyed / scoped to `sub`; `unavailable` consumed nothing and grants… */
   },
 );
 ```
 
-**Paired-tool add side** (`operation: add`): same shape, but `feature_id: '<custom-entitlement-plugpass-id>'` (the add tool's `database_record.custom_entitlement_id` — its `custom_` prefix carries the feature type; **not** `database_record.plugpass_id`, and **not** the tool's own `_meta` id), always **`check_remaining`**, passing the user's current count from the developer's own store (scoped to `sub`) as `current_count` — see TOOLS.md → Reading the user's current count.
+**Paired-tool add side** (`operation: add`): same shape, but `feature_id: '<custom-entitlement-plugpass-id>'` (the add tool's `database_record.custom_entitlement_id` — its `custom_` prefix carries the feature type; **not** `database_record.plugpass_id`, and **not** the tool's own `_meta` id), always **`check_remaining`**, passing the user's current count from the publisher's own store (scoped to `sub`) as `current_count` — see TOOLS.md → Reading the user's current count.
 
 **Identity tool** (the paired remove side, or any per-user free tool): no Entitlement API call at all — read `extra.authInfo.extra.sub` and scope the body to it. Zero Plugpass round-trips.
 
-**Placement guidance.** Adapt to the developer's structure: a Hono/Workers server follows the reference shape above; an express or bare-`node:http` server uses the `getRequestListener` variant. Whatever the layout, the invariants are: the gate covers every `/mcp` method; the PRM route is unauthenticated; `enableJsonResponse: true` on every transport construction; the reauth check sits between `handleRequest` resolving and the response being returned; wrapped tools keep `_meta.plugpass_component_id` and lose any `outputSchema`.
+**Placement guidance.** Adapt to the publisher's structure: a Hono/Workers server follows the reference shape above; an express or bare-`node:http` server uses the `getRequestListener` variant. Whatever the layout, the invariants are: the gate covers every `/mcp` method; the PRM route is unauthenticated; `enableJsonResponse: true` on every transport construction; the reauth check sits between `handleRequest` resolving and the response being returned; wrapped tools keep `_meta.plugpass_component_id` and lose any `outputSchema`.

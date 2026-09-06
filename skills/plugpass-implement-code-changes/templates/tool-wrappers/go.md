@@ -1,6 +1,6 @@
 # Go scaffolding template
 
-The developer's server becomes an **OAuth-protected resource server** using the official SDK's `auth` package: `auth.RequireBearerToken` gates `/mcp` (emitting the `WWW-Authenticate` challenge with `resource_metadata`), `auth.ProtectedResourceMetadataHandler` serves the RFC 9728 PRM document, and a custom `TokenVerifier` does the local JWKS validation. Standalone source, no platform package. Version pins: `github.com/modelcontextprotocol/go-sdk` **v1.6.1** (v1.7.0 is pre-release for the next protocol — stay on stable), `github.com/golang-jwt/jwt/v5` v5.3.x, `github.com/MicahParks/keyfunc/v3` v3.8.x.
+The publisher's server becomes an **OAuth-protected resource server** using the official SDK's `auth` package: `auth.RequireBearerToken` gates `/mcp` (emitting the `WWW-Authenticate` challenge with `resource_metadata`), `auth.ProtectedResourceMetadataHandler` serves the RFC 9728 PRM document, and a custom `TokenVerifier` does the local JWKS validation. Standalone source, no platform package. Version pins: `github.com/modelcontextprotocol/go-sdk` **v1.6.1** (v1.7.0 is pre-release for the next protocol — stay on stable), `github.com/golang-jwt/jwt/v5` v5.3.x, `github.com/MicahParks/keyfunc/v3` v3.8.x.
 
 **Two structural decisions carry the whole design — never undo them:**
 
@@ -193,7 +193,7 @@ func reauthTo401(cfg plugpassConfig, next http.Handler) http.Handler {
 }
 ```
 
-The entitlement client, the `EntitlementResult` union, the `non_authorized` rendering (the response's `result_text` string emitted verbatim as the tool's text — a single-field pipe, never parsed or re-serialized), and the unavailable-deny `CallToolResult` carry over from the wire contract in TOOLS.md — POST `{cfg.entitlementAPIOrigin}/entitlement/{op}` with the forwarded bearer and a 5-second `http.Client` timeout per attempt — ONE retry after a 2-second backoff on a transport error or a 5xx (4xx are terminal, never retried); HTTP 401 → reauth; any other non-200 or a transport failure after the retry → the deny (never fail open).
+The entitlement client, the `EntitlementResult` union, the `non_authorized` rendering (the response's `result_text` string emitted verbatim as the tool's text — a single-field pipe, never parsed or re-serialized), and the unavailable-grant `CallToolResult` carry over from the wire contract in TOOLS.md — POST `{cfg.entitlementAPIOrigin}/entitlement/{op}` with the forwarded bearer and a 5-second `http.Client` timeout per attempt — ONE retry after a 2-second backoff on a transport error or a 5xx (4xx are terminal, never retried); HTTP 401 → reauth; any other non-200 or a transport failure after the retry → the unavailable grant.
 
 **`main.go` composition** — PRM route public, bearer gate outermost on `/mcp`, reauth buffer inside it:
 
@@ -252,20 +252,20 @@ mcp.AddTool(server, &mcp.Tool{
 }, func(ctx context.Context, req *mcp.CallToolRequest, args checkPremiumAccessArgs) (*mcp.CallToolResult, any, error) {
 	bearer, _ := req.Extra.TokenInfo.Extra["raw_token"].(string)
 	status, body, err := postEntitlement(ctx, cfg, bearer, "check_premium_access", args) // 5s/attempt, one 2s-backoff retry
-	if err != nil || status >= 500 || status == 400 || status == 403 {
-		return unavailableDeny(), nil, nil
-	}
-	if status == 401 || body.Status == "reauth_required" {
+	if status == 401 || (err == nil && body.Status == "reauth_required") {
 		setReauthRequired(ctx) // → transport-level 401 via reauthTo401
 		return textResult("Re-authentication required."), nil, nil // discarded by the swap
+	}
+	if err != nil || status != 200 {
+		return unavailableCheckGrant(), nil, nil // Plugpass could not answer → the check grants
 	}
 	return textResult(body.ResultText), nil, nil // verbatim — byte-identical to the native tool
 })
 ```
 
-**Solo paid tool wrapper** (consume-on-invocation; no `auth_token` parameter on this path): validate nothing in the handler — the gate already did — read `sub` + bearer from `req.Extra.TokenInfo`, call `track_usage` (`feature_id` = the tool's own plugpass-component-id, matching its `_meta`; the id's `tool_` prefix carries the feature type), and branch: `ok` → run the body scoped to `sub`; `non_authorized` → the `result_text` verbatim as the text result; `reauth_required` → `setReauthRequired(ctx)` + placeholder; error/timeout → the unavailable deny. Keep `_meta` via the tool's `Meta` field (`mcp.Tool{ …, Meta: mcp.Meta{"plugpass_component_id": "<plugpass_id>"} }`) and never declare an output schema on a wrapped tool (use `any` for the structured output type). Re-derive the tool's `Annotations`: metering makes it neither read-only nor idempotent, whatever it was before the wrap — `Annotations: toolHints(false, <its own destructive value>, false, <its own open-world value>)`, see TOOLS.md § Tool annotations.
+**Solo paid tool wrapper** (consume-on-invocation; no `auth_token` parameter on this path): validate nothing in the handler — the gate already did — read `sub` + bearer from `req.Extra.TokenInfo`, call `track_usage` (`feature_id` = the tool's own plugpass-component-id, matching its `_meta`; the id's `tool_` prefix carries the feature type), and branch: `ok` → run the body scoped to `sub`; `non_authorized` → the `result_text` verbatim as the text result; `reauth_required` → `setReauthRequired(ctx)` + placeholder; error/timeout, or any other non-200 → run the body (the unavailable grant consumed nothing). Keep `_meta` via the tool's `Meta` field (`mcp.Tool{ …, Meta: mcp.Meta{"plugpass_component_id": "<plugpass_id>"} }`) and never declare an output schema on a wrapped tool (use `any` for the structured output type). Re-derive the tool's `Annotations`: metering makes it neither read-only nor idempotent, whatever it was before the wrap — `Annotations: toolHints(false, <its own destructive value>, false, <its own open-world value>)`, see TOOLS.md § Tool annotations.
 
-**Paired-tool add side** (`operation: add`): same shape but `feature_id` = the add tool's `database_record.custom_entitlement_id` (its `custom_` prefix carries the feature type; **not** `database_record.plugpass_id`, and **not** the tool's own `_meta` id), always **`check_remaining`**, passing the user's current count from the developer's own store (scoped to `sub`) as `current_count` — see TOOLS.md → Reading the user's current count.
+**Paired-tool add side** (`operation: add`): same shape but `feature_id` = the add tool's `database_record.custom_entitlement_id` (its `custom_` prefix carries the feature type; **not** `database_record.plugpass_id`, and **not** the tool's own `_meta` id), always **`check_remaining`**, passing the user's current count from the publisher's own store (scoped to `sub`) as `current_count` — see TOOLS.md → Reading the user's current count.
 
 **Identity tool** (the paired remove side, or any per-user free tool): no Entitlement API call — read `req.Extra.TokenInfo.UserID` and scope the body to it.
 

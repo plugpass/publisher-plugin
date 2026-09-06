@@ -7,7 +7,7 @@ allowed-tools: mcp__plugin_{PluginName}_{ConnectorKey}__authenticate, AskUserQue
 
 USER_INPUT_TOOL = A tool that presents the user a question with selectable options and returns their choice (e.g. `AskUserQuestion`, `ask_user_input_v0`, etc.) that can be used in the default session state (not limited to a certain mode, e.g. plan mode).
 
-CHECK_RESULT = the tool result already in context that triggered this skill — the `{CheckToolName}` result, or on the paid-tool surface the developer tool's result carrying the trigger keys. Within it:
+CHECK_RESULT = the tool result already in context that triggered this skill — the `{CheckToolName}` result, or on the paid-tool surface the publisher tool's result carrying the trigger keys. Within it:
 
 - MESSAGE = everything after `MESSAGE=` (from the first character after the `=`) through the end of CHECK_RESULT, newlines included.
 - CTAS = the JSON array on the `CTAS=` line. CTA = its single entry when the array is non-empty.

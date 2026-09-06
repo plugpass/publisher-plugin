@@ -1,13 +1,13 @@
-# Developer MCP server scaffolding — resource server, check proxy & tool wrappers
+# Publisher MCP server scaffolding — resource server, check proxy & tool wrappers
 
-This procedure writes the Plugpass premium-access scaffolding into the developer's **own MCP server source**: the OAuth resource-server layer, the check proxy tool (check host only), and the per-tool identity + premium feature access wrappers. Read it whenever the run has developer-server work — the connector directives call for check-host scaffolding (`connector.hosting` is `developer`), or the run's components include `tool` entries. Follow it per server, handling all of a server's work as one batch: detect the server's language once, apply `removed` tools first (as reference for the existing style), then `added`/`changed` and the template refresh set's tools (`unchanged` with `template_stale` `true`) uniformly, and verify the rest.
+This procedure writes the Plugpass premium-access scaffolding into the publisher's **own MCP server source**: the OAuth resource-server layer, the check proxy tool (check host only), and the per-tool identity + premium feature access wrappers. Read it whenever the run has publisher-server work — the connector directives call for check-host scaffolding (`connector.hosting` is `publisher`), or the run's components include `tool` entries. Follow it per server, handling all of a server's work as one batch: detect the server's language once, apply `removed` tools first (as reference for the existing style), then `added`/`changed` and the template refresh set's tools (`unchanged` with `template_stale` `true`) uniformly, and verify the rest.
 
 ## How identity reaches the server — the header bearer
 
-The developer's server is an **OAuth-protected resource server** and Plugpass is its authorization server. Identity rides the standard `Authorization: Bearer …` header on every request:
+The publisher's server is an **OAuth-protected resource server** and Plugpass is its authorization server. Identity rides the standard `Authorization: Bearer …` header on every request:
 
 - A request to the MCP endpoint without a valid bearer is **challenged** — `401` + `WWW-Authenticate` pointing at the server's protected-resource-metadata document — which is what triggers the MCP client's OAuth connect flow against Plugpass.
-- The server **validates every bearer locally** against Plugpass's public JWKS (a few lines, in the resource-server layer below) and extracts the user id (`sub`). No Plugpass round-trip for identity, and no developer-side secret: validation is against the public key set, and entitlement calls forward the user's own bearer.
+- The server **validates every bearer locally** against Plugpass's public JWKS (a few lines, in the resource-server layer below) and extracts the user id (`sub`). No Plugpass round-trip for identity, and no publisher-side secret: validation is against the public key set, and entitlement calls forward the user's own bearer.
 - Tool handlers read the validated `{ sub, bearer }` from the request context. A **paid** tool forwards the bearer to the Entitlement API; an **identity** tool (any tool whose body is per-user — the paired remove side is the canonical case) stops at `sub`; a tool with no per-user state ignores both.
 
 Inputs come from the orchestration steps: the `tool` components (each with `plugpass_id`, `server_name`, `tool_name`, `is_free`, `gating_change_since_last_implement`, `template_stale`, and — for paired tools — `database_record` (which carries `custom_entitlement_id`, the pair's shared entitlement `feature_id`) + `operation`), the connector directive for this run (`connector`, `connector_change_since_last_implement`, `previous_connector`), the plugin-level values (`{PluginName}`, `{plugin-plugpass-id}`, `entitlement_api_origin`, `plugpass_issuer`, `plugpass_jwks_url`, `owned_servers`, `server_scaffolding_template_stale`), and the resolved `server_name → absolute source-directory path` map.
@@ -16,25 +16,25 @@ Be **idempotent**, and rewrite only when something changed: an artifact's gating
 
 ## Step 1: Determine each server's work and locate its source
 
-Work over the orchestration's **server set** (SKILL.md Step 3): every server with tool work, plus the **check host** (the server named by `connector.server_key`) when the connector is developer-hosted and anything is still gated. Use the absolute path from the resolved map for each — the orchestration already resolved (and, where needed, elicited) every path before this procedure began, and dropped any server it couldn't locate. If a path unexpectedly fails to resolve mid-run, don't edit that server — leave its tasks open and surface it to the developer in the closing summary.
+Work over the orchestration's **server set** (SKILL.md Step 3): every server with tool work, plus the **check host** (the server named by `connector.server_key`) when the connector is publisher-hosted and anything is still gated. Use the absolute path from the resolved map for each — the orchestration already resolved (and, where needed, elicited) every path before this procedure began, and dropped any server it couldn't locate. If a path unexpectedly fails to resolve mid-run, don't edit that server — leave its tasks open and surface it to the publisher in the closing summary.
 
-Per server, the pieces to ensure (each independently idempotent):
+Per server, the pieces to ensure are exactly the layers its `owned_servers` entry's `scaffolding.layers` directive names (each independently idempotent; a layer the directive omits is neither written nor verified):
 
-- **The resource-server layer** (every server in the set; written when `server_scaffolding_template_stale` is `true` or the layer is missing, verified otherwise) — Step 3.
-- **The check proxy tool** (the check host only; the same write-or-verify rule) — Step 4.
-- **Per-tool wrappers** (each of the server's `tool` components: written for `added` / `changed` and for `unchanged` + `template_stale`, stripped for `removed`, verified otherwise) — Step 5.
+- `resource_server` — **the resource-server layer** (written when `server_scaffolding_template_stale` is `true` or the layer is missing, verified otherwise) — Step 3.
+- `check_proxy` — **the check proxy tool** (the check host; the same write-or-verify rule) — Step 4.
+- `tool_wrappers` — **per-tool wrappers** (each of the server's `tool` components: written for `added` / `changed` and for `unchanged` + `template_stale`, stripped for `removed`, verified otherwise) — Step 5.
 
 ## Step 2: Detect the server's language + framework
 
 Read the located source (entry file + tool definitions) to identify the SDK language and whether the server is vanilla MCP SDK or framework-wrapped (Hono / FastAPI / axum / etc.).
 
-- **TypeScript** — read [templates/tool-wrappers/typescript.md](templates/tool-wrappers/typescript.md) and adapt its placement to the developer's structure (don't re-derive what the template already gives you).
-- **Python** — read [templates/tool-wrappers/python.md](templates/tool-wrappers/python.md) and adapt its placement to the developer's structure (don't re-derive what the template already gives you).
-- **Go** — read [templates/tool-wrappers/go.md](templates/tool-wrappers/go.md) and adapt its placement to the developer's structure (don't re-derive what the template already gives you).
-- **Rust** — read [templates/tool-wrappers/rust.md](templates/tool-wrappers/rust.md) and adapt its placement to the developer's structure (don't re-derive what the template already gives you).
-- **Ruby** — read [templates/tool-wrappers/ruby.md](templates/tool-wrappers/ruby.md) and adapt its placement to the developer's structure (don't re-derive what the template already gives you).
-- **JVM (Java/Kotlin)** — read [templates/tool-wrappers/jvm.md](templates/tool-wrappers/jvm.md) and adapt its placement to the developer's structure (don't re-derive what the template already gives you).
-- **Any other language** — port the TypeScript reference to that language's MCP SDK; the scaffolding contract in this document is language-independent (challenge, PRM document, local validation, proxy pipe, wrapper rules). Tell the developer it isn't an officially supported language, so there's no vetted template — they should review and test the generated code before relying on it.
+- **TypeScript** — read [templates/tool-wrappers/typescript.md](templates/tool-wrappers/typescript.md) and adapt its placement to the publisher's structure (don't re-derive what the template already gives you).
+- **Python** — read [templates/tool-wrappers/python.md](templates/tool-wrappers/python.md) and adapt its placement to the publisher's structure (don't re-derive what the template already gives you).
+- **Go** — read [templates/tool-wrappers/go.md](templates/tool-wrappers/go.md) and adapt its placement to the publisher's structure (don't re-derive what the template already gives you).
+- **Rust** — read [templates/tool-wrappers/rust.md](templates/tool-wrappers/rust.md) and adapt its placement to the publisher's structure (don't re-derive what the template already gives you).
+- **Ruby** — read [templates/tool-wrappers/ruby.md](templates/tool-wrappers/ruby.md) and adapt its placement to the publisher's structure (don't re-derive what the template already gives you).
+- **JVM (Java/Kotlin)** — read [templates/tool-wrappers/jvm.md](templates/tool-wrappers/jvm.md) and adapt its placement to the publisher's structure (don't re-derive what the template already gives you).
+- **Any other language** — port the TypeScript reference to that language's MCP SDK; the scaffolding contract in this document is language-independent (challenge, PRM document, local validation, proxy pipe, wrapper rules). Tell the publisher it isn't an officially supported language, so there's no vetted template — they should review and test the generated code before relying on it.
 
 ## The runtime constants
 
@@ -49,7 +49,7 @@ Every scaffolded module carries these four as fixed constants:
 
 `RESOURCE_URL` is per server: the check host's is `connector.url`; any other server's is its `owned_servers` entry's `url` (matched by `server_name`). `ISSUER` and `JWKS_URL` are per plugin — the plugin's own pages-host origin (its authorization server) and that host's key-set document — so a run whose `connector_change_since_last_implement` is `changed` with only `issuer` differing from `previous_connector` re-bakes them on every server in the set (the idempotent read-then-change) and nothing else moves. Bake every value verbatim from the response; never derive the audience or the issuer from the incoming request.
 
-## Step 3: The resource-server layer (once per server)
+## Step 3: The resource-server layer (`resource_server`, once per server)
 
 Written once per server, standalone (no platform-package dependency), following the language template's structure. Write it — from the language template, as an idempotent read-then-change against the current response values — when `server_scaffolding_template_stale` is `true` or the layer is missing. Otherwise **verify** it without re-rendering the template: the challenge, the PRM route, and the local bearer validation are present, and the four runtime constants are baked with the current response values — a differing constant is re-baked in place (the issuer-drift and domain-change cases), and a missing behavior is written. Three behaviors:
 
@@ -75,9 +75,9 @@ Written once per server, standalone (no platform-package dependency), following 
 
 The layer never checks revocation locally — Plugpass reads revocation at the Entitlement API and answers `reauth_required`, which the proxy/wrappers convert into the same `401` challenge (below), triggering the client's re-auth.
 
-## Step 4: The check proxy tool (check host only)
+## Step 4: The check proxy tool (`check_proxy`, check host only)
 
-The check host registers the platform-standard check tool and pipes it to Plugpass — a **pure pipe**, so platform messaging/format changes propagate to every developer-hosted plugin with no re-scaffold. Write it on the same conditions as the resource-server layer (`server_scaffolding_template_stale` `true`, or the tool missing); otherwise verify it is registered with the exact name, description, input schema, and annotations below and pipes to the current `ENTITLEMENT_API_ORIGIN`, and leave it alone:
+The check host registers the platform-standard check tool and pipes it to Plugpass — a **pure pipe**, so platform messaging/format changes propagate to every publisher-hosted plugin with no re-scaffold. Write it on the same conditions as the resource-server layer (`server_scaffolding_template_stale` `true`, or the tool missing); otherwise verify it is registered with the exact name, description, input schema, and annotations below and pipes to the current `ENTITLEMENT_API_ORIGIN`, and leave it alone:
 
 - **Name** the plugin data's `check_tool_name` (e.g. `brainstorm_check_access`), **title** `Check premium access`, and this **description, verbatim**:
 
@@ -88,18 +88,18 @@ The check host registers the platform-standard check tool and pipes it to Plugpa
 - **Handler**: POST the input object unchanged to `{ENTITLEMENT_API_ORIGIN}/entitlement/check_premium_access` with `Authorization: Bearer {the request's bearer}` and a 5-second timeout per attempt — on a thrown request (network error / timeout) or a `5xx`, retry ONCE after a 2-second backoff; `4xx` responses are terminal, never retried. Response handling:
   - `200 { "status": "ok", "result_text": "…" }` → return `result_text` **verbatim** as the tool's text result. Never parse, reformat, or wrap it — it is byte-identical to what the platform's own check tool returns.
   - `200 { "status": "reauth_required" }`, or an HTTP `401` → the bearer is revoked or stale: respond at the **transport level** with the same `401` + `WWW-Authenticate` challenge as an invalid bearer (the template's mechanism), so the client re-authorizes and retries. Never return this as tool text.
-  - Any other status, or the timeout → the unavailable deny (below).
+  - Any other status, or the timeout → the unavailable grant (below).
 
-## Step 5: Per-tool wrappers (added / changed / template refresh)
+## Step 5: Per-tool wrappers (`tool_wrappers`; added / changed / template refresh)
 
-Write the wrapper for an `added` or `changed` tool, and for an `unchanged` tool whose `template_stale` is `true` — the latter replaces its existing wrapper with one rendered from the current template, its role unchanged. For every other `unchanged` tool, **verify only**: confirm the handler still carries the gate for its role (the `track_usage` / `check_remaining` call with its `feature_id`, or the `sub` read for an identity tool) and its `_meta` id; a tool missing either is treated as `added`. Never rewrite a verified wrapper — it is a contextual edit into the developer's own code, and leaving working code alone is the point of the rule.
+Write the wrapper for an `added` or `changed` tool, and for an `unchanged` tool whose `template_stale` is `true` — the latter replaces its existing wrapper with one rendered from the current template, its role unchanged. For every other `unchanged` tool, **verify only**: confirm the handler still carries the gate for its role (the `track_usage` / `check_remaining` call with its `feature_id`, or the `sub` read for an identity tool) and its `_meta` id; a tool missing either is treated as `added`. Never rewrite a verified wrapper — it is a contextual edit into the publisher's own code, and leaving working code alone is the point of the rule.
 
 What a tool's handler does with the request context's `{ sub, bearer }` depends on its role:
 
 - **Truly-free tool** (no per-user state) → untouched. It runs behind the connect gate like everything else, but reads neither `sub` nor the bearer.
 - **Identity tool** — any tool whose body is per-user; the **paired-tool remove side** (`operation: remove`) is the canonical case (removing a record is always allowed, but the handler must know **whose** record to remove) → read `sub` from the request context and scope the body to it. **No Entitlement API call** — zero Plugpass round-trips.
 - **Solo paid tool** → consume-on-invocation: call the Entitlement API **`track_usage`** at tool entry; run the tool body only after an `ok` response.
-- **Paired-tool add side** (`operation: add`) → gate-the-add: because the developer's own DB is the source of truth, gate with **`check_remaining` at tool entry**, read-only (it never consumes a Plugpass counter). Read the user's **current count** of that record from the developer's store (scoped to `sub`) and pass it as `current_count` (see Reading the user's current count, below); the API authorizes a **limited/total** record iff `current_count < limit`, and an **unlimited** record on entitlement alone (no cap, so the count is ignored). Run the tool body only after an `ok` response; a non-authorized `result_text` rejects with no record added.
+- **Paired-tool add side** (`operation: add`) → gate-the-add: because the publisher's own DB is the source of truth, gate with **`check_remaining` at tool entry**, read-only (it never consumes a Plugpass counter). Read the user's **current count** of that record from the publisher's store (scoped to `sub`) and pass it as `current_count` (see Reading the user's current count, below); the API authorizes a **limited/total** record iff `current_count < limit`, and an **unlimited** record on entitlement alone (no cap, so the count is ignored). Run the tool body only after an `ok` response; a non-authorized `result_text` rejects with no record added.
 
 A database-record add **never consumes** — there is no `track_usage`, no shared-pool draw, and no after-the-fact op on a success branch — so the gate is wholly at tool entry, with no success handler to locate, whether the tool's own work is synchronous or asynchronous. (The shared unlimited pool is only a `/plans` budget-calc abstraction for an unlimited record, never a runtime touch.)
 
@@ -119,7 +119,7 @@ So: **if a tool you touch declares no annotations, add them** — the tool's own
 - **Paired-tool add side** (`check_remaining`) → the gate is read-only and consumes nothing, so the gate itself changes no hint. Annotate the tool for what its own body does (a record-adding tool is a non-destructive write; idempotent if the store dedupes).
 - **Identity tool and truly-free tool** → no Entitlement API call, so nothing changes. Annotate for the tool's own behavior — and note the paired **remove** side deletes user data, which is the genuine `destructiveHint: true` case.
 
-Judging the values, in the tool's own terms: `readOnlyHint` — does the handler modify any state? `destructiveHint` — can it irreversibly remove or damage something (deleting a record), as opposed to an additive or metering write? `idempotentHint` — does a second identical call leave the state the first one produced? `openWorldHint` — does it reach an open-ended external world (the public internet, a third-party API), or a bounded domain (the developer's own store and services, the caller's own records)?
+Judging the values, in the tool's own terms: `readOnlyHint` — does the handler modify any state? `destructiveHint` — can it irreversibly remove or damage something (deleting a record), as opposed to an additive or metering write? `idempotentHint` — does a second identical call leave the state the first one produced? `openWorldHint` — does it reach an open-ended external world (the public internet, a third-party API), or a bounded domain (the publisher's own store and services, the caller's own records)?
 
 **Judge what the handler does, not how the description reads.** Descriptions carry marketing flavor that hints must not inherit — a tool described as drawing on "external inspiration" but implemented as a call to the plugin's own AI is a **closed** world (`openWorldHint: false`); a plugin's own backend, however remote, is still its own bounded domain. Words like *external*, *web*, or *live* in the copy are not evidence. Read the handler, then annotate. The one place the description does bind is the entitlement call the wrapper adds — that's real behavior, and it's why metering forces `readOnlyHint`/`idempotentHint` to false above.
 
@@ -137,11 +137,14 @@ Response handling (the `status`-discriminated JSON — see the Wire contract):
 - `ok` → authorized; run the tool body.
 - `non_authorized` → return the response's `result_text` **verbatim** as the tool's text result — a single-field pipe, never parsed, reformatted, or re-serialized (the server composed the complete block, and per-key re-serialization can't carry it faithfully). The trigger keys inside it auto-fire the plugin's access-handler skill via its description, which then owns the flow.
 - `reauth_required` (the JSON envelope, or an HTTP `401` from the API) → respond at the **transport level** with the `401` + `WWW-Authenticate` challenge (the same mechanism as the proxy tool), so the client re-authorizes and retries.
-- Any other non-200, or a thrown request — each after the single retry above → the unavailable deny (below). Never fail open: a reachable-but-failing Entitlement API **denies** — the stateless limited add is no exception (never authorize on the developer's `current_count` alone).
+- Any other non-200, or a thrown request — each after the single retry above → the unavailable grant (below).
 
-**The unavailable deny** (every scaffolded surface uses this exact text, as an error tool result — the templates' `<the unavailable deny text from TOOLS.md>` placeholder resolves to it):
+**The unavailable grant.** A failing or unreachable Entitlement API **grants**: this call is server-to-server from the server's own host, so a Plugpass failure is never the end user's doing and never costs them access. Nothing was consumed. Never deny on it, and never surface it as an error.
 
-> There was a problem verifying your access to this feature. Please try again in a moment.
+- A wrapped tool runs its body, exactly as on `ok`.
+- The check proxy returns this exact text as its tool result (the templates' `<the unavailable grant text from TOOLS.md>` placeholder resolves to it):
+
+  > USE_AUTHORIZED=true
 
 ## The wire contract
 
@@ -157,34 +160,34 @@ Response handling (the `status`-discriminated JSON — see the Wire contract):
 
 `POST {ENTITLEMENT_API_ORIGIN}/entitlement/check_premium_access` (the proxy's upstream) — request `{ plugin_id: string, feature_id: string, plugin_version: string }` (the `feature_id` prefix carries the `skill` type), response `{ "status": "ok", "result_text": string } | { "status": "reauth_required" }`.
 
-Non-cascade statuses on either endpoint: `400` malformed body, `401` missing/invalid bearer (treat as reauth), `403` plugin↔audience mismatch (a real misconfiguration — deny), `5xx` (deny).
+Non-cascade statuses on either endpoint: `401` missing/invalid bearer (treat as reauth); `400`, `403`, `5xx` and every other non-200 (the unavailable grant).
 
 ### Reading the user's current count
 
-A limited (total) record authorizes iff `current_count < limit`, so the add wrapper must read the user's current count of that record — scoped to `sub` — and pass it as `current_count`. **Always read it** — an unlimited plan simply ignores the value, so a later total↔unlimited plan change needs no wrapper change. That count lives in the **developer's own store**, not ours, so determining how to read it is part of the implementation — approached like any change to a codebase you don't already understand:
+A limited (total) record authorizes iff `current_count < limit`, so the add wrapper must read the user's current count of that record — scoped to `sub` — and pass it as `current_count`. **Always read it** — an unlimited plan simply ignores the value, so a later total↔unlimited plan change needs no wrapper change. That count lives in the **publisher's own store**, not ours, so determining how to read it is part of the implementation — approached like any change to a codebase you don't already understand:
 
-- **Work it out yourself first.** Read the add/remove tools' source to find where the record is stored and how it's scoped to the user, and write the count read against that store. Never ask the developer for something you can find yourself.
-- **Confirm what counts.** The count must match exactly what the limit governs — confirm the definition with the developer whenever it's ambiguous (active vs. archived / soft-deleted / expired rows, per-user scoping, and the like). Getting it wrong silently mis-enforces the paywall, with no error to surface it, so confirm rather than guess.
-- **Research / safe experiment.** Web-research the developer's storage layer or ORM when it helps, and you may ask permission to run a safe experiment (e.g. "may I add then immediately remove a test record so I can see how it's stored and counted?").
+- **Work it out yourself first.** Read the add/remove tools' source to find where the record is stored and how it's scoped to the user, and write the count read against that store. Never ask the publisher for something you can find yourself.
+- **Confirm what counts.** The count must match exactly what the limit governs — confirm the definition with the publisher whenever it's ambiguous (active vs. archived / soft-deleted / expired rows, per-user scoping, and the like). Getting it wrong silently mis-enforces the paywall, with no error to surface it, so confirm rather than guess.
+- **Research / safe experiment.** Web-research the publisher's storage layer or ORM when it helps, and you may ask permission to run a safe experiment (e.g. "may I add then immediately remove a test record so I can see how it's stored and counted?").
 - **Bound the effort** — a genuine, reasonable search, then stop.
 
 If you can't confidently determine how to read the count, don't guess — handle it per **Don't guess, don't leave markers** below.
 
 ### Don't guess, don't leave markers
 
-Never edit a repository other than the plugin repo and the located MCP server source without the developer's explicit permission and a plain-English explanation of why; any approved outside repo is recorded for `edited_repos` in the final report.
+Never edit a repository other than the plugin repo and the located MCP server source without the publisher's explicit permission and a plain-English explanation of why; any approved outside repo is recorded for `edited_repos` in the final report.
 
-**When a tool or server can't be brought to its correct end state** (e.g. its source can't be confidently located, or you can't confidently determine how to read the user's current count): do **not** guess, and do **not** leave a marker or `TODO` in the developer's source — a comment only a human reader would act on is a silent failure. Instead, explain in plain English what remains and why, leave the relevant task(s) **open**, and exclude the affected component(s) from the implementation record — the dashboard's publish gate then holds until a re-run verifies the wiring. The explanation is plain, dense, assumes no knowledge of the entitlement model, and never uses internal terms (no "paired tools").
+**When a tool or server can't be brought to its correct end state** (e.g. its source can't be confidently located, or you can't confidently determine how to read the user's current count): do **not** guess, and do **not** leave a marker or `TODO` in the publisher's source — a comment only a human reader would act on is a silent failure. Instead, explain in plain English what remains and why, leave the relevant task(s) **open**, and exclude the affected component(s) from the implementation record — the dashboard's publish gate then holds until a re-run verifies the wiring. The explanation is plain, dense, assumes no knowledge of the entitlement model, and never uses internal terms (no "paired tools").
 
 ## Step 6: Removals
 
-For each `removed` tool, restore its plain handler: strip the entitlement gate (the `track_usage` / `check_remaining` call and its branching); keep the `sub` read only if the tool's body genuinely still needs per-user scoping (a de-gated per-user tool is now an identity tool, not a plain one); leave its `_meta` id (identity is harmless and cheap to keep). Do **not** tear down the resource-server layer or the proxy tool on removals — the server remains the plugin's connector (or a still-registered owned server) and stale bundles may still call it; leftover scaffolding is inert and harmless. The only proxy removal this skill ever performs is the connector directive's developer→developer case (the previous check host, when its repo is in the run). Already-stripped → no-op.
+For each `removed` tool, restore its plain handler: strip the entitlement gate (the `track_usage` / `check_remaining` call and its branching); keep the `sub` read only if the tool's body genuinely still needs per-user scoping (a de-gated per-user tool is now an identity tool, not a plain one); leave its `_meta` id (identity is harmless and cheap to keep). Do **not** tear down the resource-server layer or the proxy tool on removals — the server remains the plugin's connector (or a still-registered owned server) and stale bundles may still call it; leftover scaffolding is inert and harmless. The only proxy removal this skill ever performs is the connector directive's publisher→publisher case (the previous check host, when its repo is in the run). Already-stripped → no-op.
 
 ## Reconcile runs
 
 On a `--reconcile` run, additionally re-audit what normal runs only check for presence — the audit is **probe-based** (re-read the scaffolded code and re-run the local verification below), not server-side state:
 
-- Each in-set server's **resource-server layer**: present, constants baked with the current response values, challenge + PRM + validation intact.
+- Each in-set server's **resource-server layer** (when its directive names `resource_server`): present, constants baked with the current response values, challenge + PRM + validation intact.
 - The check host's **proxy tool**: registered with the exact name/description/schema, piping to the current `ENTITLEMENT_API_ORIGIN`.
 - Every **`unchanged`** tool's wrapper: the gate call, descriptor (`feature_id` — its prefix carries the type), `current_count` read, and `_meta` id present and correct.
 
@@ -192,10 +195,10 @@ Regenerate anything missing or drifted. This is the explicit escape hatch for MC
 
 ## Step 7: Per-server verification
 
-Before the run reports a server's work done, verify it locally — drive it yourself when the repo gives you a runnable dev command; otherwise ask the developer to start the server and tell you the local port:
+Before the run reports a server's work done, verify it locally — drive it yourself when the repo gives you a runnable dev command; otherwise ask the publisher to start the server and tell you the local port:
 
 1. The code **compiles / imports cleanly**, and the server **starts and serves** (probes 2–4 exercise it). Registration itself is a source-level read: confirm every tool this run touched — plus the check proxy tool, on the check host — has its registration call present and reached from the server's setup path. A compile check never establishes registration, and runtime registration is only observable via `tools/list`, which carries the same bearer requirement as item 6. On a server that builds its MCP instance per request, the registration code doesn't even execute until an authenticated call arrives, so a clean start proves nothing about it either.
-2. `GET /.well-known/oauth-protected-resource/mcp` serves the PRM document with `resource` = the server's `RESOURCE_URL` and `authorization_servers` = `[ISSUER]`.
+2. When the server's directive names `resource_server` (probes 2–4): `GET /.well-known/oauth-protected-resource/mcp` serves the PRM document with `resource` = the server's `RESOURCE_URL` and `authorization_servers` = `[ISSUER]`.
 3. A bare request to `/mcp` (no `Authorization` header) returns `401` with the `WWW-Authenticate` challenge carrying `error="invalid_token"` and a `resource_metadata` parameter.
 
    **Assert the challenge's shape, not its host, when probing locally.** Some dev servers proxy the response and rewrite the host in outgoing headers to the local listen address, so `realm` and `resource_metadata` can come back as `127.0.0.1:{port}` instead of the baked `RESOURCE_URL` — an artifact of the dev server, not drift in the written source. Item 2 is the authoritative check on that value: it reads a response *body*, which is not rewritten. To confirm directly, re-send this request with `Host:` set to the `RESOURCE_URL`'s host — the baked value then passes through untouched. A local scheme mismatch (`https://` in the header over a plain-HTTP local request) is the same artifact and is likewise not a finding.
@@ -205,7 +208,7 @@ Before the run reports a server's work done, verify it locally — drive it your
 
    **Do not try to read this off the `tools/list` wire.** The resource-server layer gates every `/mcp` request, so `tools/list` needs a valid bearer — which no local probe has, and which deploying does not provide either (a deployed server is gated identically). The residual this leaves: an annotation block that is declared in source but never reaches the descriptor — a mis-shaped field, or an SDK/framework that drops it silently — is not caught here. That case belongs to the pre-publish connect loop below, which is the only surface with a real token.
 
-The full bearer round-trip (mint → call → cascade) needs a real Plugpass-minted token and is covered by the pre-publish connect loop (the developer connects a real client against the deployed server) — that loop also owns the wire-level annotation read described in item 6. These local probes are what this run owes.
+The full bearer round-trip (mint → call → cascade) needs a real Plugpass-minted token and is covered by the pre-publish connect loop (the publisher connects a real client against the deployed server) — that loop also owns the wire-level annotation read described in item 6. These local probes are what this run owes.
 
 ## Outcome
 

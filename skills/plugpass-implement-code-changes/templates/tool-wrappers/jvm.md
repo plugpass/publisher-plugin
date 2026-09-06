@@ -1,10 +1,10 @@
 # JVM (Java/Kotlin) scaffolding template
 
-The developer's server becomes an **OAuth-protected resource server**: a servlet `Filter` gates `/mcp` (validating the bearer against Plugpass's JWKS with Nimbus + the JDK's native Ed25519), a tiny servlet serves the RFC 9728 PRM document, and the MCP servlet transport runs behind them under embedded Jetty. Standalone source, no platform package. Version pins: `io.modelcontextprotocol.sdk:mcp` **2.0.0** (the aggregate — `mcp-core` + Jackson 3; apps pinned to Jackson 2 use `mcp-core` + `mcp-json-jackson2`), `com.nimbusds:nimbus-jose-jwt` 10.9.x, `org.eclipse.jetty.ee10:jetty-ee10-servlet` 12.1.x. Java 17+ (the reference targets 21). Keep the shade plugin's `ServicesResourceTransformer` — the SDK discovers its JSON mapper via ServiceLoader.
+The publisher's server becomes an **OAuth-protected resource server**: a servlet `Filter` gates `/mcp` (validating the bearer against Plugpass's JWKS with Nimbus + the JDK's native Ed25519), a tiny servlet serves the RFC 9728 PRM document, and the MCP servlet transport runs behind them under embedded Jetty. Standalone source, no platform package. Version pins: `io.modelcontextprotocol.sdk:mcp` **2.0.0** (the aggregate — `mcp-core` + Jackson 3; apps pinned to Jackson 2 use `mcp-core` + `mcp-json-jackson2`), `com.nimbusds:nimbus-jose-jwt` 10.9.x, `org.eclipse.jetty.ee10:jetty-ee10-servlet` 12.1.x. Java 17+ (the reference targets 21). Keep the shade plugin's `ServicesResourceTransformer` — the SDK discovers its JSON mapper via ServiceLoader.
 
 **Three structural decisions carry the whole design — never undo them:**
 
-1. **Use `HttpServletStatelessServerTransport`** (not the streamable provider). It answers `tools/call` with a plain `application/json` body, synchronously on the request thread, no `startAsync`, no sessions — so the auth filter's buffering wrapper holds the complete response after `chain.doFilter` returns and can swap in a `401` when a tool discovered mid-call that the bearer is revoked. (The streamable provider answers tools/call over SSE; a buffering filter still works there only because of deferred-`complete()` servlet semantics, with mid-stream-notification caveats — stay stateless unless the developer's tools need sampling/elicitation.) GET returns 405 — spec-legal for streamable-HTTP servers.
+1. **Use `HttpServletStatelessServerTransport`** (not the streamable provider). It answers `tools/call` with a plain `application/json` body, synchronously on the request thread, no `startAsync`, no sessions — so the auth filter's buffering wrapper holds the complete response after `chain.doFilter` returns and can swap in a `401` when a tool discovered mid-call that the bearer is revoked. (The streamable provider answers tools/call over SSE; a buffering filter still works there only because of deferred-`complete()` servlet semantics, with mid-stream-notification caveats — stay stateless unless the publisher's tools need sampling/elicitation.) GET returns 405 — spec-legal for streamable-HTTP servers.
 2. **Verify Ed25519 with the JDK (`Signature.getInstance("Ed25519")`), not Nimbus's `Ed25519Verifier`** — the Nimbus verifier still requires the optional Google Tink dependency, and its stock `DefaultJWSVerifierFactory` has no EdDSA support at all. Nimbus handles JWKS fetching/caching/selection and claims verification; the signature check is ~10 lines of JDK crypto.
 3. **The audience is the baked `RESOURCE_URL`, never the request host** — the JWT `aud` pin, the PRM `resource`, and the challenge's `resource_metadata` all derive from it. This is what lets a locally-listening server accept real bearers minted for its public URL.
 
@@ -87,12 +87,13 @@ public final class PremiumFeatureAccessCheck {
   // Entitlement API client: java.net.http.HttpClient, 5s connect + request
   // timeouts PER ATTEMPT with ONE retry after a 2s backoff on a transport
   // error or a 5xx (4xx terminal, never retried), Authorization: Bearer
-  // <token>. HTTP 401 → reauth_required; any other non-2xx or a failure after
-  // the retry → throws → the caller's unavailable deny (never
-  // fail open). non_authorized rendering: the response's "result_text" string
-  // emitted verbatim as the tool's text — a single-field pipe, never parsed or
-  // re-serialized (the trigger keys inside it auto-fire the plugin's access-handler skill).
-  /* …entitlement(bearer, bodyJson, op), nonAuthorizedText(json), UNAVAILABLE_DENY… */
+  // <token>. HTTP 401 → reauth_required; every other failure → status
+  // "unavailable", which GRANTS: the call is server-to-server from this host,
+  // so the end user cannot have caused it. non_authorized rendering: the
+  // response's "result_text" string emitted verbatim as the tool's text — a
+  // single-field pipe, never parsed or re-serialized (the trigger keys inside
+  // it auto-fire the plugin's access-handler skill).
+  /* …entitlement(bearer, bodyJson, op), nonAuthorizedText(json), UNAVAILABLE_CHECK_GRANT… */
 }
 ```
 
@@ -198,26 +199,25 @@ var checkPremiumAccess = McpStatelessServerFeatures.SyncToolSpecification.builde
         .build()) // no outputSchema
     .callHandler((ctx, request) -> {
       var auth = (PremiumFeatureAccessCheck.PlugpassAuth) ctx.get(PremiumFeatureAccessCheck.AUTH_ATTRIBUTE);
-      if (auth == null) return unavailableDeny(); // unreachable behind the gate; fail closed
-      try {
-        var result = PremiumFeatureAccessCheck.entitlement(auth.bearer(),
-            toJson(request.arguments()), "check_premium_access");
-        if ("reauth_required".equals(result.status())) {
-          auth.reauthRequired().set(true); // → transport-level 401 via the filter
-          return CallToolResult.builder().addTextContent("Re-authentication required.").build(); // discarded by the swap
-        }
-        return CallToolResult.builder().addTextContent(result.resultText()).build(); // verbatim — byte-identical to the native tool
-      } catch (Exception e) {
-        return unavailableDeny();
+      if (auth == null) return unavailableCheckGrant(); // unreachable behind the gate
+      var result = PremiumFeatureAccessCheck.entitlement(auth.bearer(),
+          toJson(request.arguments()), "check_premium_access");
+      if ("reauth_required".equals(result.status())) {
+        auth.reauthRequired().set(true); // → transport-level 401 via the filter
+        return CallToolResult.builder().addTextContent("Re-authentication required.").build(); // discarded by the swap
       }
+      if ("unavailable".equals(result.status())) {
+        return unavailableCheckGrant(); // Plugpass could not answer → the check grants
+      }
+      return CallToolResult.builder().addTextContent(result.resultText()).build(); // verbatim — byte-identical to the native tool
     })
     .build();
 ```
 
-**Solo paid tool wrapper** (consume-on-invocation; no `auth_token` parameter on this path): read the holder from the context (`auth.sub()` scopes the body, `auth.bearer()` is the forwarded bearer), call `track_usage` (`feature_id` = the tool's own plugpass-component-id, matching its `_meta`; the id's `tool_` prefix carries the feature type), and branch: `ok` → run the body; `non_authorized` → `CallToolResult` text = its `result_text` verbatim; `reauth_required` → set the flag + placeholder; exception → the unavailable deny. Stamp `_meta` via `Tool.builder(...).meta(Map.of("plugpass_component_id", "<plugpass_id>"))`, and never declare an `outputSchema` on a wrapped tool (paywall/reauth responses are text-only). Re-derive the tool's `.annotations(…)`: metering makes it neither read-only nor idempotent, whatever it was before the wrap — `.annotations(hints(false, <its own destructive value>, false, <its own open-world value>))`, see TOOLS.md § Tool annotations.
+**Solo paid tool wrapper** (consume-on-invocation; no `auth_token` parameter on this path): read the holder from the context (`auth.sub()` scopes the body, `auth.bearer()` is the forwarded bearer), call `track_usage` (`feature_id` = the tool's own plugpass-component-id, matching its `_meta`; the id's `tool_` prefix carries the feature type), and branch: `ok` → run the body; `non_authorized` → `CallToolResult` text = its `result_text` verbatim; `reauth_required` → set the flag + placeholder; `unavailable` → run the body (it consumed nothing and grants). Stamp `_meta` via `Tool.builder(...).meta(Map.of("plugpass_component_id", "<plugpass_id>"))`, and never declare an `outputSchema` on a wrapped tool (paywall/reauth responses are text-only). Re-derive the tool's `.annotations(…)`: metering makes it neither read-only nor idempotent, whatever it was before the wrap — `.annotations(hints(false, <its own destructive value>, false, <its own open-world value>))`, see TOOLS.md § Tool annotations.
 
-**Paired-tool add side** (`operation: add`): same shape but `feature_id` = the add tool's `database_record.custom_entitlement_id` (its `custom_` prefix carries the feature type; **not** `database_record.plugpass_id`, and **not** the tool's own `_meta` id), always **`check_remaining`**, passing the user's current count from the developer's own store (scoped to `sub`) as `current_count` — see TOOLS.md → Reading the user's current count.
+**Paired-tool add side** (`operation: add`): same shape but `feature_id` = the add tool's `database_record.custom_entitlement_id` (its `custom_` prefix carries the feature type; **not** `database_record.plugpass_id`, and **not** the tool's own `_meta` id), always **`check_remaining`**, passing the user's current count from the publisher's own store (scoped to `sub`) as `current_count` — see TOOLS.md → Reading the user's current count.
 
 **Identity tool** (the paired remove side, or any per-user free tool): no Entitlement API call — read `auth.sub()` from the context and scope the body to it.
 
-**Placement guidance.** An embedded-Jetty server follows the composition above; a servlet-container deployment registers the same three pieces in its `web.xml`/programmatic config (filter on `/mcp` only, `asyncSupported` true, PRM servlet public). If the developer's server must stay on the stateful `HttpServletStreamableServerTransportProvider` (tools that use sampling/elicitation), the identity path changes to `exchange.transportContext()` on `McpSyncServerExchange` and the same buffering filter works via the servlet's deferred-`complete()` semantics — but never wrap the GET listening stream, leave `keepAliveInterval` unset, and know that mid-call notifications are delayed until completion. Migration notes for a developer's older SDK: 1.x `McpSchema.JsonSchema` is deprecated (bridge maps in), and 2.0 validates tool inputs by default.
+**Placement guidance.** An embedded-Jetty server follows the composition above; a servlet-container deployment registers the same three pieces in its `web.xml`/programmatic config (filter on `/mcp` only, `asyncSupported` true, PRM servlet public). If the publisher's server must stay on the stateful `HttpServletStreamableServerTransportProvider` (tools that use sampling/elicitation), the identity path changes to `exchange.transportContext()` on `McpSyncServerExchange` and the same buffering filter works via the servlet's deferred-`complete()` semantics — but never wrap the GET listening stream, leave `keepAliveInterval` unset, and know that mid-call notifications are delayed until completion. Migration notes for a publisher's older SDK: 1.x `McpSchema.JsonSchema` is deprecated (bridge maps in), and 2.0 validates tool inputs by default.

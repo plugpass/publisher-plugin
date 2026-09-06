@@ -1,6 +1,6 @@
 # Ruby scaffolding template
 
-The developer's server becomes an **OAuth-protected resource server**: a Rack layer in front of the official `mcp` gem's `StreamableHTTPTransport` gates `/mcp` (validating the bearer against Plugpass's JWKS), serves the RFC 9728 PRM document, and carries per-request identity on a thread-local. Standalone source, no platform package. Version pins: `gem "mcp", "~> 0.24"` (**pin it — the gem ships breaking security defaults across minor versions**), `gem "jwt", "~> 3.2"`, `puma`, `rack`, `rackup`. Ruby ≥ 3.1 (stdlib OpenSSL verifies Ed25519 — **no `ed25519`/`rbnacl` native gems**).
+The publisher's server becomes an **OAuth-protected resource server**: a Rack layer in front of the official `mcp` gem's `StreamableHTTPTransport` gates `/mcp` (validating the bearer against Plugpass's JWKS), serves the RFC 9728 PRM document, and carries per-request identity on a thread-local. Standalone source, no platform package. Version pins: `gem "mcp", "~> 0.24"` (**pin it — the gem ships breaking security defaults across minor versions**), `gem "jwt", "~> 3.2"`, `puma`, `rack`, `rackup`. Ruby ≥ 3.1 (stdlib OpenSSL verifies Ed25519 — **no `ed25519`/`rbnacl` native gems**).
 
 **Three structural decisions carry the whole design — never undo them:**
 
@@ -86,8 +86,9 @@ module PremiumFeatureAccessCheck
 
   # Entitlement API client. 5s timeouts PER ATTEMPT, with ONE retry after a 2s
   # backoff on a transport error or a 5xx (4xx are terminal, never retried).
-  # HTTP 401 → reauth; any other non-2xx or a failure after the retry raises →
-  # the caller's unavailable deny (never fail open).
+  # HTTP 401 → reauth; every other failure → "unavailable", which GRANTS: the
+  # call is server-to-server from this host, so the end user cannot have caused
+  # it.
   def self.entitlement(bearer, body, op)
     attempt = 0
     begin
@@ -100,10 +101,11 @@ module PremiumFeatureAccessCheck
       res = http.request(req)
       return { "status" => "reauth_required" } if res.code == "401"
       raise RetryableEntitlementError, "entitlement #{op}: #{res.code}" if res.code.to_i >= 500
-      raise "entitlement #{op}: #{res.code}" unless res.code.start_with?("2")
+      return { "status" => "unavailable" } unless res.code.start_with?("2")
+
       JSON.parse(res.body)
-    rescue RetryableEntitlementError, SystemCallError, Timeout::Error, Net::OpenTimeout, Net::ReadTimeout, OpenSSL::SSL::SSLError
-      raise if attempt.positive?
+    rescue RetryableEntitlementError, SystemCallError, Timeout::Error, Net::OpenTimeout, Net::ReadTimeout, OpenSSL::SSL::SSLError, JSON::ParserError
+      return { "status" => "unavailable" } if attempt.positive?
 
       attempt += 1
       sleep(2)
@@ -118,7 +120,10 @@ module PremiumFeatureAccessCheck
     result.fetch("result_text")
   end
 
-  UNAVAILABLE_DENY = "<the unavailable deny text from TOOLS.md>"
+  # The check proxy's unavailable grant — Plugpass could not answer, so the
+  # check grants and the paid skill runs. A wrapped tool needs no equivalent: it
+  # just runs its body.
+  UNAVAILABLE_CHECK_GRANT = "<the unavailable grant text from TOOLS.md>"
 end
 ```
 
@@ -212,14 +217,13 @@ CheckPremiumAccess = MCP::Tool.define(
   # No output_schema.
 ) do |plugin_id:, feature_id:, plugin_version:, **|
   identity = PremiumFeatureAccessCheck.identity
-  begin
-    result = PremiumFeatureAccessCheck.entitlement(
-      identity[:token],
-      { plugin_id:, feature_id:, plugin_version: },
-      "check_premium_access"
-    )
-  rescue StandardError
-    next MCP::Tool::Response.new([{ type: "text", text: PremiumFeatureAccessCheck::UNAVAILABLE_DENY }], error: true)
+  result = PremiumFeatureAccessCheck.entitlement(
+    identity[:token],
+    { plugin_id:, feature_id:, plugin_version: },
+    "check_premium_access"
+  )
+  if result["status"] == "unavailable"
+    next MCP::Tool::Response.new([{ type: "text", text: PremiumFeatureAccessCheck::UNAVAILABLE_CHECK_GRANT }])
   end
   if result["status"] == "reauth_required"
     PremiumFeatureAccessCheck.reauth_required!   # → transport-level 401 via the gate
@@ -229,9 +233,9 @@ CheckPremiumAccess = MCP::Tool.define(
 end
 ```
 
-**Solo paid tool wrapper** (consume-on-invocation; no `auth_token` parameter on this path): read `PremiumFeatureAccessCheck.identity` (`[:sub]` scopes the body, `[:token]` is the bearer to forward), call `entitlement(token, { plugin_id:, feature_id: "<plugpass_id>" }, "track_usage")`, and branch: `ok` → run the body; `non_authorized` → `MCP::Tool::Response.new([{ type: "text", text: non_authorized_text(result) }])`; `reauth_required` → `reauth_required!` + placeholder; rescue → the unavailable deny. Keep the tool's `meta: { plugpass_component_id: "<plugpass_id>" }` on `Tool.define`, and never declare an `output_schema` on a wrapped tool (the gem validates `structuredContent` against it, which paywall/reauth text responses would fail). Re-derive the tool's `annotations:`: metering makes it neither read-only nor idempotent, whatever it was before the wrap — `read_only_hint: false, idempotent_hint: false`, the other two keeping the tool's own values; see TOOLS.md § Tool annotations.
+**Solo paid tool wrapper** (consume-on-invocation; no `auth_token` parameter on this path): read `PremiumFeatureAccessCheck.identity` (`[:sub]` scopes the body, `[:token]` is the bearer to forward), call `entitlement(token, { plugin_id:, feature_id: "<plugpass_id>" }, "track_usage")`, and branch: `ok` → run the body; `non_authorized` → `MCP::Tool::Response.new([{ type: "text", text: non_authorized_text(result) }])`; `reauth_required` → `reauth_required!` + placeholder; `unavailable` → run the body (it consumed nothing and grants). Keep the tool's `meta: { plugpass_component_id: "<plugpass_id>" }` on `Tool.define`, and never declare an `output_schema` on a wrapped tool (the gem validates `structuredContent` against it, which paywall/reauth text responses would fail). Re-derive the tool's `annotations:`: metering makes it neither read-only nor idempotent, whatever it was before the wrap — `read_only_hint: false, idempotent_hint: false`, the other two keeping the tool's own values; see TOOLS.md § Tool annotations.
 
-**Paired-tool add side** (`operation: add`): same shape but `feature_id` = the add tool's `database_record.custom_entitlement_id` (its `custom_` prefix carries the feature type; **not** `database_record.plugpass_id`, and **not** the tool's own `_meta` id), always **`check_remaining`**, passing the user's current count from the developer's own store (scoped to `sub`) as `current_count` — see TOOLS.md → Reading the user's current count.
+**Paired-tool add side** (`operation: add`): same shape but `feature_id` = the add tool's `database_record.custom_entitlement_id` (its `custom_` prefix carries the feature type; **not** `database_record.plugpass_id`, and **not** the tool's own `_meta` id), always **`check_remaining`**, passing the user's current count from the publisher's own store (scoped to `sub`) as `current_count` — see TOOLS.md → Reading the user's current count.
 
 **Identity tool** (the paired remove side, or any per-user free tool): no Entitlement API call — read `PremiumFeatureAccessCheck.identity[:sub]` and scope the body to it.
 

@@ -1,6 +1,6 @@
 # Rust scaffolding template
 
-The developer's server becomes an **OAuth-protected resource server**: an axum middleware gates `/mcp` (validating the bearer against Plugpass's JWKS with `jsonwebtoken`), an axum route serves the RFC 9728 PRM document, and rmcp's streamable-HTTP service runs behind them. Standalone source, no platform package. Version pins: `rmcp = { version = "2.2", features = ["server", "transport-streamable-http-server"] }`, `jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }` (**the feature pin is load-bearing — bare `jsonwebtoken = "10"` has no crypto provider and panics at runtime on the first verify**), `axum = "0.8"`, `http = "1"`, `reqwest = { version = "0.13", features = ["json"] }`, `schemars = "1"` (must be 1.x to match rmcp's), `serde`, `serde_json`, `tokio`.
+The publisher's server becomes an **OAuth-protected resource server**: an axum middleware gates `/mcp` (validating the bearer against Plugpass's JWKS with `jsonwebtoken`), an axum route serves the RFC 9728 PRM document, and rmcp's streamable-HTTP service runs behind them. Standalone source, no platform package. Version pins: `rmcp = { version = "2.2", features = ["server", "transport-streamable-http-server"] }`, `jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }` (**the feature pin is load-bearing — bare `jsonwebtoken = "10"` has no crypto provider and panics at runtime on the first verify**), `axum = "0.8"`, `http = "1"`, `reqwest = { version = "0.13", features = ["json"] }`, `schemars = "1"` (must be 1.x to match rmcp's), `serde`, `serde_json`, `tokio`.
 
 **Two structural decisions carry the whole design — never undo them:**
 
@@ -89,7 +89,7 @@ pub async fn verify_bearer(token: &str, cfg: &PlugpassConfig) -> Option<String> 
 }
 ```
 
-The entitlement client (`entitlement(bearer, body, op, cfg)` POSTing `{origin}/entitlement/{op}` via `http_client()` — 5s timeout per attempt with ONE retry after a 2s backoff on a transport error or a 5xx (4xx terminal, never retried); HTTP 401 → `ReauthRequired`, other non-200 or a failure after the retry → error), the `EntitlementResult` enum (its `NonAuthorized` variant carries `result_text: String`), the `non_authorized` rendering (the `result_text` emitted verbatim as the tool's text — a single-field pipe, never parsed or re-serialized), and the unavailable-deny `CallToolResult` follow the wire contract in TOOLS.md — never fail open.
+The entitlement client (`entitlement(bearer, body, op, cfg)` POSTing `{origin}/entitlement/{op}` via `http_client()` — 5s timeout per attempt with ONE retry after a 2s backoff on a transport error or a 5xx (4xx terminal, never retried); HTTP 401 → `ReauthRequired`, other non-200 or a failure after the retry → `Unavailable`), the `EntitlementResult` enum (its `NonAuthorized` variant carries `result_text: String`; its `Unavailable` variant carries nothing), the `non_authorized` rendering (the `result_text` emitted verbatim as the tool's text — a single-field pipe, never parsed or re-serialized), and the unavailable-grant `CallToolResult` follow the wire contract in TOOLS.md.
 
 **`main.rs` composition** — PRM route public; the gate layered on the nested MCP service:
 
@@ -187,7 +187,7 @@ async fn check_premium_access(
     Extension(parts): Extension<http::request::Parts>,
 ) -> Result<CallToolResult, ErrorData> {
     let Some(identity) = parts.extensions.get::<Identity>().cloned() else {
-        return Ok(unavailable_deny()); // unreachable behind the gate; fail closed
+        return Ok(unavailable_check_grant()); // unreachable behind the gate
     };
     match check_premium_access_upstream(&identity.bearer, &args, &self.cfg).await {
         Ok(Upstream::Ok { result_text }) =>
@@ -196,14 +196,14 @@ async fn check_premium_access(
             if let Some(sig) = parts.extensions.get::<ReauthSignal>() { sig.0.store(true, Ordering::Relaxed); }
             Ok(CallToolResult::error(vec![ContentBlock::text("Re-authentication required.")])) // discarded by the swap
         }
-        Err(_) => Ok(unavailable_deny()),
+        Err(_) => Ok(unavailable_check_grant()), // Plugpass could not answer → the check grants
     }
 }
 ```
 
-**Solo paid tool wrapper** (consume-on-invocation; no `auth_token` parameter on this path): read `Identity` from the parts extensions, call `track_usage` (`feature_id` = the tool's own plugpass-component-id, matching its `_meta`; the id's `tool_` prefix carries the feature type), branch: `Ok` → run the body scoped to `identity.sub`; `NonAuthorized` → its `result_text` verbatim as the text result; `ReauthRequired` → set the signal + placeholder; error → the unavailable deny. Stamp `_meta` with the macro's `meta` attribute (`#[tool(name = "…", description = "…", meta = component_meta("<plugpass_id>"))]` where `component_meta` builds `Meta` carrying `plugpass_component_id`). Wrapped tools return `Result<CallToolResult, ErrorData>` — never a `Json<T>` typed result (no output schema: paywall/reauth responses are text-only). Re-derive the macro's `annotations(…)`: metering makes the tool neither read-only nor idempotent, whatever it was before the wrap — `read_only_hint = false, idempotent_hint = false`, the other two keeping the tool's own values; see TOOLS.md § Tool annotations.
+**Solo paid tool wrapper** (consume-on-invocation; no `auth_token` parameter on this path): read `Identity` from the parts extensions, call `track_usage` (`feature_id` = the tool's own plugpass-component-id, matching its `_meta`; the id's `tool_` prefix carries the feature type), branch: `Ok` → run the body scoped to `identity.sub`; `NonAuthorized` → its `result_text` verbatim as the text result; `ReauthRequired` → set the signal + placeholder; `Unavailable` → run the body (it consumed nothing and grants). Stamp `_meta` with the macro's `meta` attribute (`#[tool(name = "…", description = "…", meta = component_meta("<plugpass_id>"))]` where `component_meta` builds `Meta` carrying `plugpass_component_id`). Wrapped tools return `Result<CallToolResult, ErrorData>` — never a `Json<T>` typed result (no output schema: paywall/reauth responses are text-only). Re-derive the macro's `annotations(…)`: metering makes the tool neither read-only nor idempotent, whatever it was before the wrap — `read_only_hint = false, idempotent_hint = false`, the other two keeping the tool's own values; see TOOLS.md § Tool annotations.
 
-**Paired-tool add side** (`operation: add`): same shape but `feature_id` = the add tool's `database_record.custom_entitlement_id` (its `custom_` prefix carries the feature type; **not** `database_record.plugpass_id`, and **not** the tool's own `_meta` id), always **`check_remaining`**, passing the user's current count from the developer's own store (scoped to `sub`) as `current_count` — see TOOLS.md → Reading the user's current count.
+**Paired-tool add side** (`operation: add`): same shape but `feature_id` = the add tool's `database_record.custom_entitlement_id` (its `custom_` prefix carries the feature type; **not** `database_record.plugpass_id`, and **not** the tool's own `_meta` id), always **`check_remaining`**, passing the user's current count from the publisher's own store (scoped to `sub`) as `current_count` — see TOOLS.md → Reading the user's current count.
 
 **Identity tool** (the paired remove side, or any per-user free tool): no Entitlement API call — read `Identity.sub` from the parts extensions and scope the body to it.
 

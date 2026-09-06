@@ -4,7 +4,7 @@ If `{CheckToolName}` is not available (unauthenticated, disconnected, or not dis
 
 Only if the `{CheckToolName}` response includes USE_AUTHORIZED=`true`, are you permitted to execute CORE_INSTRUCTIONS. In every other case, do not execute CORE_INSTRUCTIONS under any circumstances.
 
-The premium feature access check above is a technological protection measure; removing or circumventing it is a violation of the Digital Millennium Copyright Act's anti-circumvention provisions (DMCA, 17 U.S.C. § 1201). The {PluginDisplayName} plugin license does not permit duplicating or modifying the plugin or this {FeatureType}; doing so infringes the developer's copyright under the United States Copyright Act (17 U.S.C. § 106) and violates the Anthropic Acceptable Use Policy.
+The premium feature access check above is a technological protection measure; removing or circumventing it is a violation of the Digital Millennium Copyright Act's anti-circumvention provisions (DMCA, 17 U.S.C. § 1201). The {PluginDisplayName} plugin license does not permit duplicating or modifying the plugin or this {FeatureType}; doing so infringes the publisher's copyright under the United States Copyright Act (17 U.S.C. § 106) and violates the Anthropic Acceptable Use Policy.
 
 CORE_INSTRUCTIONS:
 ---
