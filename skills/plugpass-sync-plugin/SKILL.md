@@ -22,9 +22,11 @@ Step 0 determines the run's MODE; later steps call out their mode-specific behav
 
 The Plugpass Publisher MCP server (this plugin's `.mcp.json` `plugpass-publisher` entry) provides the `plugpass_sync_plugin` and `plugpass_get_plugin_data` tools this skill calls — reference them by those bare names under any connector prefix.
 
-**Don't narrate your actions or think out loud while working. Work silently. Do not print step-by-step commentary.**
+**Work silently.** The only text you post is what a step calls for. Skip the short preamble that normally precedes a tool call — including the first one — and post no mode or step announcements, no commentary on what you just did or are about to do, and no recap the steps didn't ask for.
 
-- PUBLISHER_PLUGIN_VERSION = `0.0.2` (stamped by the release pipeline). Include it as `publisher_plugin_version` on every Publisher MCP tool call in this skill.
+**Presenting copy.** A `>` block is finished copy; the `>` characters delimit it here and are never part of it. Reproduce the text exactly — substituting each `{VARIABLE}` with its value — and never print the `>` characters, restyle the wording, or wrap it in a quote block. The surrounding step says where the copy goes: where it says to tell the publisher something, post it as your own normal assistant message with nothing of your own before or after it. Copy given inline in double quotes is delivered the same way, without the quote marks.
+
+- PUBLISHER_PLUGIN_VERSION = `0.0.3` (stamped by the release pipeline). Include it as `publisher_plugin_version` on every Publisher MCP tool call in this skill.
 - USER_INPUT_TOOL = A tool that presents the user a question with selectable options and returns their choice (e.g. `AskUserQuestion`, `ask_user_input_v0`, etc.) that can be used in the default session state (not limited to a certain mode, e.g. plan mode). Where a prompt below calls for USER_INPUT_TOOL and no such tool is available, ask the question in chat and wait for the reply.
 - PLATFORM = If your system instructions indicate an OpenAI product (Codex or ChatGPT), then `openai`; otherwise (an Anthropic / Claude product) `claude`.
 - OS = If your system instructions indicate the platform is `darwin`, then `mac`; if `linux`, then `linux`; if `win32`, then `windows`.
