@@ -18,12 +18,16 @@ const JWKS_URL = '<plugpass_jwks_url>';
 const ENTITLEMENT_API_ORIGIN = '<entitlement_api_origin>';
 // This server's own public MCP URL — the JWT `aud` pin and the PRM `resource`.
 const RESOURCE_URL = '<this server's RESOURCE_URL>';
+// Where the Plugpass paywall for MCP Apps widgets loads from (the `ui_paywall`
+// layer — only on a server whose directive names it).
+const PAYWALL_SCRIPT_URL = '<paywall_script_url>';
 
 export interface PlugpassConfig {
   issuer: string;
   jwksUrl: string;
   entitlementApiOrigin: string;
   resourceUrl: string;
+  paywallScriptUrl: string;
 }
 
 export function plugpassConfig(): PlugpassConfig {
@@ -32,6 +36,7 @@ export function plugpassConfig(): PlugpassConfig {
     jwksUrl: JWKS_URL,
     entitlementApiOrigin: ENTITLEMENT_API_ORIGIN,
     resourceUrl: RESOURCE_URL,
+    paywallScriptUrl: PAYWALL_SCRIPT_URL,
   };
 }
 
@@ -152,8 +157,81 @@ export async function entitlement(
 // reformat, or re-serialize it. reauth is handled by the CALLER (set the
 // ReauthSignal — the route turns it into the transport-level 401); it never
 // renders as tool text.
-export function nonAuthorizedToolResponse(r: Extract<EntitlementResult, { status: 'non_authorized' }>): CallToolResult {
-  return { content: [{ type: 'text', text: r.result_text }] };
+//
+// Two things ride beside it for the Plugpass paywall an MCP Apps widget shows
+// (both inert everywhere else):
+//   - The denial NAMES the call it denied, on the result's `_meta` — which
+//     hosts pass to a widget and never show the model — so the paywall can
+//     replay the same call once the user has upgraded, and says whether a
+//     widget may call the tool at all (widgetCallable below): a host refuses
+//     a widget's call to a model-only tool, so the paywall then hands the
+//     retry to the conversation instead.
+//   - The marker: when the denied tool is UI-backed (it renders a widget) AND
+//     the client renders widgets (paywallUi below), a second text block
+//     carries PLUGPASS_PAYWALL_UI=true. The widget's paywall is then the one
+//     asking the user, and the plugin's access-handler skill posts nothing
+//     beside it. The composed text stays untouched in its own block.
+// Both read the tool's own registered `_meta` and the request's, at runtime.
+export interface DeniedCall {
+  name: string;
+  arguments: Record<string, unknown>;
+}
+
+export const PAYWALL_UI_MARKER = 'PLUGPASS_PAYWALL_UI=true';
+
+export function nonAuthorizedToolResponse(
+  r: Extract<EntitlementResult, { status: 'non_authorized' }>,
+  call: DeniedCall,
+  toolMeta: ToolMeta,
+  requestMeta: Record<string, unknown> | undefined,
+): CallToolResult {
+  return {
+    content: paywallUi(toolMeta, requestMeta)
+      ? [{ type: 'text', text: r.result_text }, { type: 'text', text: PAYWALL_UI_MARKER }]
+      : [{ type: 'text', text: r.result_text }],
+    _meta: { plugpass_denied_call: { ...call, widget_callable: widgetCallable(toolMeta) } },
+  };
+}
+
+// Whether the calling client renders MCP Apps widgets: it declared the UI
+// extension among the client capabilities every request carries in its `_meta`
+// (`io.modelcontextprotocol/clientCapabilities` — the stateless protocol's
+// per-request declaration; this server keeps no session, so the initialize
+// handshake is not a source). Read off the tool handler's `extra._meta`.
+const CLIENT_CAPABILITIES_META_KEY = 'io.modelcontextprotocol/clientCapabilities';
+const UI_EXTENSION_ID = 'io.modelcontextprotocol/ui';
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+export function clientRendersWidgets(meta: Record<string, unknown> | undefined): boolean {
+  const capabilities = meta?.[CLIENT_CAPABILITIES_META_KEY];
+  if (!isRecord(capabilities) || !isRecord(capabilities.extensions)) return false;
+  return isRecord(capabilities.extensions[UI_EXTENSION_ID]);
+}
+
+// The `_meta` a tool registers with: its plugpass-component-id and, on a
+// UI-backed tool, the widget it renders.
+export type ToolMeta = {
+  plugpass_component_id: string;
+  ui?: { resourceUri: string; visibility?: Array<'model' | 'app'> };
+};
+
+// Whether the widget's paywall is the one asking on this denial: the tool
+// renders a widget (its own registration declares `ui.resourceUri`) AND the
+// client renders widgets. Read off the registration at runtime, so a tool that
+// gains or loses its widget changes nothing here.
+export function paywallUi(toolMeta: ToolMeta, requestMeta: Record<string, unknown> | undefined): boolean {
+  return toolMeta.ui !== undefined && clientRendersWidgets(requestMeta);
+}
+
+// Who may call the tool, off the same registration: an undeclared visibility
+// means the model and a widget both may; a declared list means exactly its
+// members. A widget's paywall replays a denied call itself only when it may.
+export function widgetCallable(toolMeta: ToolMeta): boolean {
+  const visibility = toolMeta.ui?.visibility;
+  return visibility === undefined || visibility.includes('app');
 }
 
 // The check proxy's unavailable grant — Plugpass could not answer, so the check
@@ -275,6 +353,11 @@ export function registerCheckPremiumAccess(server: McpServer, cfg: PlugpassConfi
 **Solo paid tool wrapper** (consume-on-invocation; identity + bearer from `extra.authInfo` — there is no `auth_token` parameter on this path):
 
 ```ts
+// The registration's `_meta`, hoisted so the marker rule reads the same object
+// the tool registers with. A UI-backed tool keeps its `ui: { resourceUri,
+// visibility }` here beside the id.
+const PAID_TOOL_META: ToolMeta = { plugpass_component_id: '<plugpass_id>' };
+
 server.registerTool(
   'paid_tool',
   {
@@ -283,7 +366,7 @@ server.registerTool(
     // Metering makes this tool neither read-only nor idempotent, whatever it was
     // before the wrap. The other two hints keep the tool's own values.
     annotations: { readOnlyHint: false, destructiveHint: <the tool's own value>, idempotentHint: false, openWorldHint: <the tool's own value> },
-    _meta: { plugpass_component_id: '<plugpass_id>' },
+    _meta: PAID_TOOL_META,
   },
   async (args, extra) => {
     const auth = extra.authInfo;
@@ -292,7 +375,10 @@ server.registerTool(
       ? await entitlement(auth.token, { plugin_id: '<plugin-plugpass-id>', feature_id: '<plugpass_id>' }, 'track_usage', cfg)
       : { status: 'unavailable' };
     if (r.status === 'reauth_required') { reauth.triggered = true; return { content: [{ type: 'text', text: 'Re-authentication required.' }] }; }
-    if (r.status === 'non_authorized') return nonAuthorizedToolResponse(r);
+    // The denial names this call (the tool's name and its actual arguments); the
+    // renderer reads the tool's own registered `_meta` (its widget, who may call
+    // it) and the request's: never a baked per-tool constant.
+    if (r.status === 'non_authorized') return nonAuthorizedToolResponse(r, { name: 'paid_tool', arguments: args }, PAID_TOOL_META, extra._meta);
     /* …existing tool body — keyed / scoped to `sub`; `unavailable` consumed nothing and grants… */
   },
 );
@@ -302,4 +388,51 @@ server.registerTool(
 
 **Identity tool** (the paired remove side, or any per-user free tool): no Entitlement API call at all — read `extra.authInfo.extra.sub` and scope the body to it. Zero Plugpass round-trips.
 
-**Placement guidance.** Adapt to the publisher's structure: a Hono/Workers server follows the reference shape above; an express or bare-`node:http` server uses the `getRequestListener` variant. Whatever the layout, the invariants are: the gate covers every `/mcp` method; the PRM route is unauthenticated; `enableJsonResponse: true` on every transport construction; the reauth check sits between `handleRequest` resolving and the response being returned; wrapped tools keep `_meta.plugpass_component_id` and lose any `outputSchema`.
+**The in-widget paywall (`ui_paywall`, servers that render widgets).** The helper below, in `premium-feature-access-check.ts`, is applied to every resource the server reads out whose MIME type is `text/html;profile=mcp-app`: the paywall script tag goes first in `<head>`, and the script's origin joins the resource's `resourceDomains`. The widget HTML itself is never edited.
+
+```ts
+// The CSP a UI resource declares on its contents (`_meta.ui.csp`).
+export interface UiResourceCsp {
+  connectDomains?: string[];
+  resourceDomains?: string[];
+  frameDomains?: string[];
+  baseUriDomains?: string[];
+}
+
+// Loads the Plugpass paywall into a widget's HTML on its way out: the script
+// tag first in <head> (ahead of the widget's own code; prepended to the
+// document when it has no <head>), its origin added to `resourceDomains` so
+// the sandbox lets it load.
+export function withPaywall(html: string, csp: UiResourceCsp, cfg: PlugpassConfig): { html: string; csp: UiResourceCsp } {
+  const tag = `<script src="${cfg.paywallScriptUrl}"></script>`;
+  const head = /<head(\s[^>]*)?>/i.exec(html);
+  const injected =
+    head === null
+      ? `${tag}${html}`
+      : `${html.slice(0, head.index + head[0].length)}${tag}${html.slice(head.index + head[0].length)}`;
+  const origin = new URL(cfg.paywallScriptUrl).origin;
+  const resourceDomains = csp.resourceDomains ?? [];
+  return {
+    html: injected,
+    csp: { ...csp, resourceDomains: resourceDomains.includes(origin) ? resourceDomains : [...resourceDomains, origin] },
+  };
+}
+```
+
+Every UI resource read passes through it:
+
+```ts
+server.registerResource(
+  'widget',
+  'ui://<plugin>/<widget>',
+  { title: '…', description: '…', mimeType: 'text/html;profile=mcp-app' },
+  (uri) => {
+    const { html, csp } = withPaywall(WIDGET_HTML, WIDGET_CSP, cfg);
+    return Promise.resolve({
+      contents: [{ uri: uri.href, mimeType: 'text/html;profile=mcp-app', text: html, _meta: { ui: { csp } } }],
+    });
+  },
+);
+```
+
+**Placement guidance.** Adapt to the publisher's structure: a Hono/Workers server follows the reference shape above; an express or bare-`node:http` server uses the `getRequestListener` variant. Whatever the layout, the invariants are: the gate covers every `/mcp` method; the PRM route is unauthenticated; `enableJsonResponse: true` on every transport construction; the reauth check sits between `handleRequest` resolving and the response being returned; wrapped tools keep `_meta.plugpass_component_id` and lose any `outputSchema`; on a server whose directive names `ui_paywall`, every `text/html;profile=mcp-app` resource read passes through `withPaywall`.

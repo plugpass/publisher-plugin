@@ -38,10 +38,13 @@ const (
 	entitlementAPIOrigin = "<entitlement_api_origin>"
 	// This server's own public MCP URL — the JWT aud pin and the PRM resource.
 	resourceURL = "<this server's RESOURCE_URL>"
+	// Where the Plugpass paywall for MCP Apps widgets loads from (the ui_paywall
+	// layer — only on a server whose directive names it).
+	paywallScriptURL = "<paywall_script_url>"
 )
 
 type plugpassConfig struct {
-	issuer, jwksURL, entitlementAPIOrigin, resourceURL string
+	issuer, jwksURL, entitlementAPIOrigin, resourceURL, paywallScriptURL string
 }
 
 func loadPlugpassConfig() plugpassConfig {
@@ -50,6 +53,7 @@ func loadPlugpassConfig() plugpassConfig {
 		jwksURL:              jwksURL,
 		entitlementAPIOrigin: entitlementAPIOrigin,
 		resourceURL:          resourceURL,
+		paywallScriptURL:     paywallScriptURL,
 	}
 }
 
@@ -193,7 +197,88 @@ func reauthTo401(cfg plugpassConfig, next http.Handler) http.Handler {
 }
 ```
 
-The entitlement client, the `EntitlementResult` union, the `non_authorized` rendering (the response's `result_text` string emitted verbatim as the tool's text — a single-field pipe, never parsed or re-serialized), and the unavailable-grant `CallToolResult` carry over from the wire contract in TOOLS.md — POST `{cfg.entitlementAPIOrigin}/entitlement/{op}` with the forwarded bearer and a 5-second `http.Client` timeout per attempt — ONE retry after a 2-second backoff on a transport error or a 5xx (4xx are terminal, never retried); HTTP 401 → reauth; any other non-200 or a transport failure after the retry → the unavailable grant.
+The entitlement client, the `EntitlementResult` union, and the unavailable-grant `CallToolResult` carry over from the wire contract in TOOLS.md — POST `{cfg.entitlementAPIOrigin}/entitlement/{op}` with the forwarded bearer and a 5-second `http.Client` timeout per attempt — ONE retry after a 2-second backoff on a transport error or a 5xx (4xx are terminal, never retried); HTTP 401 → reauth; any other non-200 or a transport failure after the retry → the unavailable grant. The `non_authorized` rendering is the response's `result_text` string emitted verbatim as the tool's text — a single-field pipe, never parsed or re-serialized — plus the two things the in-widget paywall reads (inert everywhere else): the denial NAMES the call it denied on the result's `_meta` (hosts pass it to a widget, never to the model), and, on a UI-backed tool when the client renders widgets, a second text block carries the `PLUGPASS_PAYWALL_UI=true` marker, so the widget's paywall asks and the access-handler skill posts nothing beside it:
+
+```go
+type deniedCall struct {
+	Name      string `json:"name"`
+	Arguments any    `json:"arguments"`
+	// Whether a widget may call the tool at all (its registered visibility);
+	// set by nonAuthorizedToolResponse.
+	WidgetCallable bool `json:"widget_callable"`
+}
+
+const paywallUIMarker = "PLUGPASS_PAYWALL_UI=true"
+
+// Both facts the paywall reads — the marker and widget_callable — come off the
+// tool's own registered Meta and the request, at runtime.
+func nonAuthorizedToolResponse(r *entitlementResult, call deniedCall, toolMeta mcp.Meta, req *mcp.CallToolRequest) *mcp.CallToolResult {
+	content := []mcp.Content{&mcp.TextContent{Text: r.ResultText}}
+	if paywallUI(toolMeta, req) {
+		content = append(content, &mcp.TextContent{Text: paywallUIMarker})
+	}
+	call.WidgetCallable = widgetCallable(toolMeta)
+	return &mcp.CallToolResult{Meta: mcp.Meta{"plugpass_denied_call": call}, Content: content}
+}
+
+// Whether the calling client renders MCP Apps widgets: it declared the UI
+// extension among the client capabilities every request carries in its _meta
+// (io.modelcontextprotocol/clientCapabilities — the stateless protocol's
+// per-request declaration; this server keeps no session, so the initialize
+// handshake is not a source). Read off the tool request's params.
+const (
+	clientCapabilitiesMetaKey = "io.modelcontextprotocol/clientCapabilities"
+	uiExtensionID             = "io.modelcontextprotocol/ui"
+)
+
+func clientRendersWidgets(req *mcp.CallToolRequest) bool {
+	if req == nil || req.Params == nil {
+		return false
+	}
+	capabilities, ok := req.Params.Meta[clientCapabilitiesMetaKey].(map[string]any)
+	if !ok {
+		return false
+	}
+	extensions, ok := capabilities["extensions"].(map[string]any)
+	if !ok {
+		return false
+	}
+	_, ok = extensions[uiExtensionID].(map[string]any)
+	return ok
+}
+
+// paywallUI reports whether the widget's paywall is the one asking on this
+// denial: the tool renders a widget (its own registration's Meta declares
+// ui.resourceUri) AND the client renders widgets. Read off the registration at
+// runtime, so a tool that gains or loses its widget changes nothing here.
+func paywallUI(toolMeta mcp.Meta, req *mcp.CallToolRequest) bool {
+	ui, ok := toolMeta["ui"].(map[string]any)
+	if !ok {
+		return false
+	}
+	_, ok = ui["resourceUri"].(string)
+	return ok && clientRendersWidgets(req)
+}
+
+// widgetCallable reports who may call the tool, off the same registration: an
+// undeclared visibility means the model and a widget both may; a declared list
+// means exactly its members. A widget's paywall replays a denied call itself
+// only when it may.
+func widgetCallable(toolMeta mcp.Meta) bool {
+	ui, ok := toolMeta["ui"].(map[string]any)
+	if !ok {
+		return true
+	}
+	switch visibility := ui["visibility"].(type) {
+	case []string:
+		return slices.Contains(visibility, "app")
+	case []any:
+		return slices.Contains(visibility, any("app"))
+	default:
+		return true
+	}
+}
+```
 
 **`main.go` composition** — PRM route public, bearer gate outermost on `/mcp`, reauth buffer inside it:
 
@@ -263,10 +348,58 @@ mcp.AddTool(server, &mcp.Tool{
 })
 ```
 
-**Solo paid tool wrapper** (consume-on-invocation; no `auth_token` parameter on this path): validate nothing in the handler — the gate already did — read `sub` + bearer from `req.Extra.TokenInfo`, call `track_usage` (`feature_id` = the tool's own plugpass-component-id, matching its `_meta`; the id's `tool_` prefix carries the feature type), and branch: `ok` → run the body scoped to `sub`; `non_authorized` → the `result_text` verbatim as the text result; `reauth_required` → `setReauthRequired(ctx)` + placeholder; error/timeout, or any other non-200 → run the body (the unavailable grant consumed nothing). Keep `_meta` via the tool's `Meta` field (`mcp.Tool{ …, Meta: mcp.Meta{"plugpass_component_id": "<plugpass_id>"} }`) and never declare an output schema on a wrapped tool (use `any` for the structured output type). Re-derive the tool's `Annotations`: metering makes it neither read-only nor idempotent, whatever it was before the wrap — `Annotations: toolHints(false, <its own destructive value>, false, <its own open-world value>)`, see TOOLS.md § Tool annotations.
+**Solo paid tool wrapper** (consume-on-invocation; no `auth_token` parameter on this path): validate nothing in the handler — the gate already did — read `sub` + bearer from `req.Extra.TokenInfo`, call `track_usage` (`feature_id` = the tool's own plugpass-component-id, matching its `_meta`; the id's `tool_` prefix carries the feature type), and branch: `ok` → run the body scoped to `sub`; `non_authorized` → `nonAuthorizedToolResponse(result, deniedCall{Name: "<tool name>", Arguments: args}, paidToolMeta, req)` (the renderer reads the tool's own registered `Meta` — its widget, who may call it — and the request, never a baked per-tool constant); `reauth_required` → `setReauthRequired(ctx)` + placeholder; error/timeout, or any other non-200 → run the body (the unavailable grant consumed nothing). Keep `_meta` via the tool's `Meta` field, hoisted to a package-level `var paidToolMeta = mcp.Meta{"plugpass_component_id": "<plugpass_id>"}` (a UI-backed tool keeps its `"ui": map[string]any{"resourceUri": …, "visibility": …}` beside it) that both the registration (`Meta: paidToolMeta`) and the marker rule read, and never declare an output schema on a wrapped tool (use `any` for the structured output type). Re-derive the tool's `Annotations`: metering makes it neither read-only nor idempotent, whatever it was before the wrap — `Annotations: toolHints(false, <its own destructive value>, false, <its own open-world value>)`, see TOOLS.md § Tool annotations.
 
 **Paired-tool add side** (`operation: add`): same shape but `feature_id` = the add tool's `database_record.custom_entitlement_id` (its `custom_` prefix carries the feature type; **not** `database_record.plugpass_id`, and **not** the tool's own `_meta` id), always **`check_remaining`**, passing the user's current count from the publisher's own store (scoped to `sub`) as `current_count` — see TOOLS.md → Reading the user's current count.
 
 **Identity tool** (the paired remove side, or any per-user free tool): no Entitlement API call — read `req.Extra.TokenInfo.UserID` and scope the body to it.
 
-**Placement guidance.** A vanilla `net/http` server follows the composition above; a server using chi/gin/echo mounts the same three pieces (public PRM route; `requireAuth(reauthTo401(mcpHandler))` on `/mcp`) through its router's `http.Handler` adapters. Invariants regardless of layout: `Stateless: true, JSONResponse: true` (both — the flag mechanism silently dies in stateful mode); verifier failures wrap `auth.ErrInvalidToken`; the gate covers every `/mcp` method. Local-dev note: the SDK 403s requests whose `Host` isn't loopback when listening on loopback (DNS-rebinding guard) — testing through a tunnel needs `DisableLocalhostProtection: true`, never in production.
+**The in-widget paywall (`ui_paywall`, servers that render widgets).** The helper below, in `premium_feature_access_check.go`, is applied to every resource the server reads out whose MIME type is `text/html;profile=mcp-app`: the paywall script tag goes first in `<head>`, and the script's origin joins the resource's `resourceDomains`. The widget HTML itself is never edited.
+
+```go
+// The CSP a UI resource declares on its contents (_meta.ui.csp).
+type uiResourceCsp struct {
+	ConnectDomains  []string `json:"connectDomains,omitempty"`
+	ResourceDomains []string `json:"resourceDomains,omitempty"`
+	FrameDomains    []string `json:"frameDomains,omitempty"`
+	BaseURIDomains  []string `json:"baseUriDomains,omitempty"`
+}
+
+var headOpenTag = regexp.MustCompile(`(?i)<head(\s[^>]*)?>`)
+
+// The script tag first in <head> (ahead of the widget's own code; prepended to
+// the document when it has no <head>), its origin added to resourceDomains so
+// the sandbox lets it load.
+func withPaywall(html string, csp uiResourceCsp, cfg plugpassConfig) (string, uiResourceCsp) {
+	tag := `<script src="` + cfg.paywallScriptURL + `"></script>`
+	injected := tag + html
+	if loc := headOpenTag.FindStringIndex(html); loc != nil {
+		injected = html[:loc[1]] + tag + html[loc[1]:]
+	}
+	origin := cfg.paywallScriptURL
+	if u, err := url.Parse(cfg.paywallScriptURL); err == nil {
+		origin = u.Scheme + "://" + u.Host
+	}
+	widened := csp
+	widened.ResourceDomains = slices.Clone(csp.ResourceDomains)
+	if !slices.Contains(widened.ResourceDomains, origin) {
+		widened.ResourceDomains = append(widened.ResourceDomains, origin)
+	}
+	return injected, widened
+}
+```
+
+Every UI resource read passes through it:
+
+```go
+server.AddResource(&mcp.Resource{URI: "ui://<plugin>/<widget>", Name: "widget", Title: "…", Description: "…", MIMEType: "text/html;profile=mcp-app"},
+	func(ctx context.Context, req *mcp.ReadResourceRequest) (*mcp.ReadResourceResult, error) {
+		html, csp := withPaywall(widgetHTML, widgetCSP, cfg)
+		return &mcp.ReadResourceResult{Contents: []*mcp.ResourceContents{{
+			URI: req.Params.URI, MIMEType: "text/html;profile=mcp-app", Text: html,
+			Meta: mcp.Meta{"ui": map[string]any{"csp": csp}},
+		}}}, nil
+	})
+```
+
+**Placement guidance.** A vanilla `net/http` server follows the composition above; a server using chi/gin/echo mounts the same three pieces (public PRM route; `requireAuth(reauthTo401(mcpHandler))` on `/mcp`) through its router's `http.Handler` adapters. Invariants regardless of layout: `Stateless: true, JSONResponse: true` (both — the flag mechanism silently dies in stateful mode); verifier failures wrap `auth.ErrInvalidToken`; the gate covers every `/mcp` method; on a server whose directive names `ui_paywall`, every `text/html;profile=mcp-app` resource read passes through `withPaywall`. Local-dev note: the SDK 403s requests whose `Host` isn't loopback when listening on loopback (DNS-rebinding guard) — testing through a tunnel needs `DisableLocalhostProtection: true`, never in production.

@@ -1,7 +1,7 @@
 {
   "name": "plugpass",
   "displayName": "Plugpass",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "Monetize your AI plugins.",
   "author": { "name": "Plugpass" },
   "license": "LicenseRef-Plugpass-Publisher-Plugin-1.0"

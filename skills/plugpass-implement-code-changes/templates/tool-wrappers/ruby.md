@@ -25,11 +25,15 @@ module PremiumFeatureAccessCheck
   ENTITLEMENT_API_ORIGIN = "<entitlement_api_origin>"
   # This server's own public MCP URL — the JWT `aud` pin and the PRM `resource`.
   RESOURCE_URL = "<this server's RESOURCE_URL>"
+  # Where the Plugpass paywall for MCP Apps widgets loads from (the `ui_paywall`
+  # layer — only on a server whose directive names it).
+  PAYWALL_SCRIPT_URL = "<paywall_script_url>"
 
   def self.issuer = ISSUER
   def self.jwks_url = JWKS_URL
   def self.entitlement_api_origin = ENTITLEMENT_API_ORIGIN
   def self.resource_url = RESOURCE_URL
+  def self.paywall_script_url = PAYWALL_SCRIPT_URL
   # RFC 9728 path-aware form: origin + /.well-known/oauth-protected-resource + /mcp.
   def self.prm_url = "#{resource_url.delete_suffix(MCP_PATH)}/.well-known/oauth-protected-resource#{MCP_PATH}"
 
@@ -113,11 +117,71 @@ module PremiumFeatureAccessCheck
     end
   end
 
+  # The marker a UI-backed tool's denial carries when the client renders widgets.
+  PAYWALL_UI_MARKER = "PLUGPASS_PAYWALL_UI=true"
+
   # non_authorized → result_text verbatim — a single-field pipe (the trigger
-  # keys inside it auto-fire the plugin's access-handler skill). Never
-  # parse, reformat, or re-serialize it.
-  def self.non_authorized_text(result)
-    result.fetch("result_text")
+  # keys inside it auto-fire the plugin's access-handler skill). Never parse,
+  # reformat, or re-serialize it.
+  #
+  # Two things ride beside it for the Plugpass paywall an MCP Apps widget shows
+  # (both inert everywhere else):
+  #   - The denial NAMES the call it denied (`call`: the tool's name and the
+  #     arguments it was called with), on the result's `_meta` — which hosts
+  #     pass to a widget and never show the model — so the paywall can replay
+  #     the same call once the user has upgraded, and says whether a widget
+  #     may call the tool at all (widget_callable below): a host refuses a
+  #     widget's call to a model-only tool, so the paywall then hands the retry
+  #     to the conversation instead.
+  #   - The marker: when the denied tool is UI-backed (it renders a widget) AND
+  #     the client renders widgets (paywall_ui below), a second text block
+  #     carries PLUGPASS_PAYWALL_UI=true. The widget's paywall is then the one
+  #     asking the user, and the plugin's access-handler skill posts nothing
+  #     beside it. The composed text stays untouched in its own block.
+  # Both read the tool's own registered meta and the request's, at runtime.
+  def self.non_authorized_tool_response(result, call, tool_meta, server_context)
+    content = [{ type: "text", text: result.fetch("result_text") }]
+    content << { type: "text", text: PAYWALL_UI_MARKER } if paywall_ui(tool_meta, server_context)
+    MCP::Tool::Response.new(content, meta: { plugpass_denied_call: call.merge(widget_callable: widget_callable(tool_meta)) })
+  end
+
+  # Whether the calling client renders MCP Apps widgets: it declared the UI
+  # extension among the client capabilities every request carries in its `_meta`
+  # (`io.modelcontextprotocol/clientCapabilities` — the stateless protocol's
+  # per-request declaration; this server keeps no session, so the initialize
+  # handshake is not a source). The gem hands a tool the request's `_meta` on
+  # its `server_context` (symbol keys throughout). A client that declares
+  # nothing renders nothing, and gets no marker.
+  CLIENT_CAPABILITIES_META_KEY = :"io.modelcontextprotocol/clientCapabilities"
+  UI_EXTENSION_ID = :"io.modelcontextprotocol/ui"
+
+  def self.client_renders_widgets(server_context)
+    return false unless server_context.respond_to?(:[])
+
+    meta = server_context[:_meta]
+    return false unless meta.is_a?(Hash)
+
+    capabilities = meta[CLIENT_CAPABILITIES_META_KEY]
+    return false unless capabilities.is_a?(Hash)
+
+    extensions = capabilities[:extensions]
+    extensions.is_a?(Hash) && extensions[UI_EXTENSION_ID].is_a?(Hash)
+  end
+
+  # Whether the widget's paywall is the one asking on this denial: the tool
+  # renders a widget (its own registration's meta declares `ui.resourceUri`)
+  # AND the client renders widgets. Read off the registration at runtime, so a
+  # tool that gains or loses its widget changes nothing here.
+  def self.paywall_ui(tool_meta, server_context)
+    tool_meta.dig(:ui, :resourceUri).is_a?(String) && client_renders_widgets(server_context)
+  end
+
+  # Who may call the tool, off the same registration: an undeclared visibility
+  # means the model and a widget both may; a declared list means exactly its
+  # members. A widget's paywall replays a denied call itself only when it may.
+  def self.widget_callable(tool_meta)
+    visibility = tool_meta.dig(:ui, :visibility)
+    !visibility.is_a?(Array) || visibility.map(&:to_s).include?("app")
   end
 
   # The check proxy's unavailable grant — Plugpass could not answer, so the
@@ -233,10 +297,45 @@ CheckPremiumAccess = MCP::Tool.define(
 end
 ```
 
-**Solo paid tool wrapper** (consume-on-invocation; no `auth_token` parameter on this path): read `PremiumFeatureAccessCheck.identity` (`[:sub]` scopes the body, `[:token]` is the bearer to forward), call `entitlement(token, { plugin_id:, feature_id: "<plugpass_id>" }, "track_usage")`, and branch: `ok` → run the body; `non_authorized` → `MCP::Tool::Response.new([{ type: "text", text: non_authorized_text(result) }])`; `reauth_required` → `reauth_required!` + placeholder; `unavailable` → run the body (it consumed nothing and grants). Keep the tool's `meta: { plugpass_component_id: "<plugpass_id>" }` on `Tool.define`, and never declare an `output_schema` on a wrapped tool (the gem validates `structuredContent` against it, which paywall/reauth text responses would fail). Re-derive the tool's `annotations:`: metering makes it neither read-only nor idempotent, whatever it was before the wrap — `read_only_hint: false, idempotent_hint: false`, the other two keeping the tool's own values; see TOOLS.md § Tool annotations.
+**Solo paid tool wrapper** (consume-on-invocation; no `auth_token` parameter on this path): the block takes `|server_context:, **args|` (the request's `_meta` rides on `server_context`; `args` is the call as sent, symbol-keyed), read `PremiumFeatureAccessCheck.identity` (`[:sub]` scopes the body, `[:token]` is the bearer to forward), call `entitlement(token, { plugin_id:, feature_id: "<plugpass_id>" }, "track_usage")`, and branch: `ok` → run the body; `non_authorized` → `non_authorized_tool_response(result, { name: "<tool name>", arguments: args }, PAID_TOOL_META, server_context)` (the renderer reads the tool's own registered meta — its widget, who may call it — and the request's, never a baked per-tool constant); `reauth_required` → `reauth_required!` + placeholder; `unavailable` → run the body (it consumed nothing and grants). Keep the tool's meta on `Tool.define`, hoisted to a frozen constant both the registration and the marker rule read — `PAID_TOOL_META = { plugpass_component_id: "<plugpass_id>" }.freeze` (a UI-backed tool's also carries its `ui: { resourceUri: …, visibility: … }`), passed as `meta: PAID_TOOL_META` — and never declare an `output_schema` on a wrapped tool (the gem validates `structuredContent` against it, which paywall/reauth text responses would fail). Re-derive the tool's `annotations:`: metering makes it neither read-only nor idempotent, whatever it was before the wrap — `read_only_hint: false, idempotent_hint: false`, the other two keeping the tool's own values; see TOOLS.md § Tool annotations.
 
 **Paired-tool add side** (`operation: add`): same shape but `feature_id` = the add tool's `database_record.custom_entitlement_id` (its `custom_` prefix carries the feature type; **not** `database_record.plugpass_id`, and **not** the tool's own `_meta` id), always **`check_remaining`**, passing the user's current count from the publisher's own store (scoped to `sub`) as `current_count` — see TOOLS.md → Reading the user's current count.
 
 **Identity tool** (the paired remove side, or any per-user free tool): no Entitlement API call — read `PremiumFeatureAccessCheck.identity[:sub]` and scope the body to it.
 
-**Placement guidance.** A standalone puma server follows the composition above. In a Rails app, mount the gate-wrapped transport (`mount PlugpassGate.new(transport) => "/mcp"` plus a route for the PRM path) — the same invariants hold. Tool blocks receive **symbolized keyword args**; `required` entries in `input_schema` are strings. Thread-locals are per-request under puma (one thread per request) — the pattern doesn't target fiber-scheduling servers like falcon. In-memory state means single-process puma (`workers 0`) or an external store.
+**The in-widget paywall (`ui_paywall`, servers that render widgets).** The helper below, in `premium_feature_access_check.rb`, is applied to every resource the server reads out whose MIME type is `text/html;profile=mcp-app`: the paywall script tag goes first in `<head>`, and the script's origin joins the resource's `resourceDomains`. The widget HTML itself is never edited.
+
+```ruby
+  # Loads the Plugpass paywall into a widget's HTML on its way out: the script
+  # tag first in <head> (ahead of the widget's own code; prepended to the
+  # document when it has no <head>), its origin added to `resourceDomains` so
+  # the sandbox lets it load. `csp` is the resource's own `_meta.ui.csp` hash
+  # (camelCase symbol keys, as declared). Returns [html, csp].
+  def self.with_paywall(html, csp)
+    tag = "<script src=\"#{paywall_script_url}\"></script>"
+    head = html.match(/<head(\s[^>]*)?>/i)
+    injected = head ? "#{head.pre_match}#{head[0]}#{tag}#{head.post_match}" : "#{tag}#{html}"
+    script = URI.parse(paywall_script_url)
+    origin = "#{script.scheme}://#{script.host}#{script.port == script.default_port ? "" : ":#{script.port}"}"
+    domains = Array(csp[:resourceDomains])
+    widened = csp.merge(resourceDomains: domains.include?(origin) ? domains : domains + [origin])
+    [injected, widened]
+  end
+```
+
+Every UI resource read passes through it — the resource goes on `MCP::Server.new(resources: [...])`:
+
+```ruby
+Widget = MCP::Resource.define(
+  uri: "ui://<plugin>/<widget>",
+  name: "<widget>",
+  title: "…",
+  description: "…",
+  mime_type: "text/html;profile=mcp-app",
+) do
+  html, csp = PremiumFeatureAccessCheck.with_paywall(WIDGET_HTML, WIDGET_CSP)
+  MCP::Resource::TextContents.new(text: html, uri: "ui://<plugin>/<widget>", mime_type: "text/html;profile=mcp-app", meta: { ui: { csp: csp } })
+end
+```
+
+**Placement guidance.** A standalone puma server follows the composition above. In a Rails app, mount the gate-wrapped transport (`mount PlugpassGate.new(transport) => "/mcp"` plus a route for the PRM path) — the same invariants hold. Tool blocks receive **symbolized keyword args**; `required` entries in `input_schema` are strings. Thread-locals are per-request under puma (one thread per request) — the pattern doesn't target fiber-scheduling servers like falcon. In-memory state means single-process puma (`workers 0`) or an external store. On a server whose directive names `ui_paywall`, every `text/html;profile=mcp-app` resource read passes through `with_paywall`.

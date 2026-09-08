@@ -19,11 +19,15 @@ public final class PremiumFeatureAccessCheck {
   private static final String ENTITLEMENT_API_ORIGIN = "<entitlement_api_origin>";
   // This server's own public MCP URL — the JWT aud pin and the PRM resource.
   private static final String RESOURCE_URL = "<this server's RESOURCE_URL>";
+  // Where the Plugpass paywall for MCP Apps widgets loads from (the `ui_paywall`
+  // layer — only on a server whose directive names it).
+  private static final String PAYWALL_SCRIPT_URL = "<paywall_script_url>";
 
   public static String issuer() { return ISSUER; }
   public static String jwksUrl() { return JWKS_URL; }
   public static String entitlementApiOrigin() { return ENTITLEMENT_API_ORIGIN; }
   public static String resourceUrl() { return RESOURCE_URL; }
+  public static String paywallScriptUrl() { return PAYWALL_SCRIPT_URL; }
 
   // RFC 9728 path-aware PRM URL: origin + /.well-known/oauth-protected-resource + /mcp.
   public static String prmUrl() {
@@ -89,11 +93,77 @@ public final class PremiumFeatureAccessCheck {
   // error or a 5xx (4xx terminal, never retried), Authorization: Bearer
   // <token>. HTTP 401 → reauth_required; every other failure → status
   // "unavailable", which GRANTS: the call is server-to-server from this host,
-  // so the end user cannot have caused it. non_authorized rendering: the
-  // response's "result_text" string emitted verbatim as the tool's text — a
-  // single-field pipe, never parsed or re-serialized (the trigger keys inside
-  // it auto-fire the plugin's access-handler skill).
-  /* …entitlement(bearer, bodyJson, op), nonAuthorizedText(json), UNAVAILABLE_CHECK_GRANT… */
+  // so the end user cannot have caused it.
+  /* …entitlement(bearer, bodyJson, op), UNAVAILABLE_CHECK_GRANT… */
+
+  /** The call a wrapper denied: the tool's name and the arguments it was called with. */
+  public record DeniedCall(String name, Map<String, Object> arguments) {}
+
+  /** The marker a UI-backed tool's denial carries when the client renders widgets. */
+  public static final String PAYWALL_UI_MARKER = "PLUGPASS_PAYWALL_UI=true";
+
+  // non_authorized → result_text verbatim — a single-field pipe (the trigger keys
+  // inside it auto-fire the plugin's access-handler skill). Never parse, reformat,
+  // or re-serialize it.
+  //
+  // Two things ride beside it for the Plugpass paywall an MCP Apps widget shows
+  // (both inert everywhere else):
+  //   - The denial NAMES the call it denied, on the result's `_meta` — which hosts
+  //     pass to a widget and never show the model — so the paywall can replay the
+  //     same call once the user has upgraded, and says whether a widget may call
+  //     the tool at all (widgetCallable below): a host refuses a widget's call to
+  //     a model-only tool, so the paywall then hands the retry to the conversation.
+  //   - The marker: when the denied tool is UI-backed (it renders a widget) AND the
+  //     client renders widgets (paywallUi below), a second text block carries
+  //     PLUGPASS_PAYWALL_UI=true. The widget's paywall is then the one asking the
+  //     user, and the plugin's access-handler skill posts nothing beside it. The
+  //     composed text stays untouched in its own block.
+  // Both read the tool's own registered meta and the request, at runtime.
+  public static CallToolResult nonAuthorizedToolResponse(Map<String, Object> result, DeniedCall call, Map<String, Object> toolMeta, CallToolRequest request) {
+    var response = CallToolResult.builder().addTextContent(String.valueOf(result.get("result_text")));
+    if (paywallUi(toolMeta, request)) response.addTextContent(PAYWALL_UI_MARKER);
+    Map<String, Object> deniedCall = new LinkedHashMap<>();
+    deniedCall.put("name", call.name());
+    deniedCall.put("arguments", call.arguments() == null ? Map.of() : call.arguments());
+    deniedCall.put("widget_callable", widgetCallable(toolMeta));
+    return response.meta(Map.of("plugpass_denied_call", deniedCall)).build();
+  }
+
+  // Whether the calling client renders MCP Apps widgets: it declared the UI
+  // extension among the client capabilities every request carries in its `_meta`
+  // (`io.modelcontextprotocol/clientCapabilities` — the stateless protocol's
+  // per-request declaration; this server keeps no session, so the initialize
+  // handshake is not a source). Read off the tool call request's meta(). A client
+  // that declares nothing renders nothing, and gets no marker.
+  private static final String CLIENT_CAPABILITIES_META_KEY = "io.modelcontextprotocol/clientCapabilities";
+  private static final String UI_EXTENSION_ID = "io.modelcontextprotocol/ui";
+
+  public static boolean clientRendersWidgets(CallToolRequest request) {
+    Map<String, Object> meta = request.meta();
+    if (meta == null) return false;
+    return meta.get(CLIENT_CAPABILITIES_META_KEY) instanceof Map<?, ?> capabilities
+        && capabilities.get("extensions") instanceof Map<?, ?> extensions
+        && extensions.get(UI_EXTENSION_ID) instanceof Map<?, ?>;
+  }
+
+  // Whether the widget's paywall is the one asking on this denial: the tool renders
+  // a widget (its own registration's meta declares ui.resourceUri) AND the client
+  // renders widgets. Read off the registration at runtime, so a tool that gains or
+  // loses its widget changes nothing here.
+  public static boolean paywallUi(Map<String, Object> toolMeta, CallToolRequest request) {
+    return toolMeta.get("ui") instanceof Map<?, ?> ui
+        && ui.get("resourceUri") instanceof String
+        && clientRendersWidgets(request);
+  }
+
+  // Who may call the tool, off the same registration: an undeclared visibility
+  // means the model and a widget both may; a declared list means exactly its
+  // members. A widget's paywall replays a denied call itself only when it may.
+  public static boolean widgetCallable(Map<String, Object> toolMeta) {
+    return !(toolMeta.get("ui") instanceof Map<?, ?> ui)
+        || !(ui.get("visibility") instanceof List<?> visibility)
+        || visibility.contains("app");
+  }
 }
 ```
 
@@ -214,10 +284,52 @@ var checkPremiumAccess = McpStatelessServerFeatures.SyncToolSpecification.builde
     .build();
 ```
 
-**Solo paid tool wrapper** (consume-on-invocation; no `auth_token` parameter on this path): read the holder from the context (`auth.sub()` scopes the body, `auth.bearer()` is the forwarded bearer), call `track_usage` (`feature_id` = the tool's own plugpass-component-id, matching its `_meta`; the id's `tool_` prefix carries the feature type), and branch: `ok` → run the body; `non_authorized` → `CallToolResult` text = its `result_text` verbatim; `reauth_required` → set the flag + placeholder; `unavailable` → run the body (it consumed nothing and grants). Stamp `_meta` via `Tool.builder(...).meta(Map.of("plugpass_component_id", "<plugpass_id>"))`, and never declare an `outputSchema` on a wrapped tool (paywall/reauth responses are text-only). Re-derive the tool's `.annotations(…)`: metering makes it neither read-only nor idempotent, whatever it was before the wrap — `.annotations(hints(false, <its own destructive value>, false, <its own open-world value>))`, see TOOLS.md § Tool annotations.
+**Solo paid tool wrapper** (consume-on-invocation; no `auth_token` parameter on this path): read the holder from the context (`auth.sub()` scopes the body, `auth.bearer()` is the forwarded bearer), call `track_usage` (`feature_id` = the tool's own plugpass-component-id, matching its `_meta`; the id's `tool_` prefix carries the feature type), and branch: `ok` → run the body; `non_authorized` → `nonAuthorizedToolResponse(result, new DeniedCall("<tool name>", request.arguments()), PAID_TOOL_META, request)` (the renderer reads the tool's own registered meta — its widget, who may call it — and the request, never a baked per-tool constant); `reauth_required` → set the flag + placeholder; `unavailable` → run the body (it consumed nothing and grants). Stamp `_meta` via `Tool.builder(...).meta(PAID_TOOL_META)`, the map hoisted to a `static final Map<String, Object> PAID_TOOL_META = Map.of("plugpass_component_id", "<plugpass_id>")` (a UI-backed tool's also carries its `"ui", Map.of("resourceUri", …, "visibility", …)`) that both the builder and the marker rule read, and never declare an `outputSchema` on a wrapped tool (paywall/reauth responses are text-only). Re-derive the tool's `.annotations(…)`: metering makes it neither read-only nor idempotent, whatever it was before the wrap — `.annotations(hints(false, <its own destructive value>, false, <its own open-world value>))`, see TOOLS.md § Tool annotations.
 
 **Paired-tool add side** (`operation: add`): same shape but `feature_id` = the add tool's `database_record.custom_entitlement_id` (its `custom_` prefix carries the feature type; **not** `database_record.plugpass_id`, and **not** the tool's own `_meta` id), always **`check_remaining`**, passing the user's current count from the publisher's own store (scoped to `sub`) as `current_count` — see TOOLS.md → Reading the user's current count.
 
 **Identity tool** (the paired remove side, or any per-user free tool): no Entitlement API call — read `auth.sub()` from the context and scope the body to it.
 
-**Placement guidance.** An embedded-Jetty server follows the composition above; a servlet-container deployment registers the same three pieces in its `web.xml`/programmatic config (filter on `/mcp` only, `asyncSupported` true, PRM servlet public). If the publisher's server must stay on the stateful `HttpServletStreamableServerTransportProvider` (tools that use sampling/elicitation), the identity path changes to `exchange.transportContext()` on `McpSyncServerExchange` and the same buffering filter works via the servlet's deferred-`complete()` semantics — but never wrap the GET listening stream, leave `keepAliveInterval` unset, and know that mid-call notifications are delayed until completion. Migration notes for a publisher's older SDK: 1.x `McpSchema.JsonSchema` is deprecated (bridge maps in), and 2.0 validates tool inputs by default.
+**The in-widget paywall (`ui_paywall`, servers that render widgets).** The helper below, in `PremiumFeatureAccessCheck`, is applied to every resource the server reads out whose MIME type is `text/html;profile=mcp-app`: the paywall script tag goes first in `<head>`, and the script's origin joins the resource's `resourceDomains`. The widget HTML itself is never edited.
+
+```java
+/** The CSP a UI resource declares on its contents (_meta.ui.csp); toMap() is the wire shape. */
+public record UiResourceCsp(List<String> connectDomains, List<String> resourceDomains, List<String> frameDomains, List<String> baseUriDomains) {
+  public Map<String, Object> toMap() { /* camelCase keys; empty lists omitted */ }
+}
+
+public record PaywalledWidget(String html, UiResourceCsp csp) {}
+
+private static final Pattern HEAD_OPEN = Pattern.compile("<head(\\s[^>]*)?>", Pattern.CASE_INSENSITIVE);
+
+// Loads the Plugpass paywall into a widget's HTML on its way out: the script
+// tag first in <head> (ahead of the widget's own code; prepended to the
+// document when it has no <head>), its origin added to resourceDomains so the
+// sandbox lets it load.
+public static PaywalledWidget withPaywall(String html, UiResourceCsp csp) {
+  String tag = "<script src=\"" + paywallScriptUrl() + "\"></script>";
+  Matcher head = HEAD_OPEN.matcher(html);
+  String injected = head.find() ? html.substring(0, head.end()) + tag + html.substring(head.end()) : tag + html;
+  String origin = originOf(paywallScriptUrl()); // scheme + host (+ port), no path
+  List<String> resourceDomains = new ArrayList<>(csp.resourceDomains() == null ? List.of() : csp.resourceDomains());
+  if (!resourceDomains.contains(origin)) resourceDomains.add(origin);
+  return new PaywalledWidget(injected, new UiResourceCsp(csp.connectDomains(), resourceDomains, csp.frameDomains(), csp.baseUriDomains()));
+}
+```
+
+Every UI resource read passes through it — the resource is registered with `.resources(...)` on the server builder, whose capabilities add `.resources(false, false)`:
+
+```java
+new McpStatelessServerFeatures.SyncResourceSpecification(
+    McpSchema.Resource.builder().uri("ui://<plugin>/<widget>").name("<widget>").title("…").description("…").mimeType("text/html;profile=mcp-app").build(),
+    (ctx, request) -> {
+      var widget = PremiumFeatureAccessCheck.withPaywall(WIDGET_HTML, WIDGET_CSP);
+      return new McpSchema.ReadResourceResult(List.of(
+          McpSchema.TextResourceContents.builder(request.uri(), widget.html())
+              .mimeType("text/html;profile=mcp-app")
+              .meta(Map.of("ui", Map.of("csp", widget.csp().toMap())))
+              .build()));
+    })
+```
+
+**Placement guidance.** An embedded-Jetty server follows the composition above; a servlet-container deployment registers the same three pieces in its `web.xml`/programmatic config (filter on `/mcp` only, `asyncSupported` true, PRM servlet public). On a server whose directive names `ui_paywall`, every `text/html;profile=mcp-app` resource read passes through `withPaywall`. If the publisher's server must stay on the stateful `HttpServletStreamableServerTransportProvider` (tools that use sampling/elicitation), the identity path changes to `exchange.transportContext()` on `McpSyncServerExchange` and the same buffering filter works via the servlet's deferred-`complete()` semantics — but never wrap the GET listening stream, leave `keepAliveInterval` unset, and know that mid-call notifications are delayed until completion. Migration notes for a publisher's older SDK: 1.x `McpSchema.JsonSchema` is deprecated (bridge maps in), and 2.0 validates tool inputs by default.

@@ -25,6 +25,9 @@ const JWKS_URL: &str = "<plugpass_jwks_url>";
 const ENTITLEMENT_API_ORIGIN: &str = "<entitlement_api_origin>";
 // This server's own public MCP URL — the JWT `aud` pin and the PRM `resource`.
 const RESOURCE_URL: &str = "<this server's RESOURCE_URL>";
+// Where the Plugpass paywall for MCP Apps widgets loads from (the `ui_paywall`
+// layer — only on a server whose directive names it).
+const PAYWALL_SCRIPT_URL: &str = "<paywall_script_url>";
 
 #[derive(Clone)]
 pub struct PlugpassConfig {
@@ -32,6 +35,7 @@ pub struct PlugpassConfig {
     pub jwks_url: String,
     pub entitlement_api_origin: String,
     pub resource_url: String,
+    pub paywall_script_url: String,
 }
 
 pub fn plugpass_config() -> PlugpassConfig {
@@ -40,6 +44,7 @@ pub fn plugpass_config() -> PlugpassConfig {
         jwks_url: JWKS_URL.to_string(),
         entitlement_api_origin: ENTITLEMENT_API_ORIGIN.to_string(),
         resource_url: RESOURCE_URL.to_string(),
+        paywall_script_url: PAYWALL_SCRIPT_URL.to_string(),
     }
 }
 
@@ -89,7 +94,91 @@ pub async fn verify_bearer(token: &str, cfg: &PlugpassConfig) -> Option<String> 
 }
 ```
 
-The entitlement client (`entitlement(bearer, body, op, cfg)` POSTing `{origin}/entitlement/{op}` via `http_client()` — 5s timeout per attempt with ONE retry after a 2s backoff on a transport error or a 5xx (4xx terminal, never retried); HTTP 401 → `ReauthRequired`, other non-200 or a failure after the retry → `Unavailable`), the `EntitlementResult` enum (its `NonAuthorized` variant carries `result_text: String`; its `Unavailable` variant carries nothing), the `non_authorized` rendering (the `result_text` emitted verbatim as the tool's text — a single-field pipe, never parsed or re-serialized), and the unavailable-grant `CallToolResult` follow the wire contract in TOOLS.md.
+The entitlement client (`entitlement(bearer, body, op, cfg)` POSTing `{origin}/entitlement/{op}` via `http_client()` — 5s timeout per attempt with ONE retry after a 2s backoff on a transport error or a 5xx (4xx terminal, never retried); HTTP 401 → `ReauthRequired`, other non-200 or a failure after the retry → `Unavailable`), the `EntitlementResult` enum (its `NonAuthorized` variant carries `result_text: String`; its `Unavailable` variant carries nothing), the `non_authorized` rendering below, and the unavailable-grant `CallToolResult` follow the wire contract in TOOLS.md.
+
+```rust
+use rmcp::model::{CallToolResult, ContentBlock, JsonObject, Meta};
+use serde_json::Value;
+
+// The call a wrapper denied: the tool's name and the arguments it was called
+// with (the handler's parsed args, serialized as the caller sent them).
+pub struct DeniedCall {
+    pub name: String,
+    pub arguments: Value,
+}
+
+// The marker a UI-backed tool's denial carries when the client renders widgets.
+pub const PAYWALL_UI_MARKER: &str = "PLUGPASS_PAYWALL_UI=true";
+
+// non_authorized → result_text verbatim — a single-field pipe (the trigger keys
+// inside it auto-fire the plugin's access-handler skill). Never parse, reformat,
+// or re-serialize it.
+//
+// Two things ride beside it for the Plugpass paywall an MCP Apps widget shows
+// (both inert everywhere else):
+//   - The denial NAMES the call it denied, on the result's `_meta` — which
+//     hosts pass to a widget and never show the model — so the paywall can
+//     replay the same call once the user has upgraded, and says whether a
+//     widget may call the tool at all (widget_callable below): a host refuses
+//     a widget's call to a model-only tool, so the paywall then hands the
+//     retry to the conversation instead.
+//   - The marker: when the denied tool is UI-backed (it renders a widget) AND
+//     the client renders widgets (paywall_ui below), a second text block
+//     carries PLUGPASS_PAYWALL_UI=true. The widget's paywall is then the one
+//     asking the user, and the plugin's access-handler skill posts nothing
+//     beside it. The composed text stays untouched in its own block.
+// Both read the tool's own registered `Meta` and the request's, at runtime.
+pub fn non_authorized_tool_response(result_text: &str, call: DeniedCall, tool_meta: &Meta, request_meta: &Meta) -> CallToolResult {
+    let mut content = vec![ContentBlock::text(result_text)];
+    if paywall_ui(tool_meta, request_meta) {
+        content.push(ContentBlock::text(PAYWALL_UI_MARKER));
+    }
+    let mut response = CallToolResult::success(content);
+    let mut meta = JsonObject::new();
+    meta.insert(
+        "plugpass_denied_call".to_string(),
+        serde_json::json!({ "name": call.name, "arguments": call.arguments, "widget_callable": widget_callable(tool_meta) }),
+    );
+    response.meta = Some(Meta(meta));
+    response
+}
+
+// Whether the calling client renders MCP Apps widgets: it declared the UI
+// extension among the client capabilities every request carries in its `_meta`
+// (`io.modelcontextprotocol/clientCapabilities` — the stateless protocol's
+// per-request declaration; this server keeps no session, so the initialize
+// handshake is not a source). Read off the request `Meta` a tool handler
+// extracts. A client that declares nothing renders nothing, and gets no marker.
+const CLIENT_CAPABILITIES_META_KEY: &str = "io.modelcontextprotocol/clientCapabilities";
+const UI_EXTENSION_ID: &str = "io.modelcontextprotocol/ui";
+
+pub fn client_renders_widgets(meta: &Meta) -> bool {
+    meta.0
+        .get(CLIENT_CAPABILITIES_META_KEY)
+        .and_then(|capabilities| capabilities.get("extensions"))
+        .and_then(|extensions| extensions.get(UI_EXTENSION_ID))
+        .is_some_and(Value::is_object)
+}
+
+// Whether the widget's paywall is the one asking on this denial: the tool
+// renders a widget (its own registration's `Meta` declares `ui.resourceUri`)
+// AND the client renders widgets. Read off the registration at runtime, so a
+// tool that gains or loses its widget changes nothing here.
+pub fn paywall_ui(tool_meta: &Meta, request_meta: &Meta) -> bool {
+    tool_meta.0.get("ui").and_then(|ui| ui.get("resourceUri")).is_some_and(Value::is_string)
+        && client_renders_widgets(request_meta)
+}
+
+// Who may call the tool, off the same registration: an undeclared visibility
+// means the model and a widget both may; a declared list means exactly its
+// members. A widget's paywall replays a denied call itself only when it may.
+pub fn widget_callable(tool_meta: &Meta) -> bool {
+    match tool_meta.0.get("ui").and_then(|ui| ui.get("visibility")).and_then(Value::as_array) {
+        Some(visibility) => visibility.iter().any(|v| v.as_str() == Some("app")),
+        None => true,
+    }
+}
+```
 
 **`main.rs` composition** — PRM route public; the gate layered on the nested MCP service:
 
@@ -201,10 +290,74 @@ async fn check_premium_access(
 }
 ```
 
-**Solo paid tool wrapper** (consume-on-invocation; no `auth_token` parameter on this path): read `Identity` from the parts extensions, call `track_usage` (`feature_id` = the tool's own plugpass-component-id, matching its `_meta`; the id's `tool_` prefix carries the feature type), branch: `Ok` → run the body scoped to `identity.sub`; `NonAuthorized` → its `result_text` verbatim as the text result; `ReauthRequired` → set the signal + placeholder; `Unavailable` → run the body (it consumed nothing and grants). Stamp `_meta` with the macro's `meta` attribute (`#[tool(name = "…", description = "…", meta = component_meta("<plugpass_id>"))]` where `component_meta` builds `Meta` carrying `plugpass_component_id`). Wrapped tools return `Result<CallToolResult, ErrorData>` — never a `Json<T>` typed result (no output schema: paywall/reauth responses are text-only). Re-derive the macro's `annotations(…)`: metering makes the tool neither read-only nor idempotent, whatever it was before the wrap — `read_only_hint = false, idempotent_hint = false`, the other two keeping the tool's own values; see TOOLS.md § Tool annotations.
+**Solo paid tool wrapper** (consume-on-invocation; no `auth_token` parameter on this path): read `Identity` from the parts extensions, call `track_usage` (`feature_id` = the tool's own plugpass-component-id, matching its `_meta`; the id's `tool_` prefix carries the feature type), branch: `Ok` → run the body scoped to `identity.sub`; `NonAuthorized` → `non_authorized_tool_response(&result_text, DeniedCall { name: "<tool name>".into(), arguments: serde_json::to_value(&args).unwrap_or(Value::Null) }, &paid_tool_meta(), &meta)` — the args struct derives `serde::Serialize` beside `Deserialize` (`#[serde(skip_serializing_if = "Option::is_none")]` on each optional field, so the echo is the call as sent), every wrapped tool's handler extracts `meta: Meta` (rmcp's request-`_meta` extractor, beside `Parameters` and `Extension`), and the renderer reads the tool's own registered `Meta` (its widget, who may call it) and the request's — never a baked per-tool constant; `ReauthRequired` → set the signal + placeholder; `Unavailable` → run the body (it consumed nothing and grants). Stamp `_meta` with the macro's `meta` attribute, `#[tool(name = "…", description = "…", meta = paid_tool_meta())]`, where `fn paid_tool_meta() -> Meta` builds the `Meta` carrying `plugpass_component_id` (and, on a UI-backed tool, its `ui: { resourceUri, visibility }`) — the one function both the attribute and the marker rule read. Wrapped tools return `Result<CallToolResult, ErrorData>` — never a `Json<T>` typed result (no output schema: paywall/reauth responses are text-only). Re-derive the macro's `annotations(…)`: metering makes the tool neither read-only nor idempotent, whatever it was before the wrap — `read_only_hint = false, idempotent_hint = false`, the other two keeping the tool's own values; see TOOLS.md § Tool annotations.
 
 **Paired-tool add side** (`operation: add`): same shape but `feature_id` = the add tool's `database_record.custom_entitlement_id` (its `custom_` prefix carries the feature type; **not** `database_record.plugpass_id`, and **not** the tool's own `_meta` id), always **`check_remaining`**, passing the user's current count from the publisher's own store (scoped to `sub`) as `current_count` — see TOOLS.md → Reading the user's current count.
 
 **Identity tool** (the paired remove side, or any per-user free tool): no Entitlement API call — read `Identity.sub` from the parts extensions and scope the body to it.
 
-**Placement guidance.** The handler struct keeps rmcp's macro requirements: a `tool_router: ToolRouter<Self>` field initialized with `Self::tool_router()`, `#[tool_router]` on the impl block, `#[tool_handler]` on the `ServerHandler` impl; args structs derive `serde::Deserialize + schemars::JsonSchema` (schemars 1.x). rmcp's config/model types are `#[non_exhaustive]` — always builders or mutate-a-`Default`. Invariants regardless of layout: the stateless+JSON pair on the transport config; the gate layered on the MCP service covering every method; the PRM route outside the gate; extensions read through `Parts`, never top-level.
+**The in-widget paywall (`ui_paywall`, servers that render widgets).** The helper below, in `premium_feature_access_check.rs`, is applied to every resource the server reads out whose MIME type is `text/html;profile=mcp-app`: the paywall script tag goes first in `<head>`, and the script's origin joins the resource's `resourceDomains`. The widget HTML itself is never edited.
+
+```rust
+// The CSP a UI resource declares on its contents (`_meta.ui.csp`).
+#[derive(Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UiResourceCsp {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub connect_domains: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub resource_domains: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub frame_domains: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub base_uri_domains: Vec<String>,
+}
+
+// Loads the Plugpass paywall into a widget's HTML on its way out: the script
+// tag first in <head> (ahead of the widget's own code; prepended to the
+// document when it has no <head>), its origin added to `resourceDomains` so
+// the sandbox lets it load.
+pub fn with_paywall(html: &str, csp: &UiResourceCsp, cfg: &PlugpassConfig) -> (String, UiResourceCsp) {
+    let tag = format!("<script src=\"{}\"></script>", cfg.paywall_script_url);
+    let injected = match head_open_end(html) { // the byte offset just past the opening <head …> tag, if any
+        Some(end) => format!("{}{}{}", &html[..end], tag, &html[end..]),
+        None => format!("{tag}{html}"),
+    };
+    let origin = origin_of(&cfg.paywall_script_url); // scheme + host (+ port), no path
+    let mut widened = csp.clone();
+    if !widened.resource_domains.iter().any(|d| *d == origin) {
+        widened.resource_domains.push(origin);
+    }
+    (injected, widened)
+}
+```
+
+Every UI resource read passes through it — `ServerHandler` overrides beside `get_info`, which enables resources (`ServerCapabilities::builder().enable_tools().enable_resources().build()`):
+
+```rust
+async fn list_resources(&self, _request: Option<PaginatedRequestParams>, _context: RequestContext<RoleServer>) -> Result<ListResourcesResult, ErrorData> {
+    Ok(ListResourcesResult::with_all_items(vec![
+        Resource::new("ui://<plugin>/<widget>", "<widget>")
+            .with_title("…")
+            .with_description("…")
+            .with_mime_type("text/html;profile=mcp-app"),
+    ]))
+}
+
+async fn read_resource(&self, request: ReadResourceRequestParams, _context: RequestContext<RoleServer>) -> Result<ReadResourceResult, ErrorData> {
+    if request.uri != "ui://<plugin>/<widget>" {
+        return Err(ErrorData::resource_not_found(format!("Unknown resource: {}", request.uri), None));
+    }
+    let (html, csp) = with_paywall(WIDGET_HTML, &widget_csp(), &self.cfg);
+    let mut meta = JsonObject::new();
+    meta.insert("ui".to_string(), serde_json::json!({ "csp": csp }));
+    Ok(ReadResourceResult::new(vec![ResourceContents::TextResourceContents {
+        uri: request.uri,
+        mime_type: Some("text/html;profile=mcp-app".to_string()),
+        text: html,
+        meta: Some(Meta(meta)),
+    }]))
+}
+```
+
+**Placement guidance.** The handler struct keeps rmcp's macro requirements: a `tool_router: ToolRouter<Self>` field initialized with `Self::tool_router()`, `#[tool_router]` on the impl block, `#[tool_handler(router = self.tool_router)]` on the `ServerHandler` impl (the macro's default rebuilds a router per call and leaves the field unread); args structs derive `serde::Deserialize + schemars::JsonSchema` (schemars 1.x). rmcp's config/model types are `#[non_exhaustive]` — always builders or mutate-a-`Default`. Invariants regardless of layout: the stateless+JSON pair on the transport config; the gate layered on the MCP service covering every method; the PRM route outside the gate; extensions read through `Parts`, never top-level; on a server whose directive names `ui_paywall`, every `text/html;profile=mcp-app` resource read passes through `with_paywall`.

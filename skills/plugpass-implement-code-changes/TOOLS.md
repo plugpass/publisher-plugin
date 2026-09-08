@@ -1,6 +1,6 @@
-# Publisher MCP server scaffolding — resource server, check proxy & tool wrappers
+# Publisher MCP server scaffolding — resource server, check proxy, tool wrappers & the in-widget paywall
 
-This procedure writes the Plugpass premium-access scaffolding into the publisher's **own MCP server source**: the OAuth resource-server layer, the check proxy tool (check host only), and the per-tool identity + premium feature access wrappers. Read it whenever the run has publisher-server work — the connector directives call for check-host scaffolding (`connector.hosting` is `publisher`), or the run's components include `tool` entries. Follow it per server, handling all of a server's work as one batch: detect the server's language once, apply `removed` tools first (as reference for the existing style), then `added`/`changed` and the template refresh set's tools (`unchanged` with `template_stale` `true`) uniformly, and verify the rest.
+This procedure writes the Plugpass premium-access scaffolding into the publisher's **own MCP server source**: the OAuth resource-server layer, the check proxy tool (check host only), the per-tool identity + premium feature access wrappers, and the in-widget paywall (servers that render MCP Apps widgets). Read it whenever the run has publisher-server work — the connector directives call for check-host scaffolding (`connector.hosting` is `publisher`), or the run's components include `tool` entries. Follow it per server, handling all of a server's work as one batch: detect the server's language once, apply `removed` tools first (as reference for the existing style), then `added`/`changed` and the template refresh set's tools (`unchanged` with `template_stale` `true`) uniformly, and verify the rest.
 
 ## How identity reaches the server — the header bearer
 
@@ -10,7 +10,7 @@ The publisher's server is an **OAuth-protected resource server** and Plugpass is
 - The server **validates every bearer locally** against Plugpass's public JWKS (a few lines, in the resource-server layer below) and extracts the user id (`sub`). No Plugpass round-trip for identity, and no publisher-side secret: validation is against the public key set, and entitlement calls forward the user's own bearer.
 - Tool handlers read the validated `{ sub, bearer }` from the request context. A **paid** tool forwards the bearer to the Entitlement API; an **identity** tool (any tool whose body is per-user — the paired remove side is the canonical case) stops at `sub`; a tool with no per-user state ignores both.
 
-Inputs come from the orchestration steps: the `tool` components (each with `plugpass_id`, `server_name`, `tool_name`, `is_free`, `gating_change_since_last_implement`, `template_stale`, and — for paired tools — `database_record` (which carries `custom_entitlement_id`, the pair's shared entitlement `feature_id`) + `operation`), the connector directive for this run (`connector`, `connector_change_since_last_implement`, `previous_connector`), the plugin-level values (`{PluginName}`, `{plugin-plugpass-id}`, `entitlement_api_origin`, `plugpass_issuer`, `plugpass_jwks_url`, `owned_servers`, `server_scaffolding_template_stale`), and the resolved `server_name → absolute source-directory path` map.
+Inputs come from the orchestration steps: the `tool` components (each with `plugpass_id`, `server_name`, `tool_name`, `is_free`, `gating_change_since_last_implement`, `template_stale`, and — for paired tools — `database_record` (which carries `custom_entitlement_id`, the pair's shared entitlement `feature_id`) + `operation`), the connector directive for this run (`connector`, `connector_change_since_last_implement`, `previous_connector`), the plugin-level values (`{PluginName}`, `{plugin-plugpass-id}`, `entitlement_api_origin`, `paywall_script_url`, `plugpass_issuer`, `plugpass_jwks_url`, `owned_servers`, `server_scaffolding_template_stale`), and the resolved `server_name → absolute source-directory path` map.
 
 Be **idempotent**, and rewrite only when something changed: an artifact's gating (`gating_change_since_last_implement`), the Plugpass template it was written from (`template_stale` for a wrapper, `server_scaffolding_template_stale` for the resource-server layer and check proxy), or a baked constant that no longer matches the response. Everything else is **verified** — read the source and confirm it is present and structurally intact — never re-derived or re-rendered. A server or tool already in its correct end state is a no-op.
 
@@ -23,6 +23,7 @@ Per server, the pieces to ensure are exactly the layers its `owned_servers` entr
 - `resource_server` — **the resource-server layer** (written when `server_scaffolding_template_stale` is `true` or the layer is missing, verified otherwise) — Step 3.
 - `check_proxy` — **the check proxy tool** (the check host; the same write-or-verify rule) — Step 4.
 - `tool_wrappers` — **per-tool wrappers** (each of the server's `tool` components: written for `added` / `changed` and for `unchanged` + `template_stale`, stripped for `removed`, verified otherwise) — Step 5.
+- `ui_paywall` — **the in-widget paywall** (a server that renders MCP Apps widgets — one with a UI-backed tool; the same write-or-verify rule as the resource-server layer) — Step 6.
 
 ## Step 2: Detect the server's language + framework
 
@@ -38,7 +39,7 @@ Read the located source (entry file + tool definitions) to identify the SDK lang
 
 ## The runtime constants
 
-Every scaffolded module carries these four as fixed constants:
+Every scaffolded module carries these as fixed constants:
 
 | Constant | Baked from (the `plugpass_get_plugin_data` response) | Purpose |
 | --- | --- | --- |
@@ -46,6 +47,7 @@ Every scaffolded module carries these four as fixed constants:
 | `JWKS_URL` | `plugpass_jwks_url` | Where the public key set is fetched from |
 | `ENTITLEMENT_API_ORIGIN` | `entitlement_api_origin` | The origin the proxy + paid wrappers POST `{origin}/entitlement/*` against |
 | `RESOURCE_URL` | this server's own connector-shape URL (below) | The server's public MCP URL — the JWT `aud` pin and the PRM document's `resource` |
+| `PAYWALL_SCRIPT_URL` | `paywall_script_url` | Where the in-widget paywall script loads from — the `ui_paywall` layer's constant, present on a server whose directive names that layer |
 
 `RESOURCE_URL` is per server: the check host's is `connector.url`; any other server's is its `owned_servers` entry's `url` (matched by `server_name`). `ISSUER` and `JWKS_URL` are per plugin — the plugin's own pages-host origin (its authorization server) and that host's key-set document — so a run whose `connector_change_since_last_implement` is `changed` with only `issuer` differing from `previous_connector` re-bakes them on every server in the set (the idempotent read-then-change) and nothing else moves. Bake every value verbatim from the response; never derive the audience or the issuer from the incoming request.
 
@@ -92,7 +94,7 @@ The check host registers the platform-standard check tool and pipes it to Plugpa
 
 ## Step 5: Per-tool wrappers (`tool_wrappers`; added / changed / template refresh)
 
-Write the wrapper for an `added` or `changed` tool, and for an `unchanged` tool whose `template_stale` is `true` — the latter replaces its existing wrapper with one rendered from the current template, its role unchanged. For every other `unchanged` tool, **verify only**: confirm the handler still carries the gate for its role (the `track_usage` / `check_remaining` call with its `feature_id`, or the `sub` read for an identity tool) and its `_meta` id; a tool missing either is treated as `added`. Never rewrite a verified wrapper — it is a contextual edit into the publisher's own code, and leaving working code alone is the point of the rule.
+Write the wrapper for an `added` or `changed` tool, and for an `unchanged` tool whose `template_stale` is `true` — the latter replaces its existing wrapper with one rendered from the current template, its role unchanged. For every other `unchanged` tool, **verify only**: confirm the handler still carries the gate for its role (the `track_usage` / `check_remaining` call with its `feature_id`, or the `sub` read for an identity tool), its `_meta` id, and — on a paid tool — the denial's call echo and marker rule below; a tool missing any of them is treated as `added`. Never rewrite a verified wrapper — it is a contextual edit into the publisher's own code, and leaving working code alone is the point of the rule.
 
 What a tool's handler does with the request context's `{ sub, bearer }` depends on its role:
 
@@ -135,7 +137,9 @@ For each **paid** tool call, forward the request's bearer as `Authorization: Bea
 Response handling (the `status`-discriminated JSON — see the Wire contract):
 
 - `ok` → authorized; run the tool body.
-- `non_authorized` → return the response's `result_text` **verbatim** as the tool's text result — a single-field pipe, never parsed, reformatted, or re-serialized (the server composed the complete block, and per-key re-serialization can't carry it faithfully). The trigger keys inside it auto-fire the plugin's access-handler skill via its description, which then owns the flow.
+- `non_authorized` → return the response's `result_text` **verbatim** as the tool's text result — a single-field pipe, never parsed, reformatted, or re-serialized (the server composed the complete block, and per-key re-serialization can't carry it faithfully). The trigger keys inside it auto-fire the plugin's access-handler skill via its description, which then owns the flow. The result also carries two things for the in-widget paywall (the language template's denial renderer takes both), inert everywhere else:
+  - **The denied-call echo** — `_meta.plugpass_denied_call`, `{ name, arguments, widget_callable }`: the tool's name, the arguments this call was made with, and whether a widget may call the tool at all (its registered `_meta.ui.visibility`; undeclared means the model and a widget both may). Hosts pass a result's `_meta` to an MCP Apps widget and never show the model; the paywall replays the call from it once the user has upgraded — or, for a tool a widget may not call, hands the retry to the conversation as a user turn.
+  - **The paywall-UI marker** — a second text block, exactly `PLUGPASS_PAYWALL_UI=true`, when the tool is **UI-backed** (its registration declares `_meta.ui.resourceUri`) and the client renders widgets: the widget's paywall is then the one asking the user, and the access-handler skill posts nothing beside it. The client renders widgets when the request's `_meta["io.modelcontextprotocol/clientCapabilities"]` declares the `io.modelcontextprotocol/ui` extension (the declaration every request carries). The template's denial renderer reads all of it off the tool's own registered `_meta` (its widget, who may call it) and the request's `_meta` at runtime — the wrapper bakes no per-tool constant, so a tool that gains or loses its widget, or changes who may call it, needs no rewrite, and a tool that renders no widget of its own never carries the marker, whatever the client.
 - `reauth_required` (the JSON envelope, or an HTTP `401` from the API) → respond at the **transport level** with the `401` + `WWW-Authenticate` challenge (the same mechanism as the proxy tool), so the client re-authorizes and retries.
 - Any other non-200, or a thrown request — each after the single retry above → the unavailable grant (below).
 
@@ -179,7 +183,16 @@ Never edit a repository other than the plugin repo and the located MCP server so
 
 **When a tool or server can't be brought to its correct end state** (e.g. its source can't be confidently located, or you can't confidently determine how to read the user's current count): do **not** guess, and do **not** leave a marker or `TODO` in the publisher's source — a comment only a human reader would act on is a silent failure. Instead, explain in plain English what remains and why, leave the relevant task(s) **open**, and exclude the affected component(s) from the implementation record — the dashboard's publish gate then holds until a re-run verifies the wiring. The explanation is plain, dense, assumes no knowledge of the entitlement model, and never uses internal terms (no "paired tools").
 
-## Step 6: Removals
+## Step 6: The in-widget paywall (`ui_paywall`, servers that render widgets)
+
+A tool call a widget makes itself returns its result to the widget, never to the model, so a non-authorized `result_text` there fires no access-handler skill. The platform's paywall script renders it in place instead: loaded into every widget the server renders, it watches for a denial, shows the composed message with its call to action, and replays the denied call once the user confirms they've upgraded. Write the layer — from the language template — when `server_scaffolding_template_stale` is `true` or the layer is missing; otherwise **verify** it (the constant is baked with the current `paywall_script_url`, every UI resource read passes through the helper) and leave it alone. Two pieces:
+
+- **`PAYWALL_SCRIPT_URL`**, baked beside the other runtime constants from `paywall_script_url`.
+- **The injection helper**, applied to every resource the server reads out whose MIME type is `text/html;profile=mcp-app` (every resource a tool's `_meta.ui.resourceUri` names): it inserts `<script src="{PAYWALL_SCRIPT_URL}"></script>` as the first child of the document's `<head>`, ahead of the widget's own scripts (prepended to the document when it has no `<head>`), and adds the script's origin to the resource's `_meta.ui.csp.resourceDomains` (the sandbox's allowlist for scripts — deduplicated, the widget's own origins kept). The read passes through the helper on its way out; the publisher's widget HTML itself is never edited.
+
+The two wrapper-side pieces the paywall reads — the denied-call echo and the paywall-UI marker — are part of every paid wrapper (Step 5), on every server, whether or not the server renders widgets.
+
+## Step 7: Removals
 
 For each `removed` tool, restore its plain handler: strip the entitlement gate (the `track_usage` / `check_remaining` call and its branching); keep the `sub` read only if the tool's body genuinely still needs per-user scoping (a de-gated per-user tool is now an identity tool, not a plain one); leave its `_meta` id (identity is harmless and cheap to keep). Do **not** tear down the resource-server layer or the proxy tool on removals — the server remains the plugin's connector (or a still-registered owned server) and stale bundles may still call it; leftover scaffolding is inert and harmless. The only proxy removal this skill ever performs is the connector directive's publisher→publisher case (the previous check host, when its repo is in the run). Already-stripped → no-op.
 
@@ -189,11 +202,12 @@ On a `--reconcile` run, additionally re-audit what normal runs only check for pr
 
 - Each in-set server's **resource-server layer** (when its directive names `resource_server`): present, constants baked with the current response values, challenge + PRM + validation intact.
 - The check host's **proxy tool**: registered with the exact name/description/schema, piping to the current `ENTITLEMENT_API_ORIGIN`.
-- Every **`unchanged`** tool's wrapper: the gate call, descriptor (`feature_id` — its prefix carries the type), `current_count` read, and `_meta` id present and correct.
+- Every **`unchanged`** tool's wrapper: the gate call, descriptor (`feature_id` — its prefix carries the type), `current_count` read, `_meta` id, and the denial's call echo + marker rule present and correct.
+- Each in-set server's **in-widget paywall** (when its directive names `ui_paywall`): `PAYWALL_SCRIPT_URL` baked with the current `paywall_script_url`, and every `text/html;profile=mcp-app` resource read passing through the injection helper.
 
 Regenerate anything missing or drifted. This is the explicit escape hatch for MCP-server source that drifted out of band (hand-edits, a git revert, a previously-failed run).
 
-## Step 7: Per-server verification
+## Step 8: Per-server verification
 
 Before the run reports a server's work done, verify it locally — drive it yourself when the repo gives you a runnable dev command; otherwise ask the publisher to start the server and tell you the local port:
 
@@ -203,7 +217,8 @@ Before the run reports a server's work done, verify it locally — drive it your
 
    **Assert the challenge's shape, not its host, when probing locally.** Some dev servers proxy the response and rewrite the host in outgoing headers to the local listen address, so `realm` and `resource_metadata` can come back as `127.0.0.1:{port}` instead of the baked `RESOURCE_URL` — an artifact of the dev server, not drift in the written source. Item 2 is the authoritative check on that value: it reads a response *body*, which is not rewritten. To confirm directly, re-send this request with `Host:` set to the `RESOURCE_URL`'s host — the baked value then passes through untouched. A local scheme mismatch (`https://` in the header over a plain-HTTP local request) is the same artifact and is likewise not a finding.
 4. A garbage bearer (`Authorization: Bearer not-a-jwt`) is rejected the same way: `401`, `error="invalid_token"`, and a `resource_metadata` parameter — the same three assertions as item 3, and subject to the same local-host caveat. `error_description` is **expected to differ** between the two probes, since it carries the reason; a different description is not a finding. What this probe checks is that a malformed bearer takes the invalid-token path rather than some other error code — as every invalid-bearer case must (missing, malformed, bad signature, wrong issuer or audience, expired).
-5. **Cross-check the baked values the probes can't see** — read them back from the written source against this run's data: every wrapper's entitlement descriptor (`feature_id` — its prefix carries the type; a paired add must carry the shared `custom_entitlements` `custom_`-prefixed id from `database_record.custom_entitlement_id`, never the database-record id and never the tool's own `_meta` id) and its **operation against its role** (`track_usage` for a solo paid tool, `check_remaining` for a paired add — a solo tool wrongly calling `check_remaining` authorizes without ever consuming, a silent under-metering nothing downstream catches), and the baked `ENTITLEMENT_API_ORIGIN` default (proxy + wrappers) against the response's `entitlement_api_origin`. (The PRM probe above already pins `RESOURCE_URL` and `ISSUER` on the wire.)
+5. **Cross-check the baked values the probes can't see** — read them back from the written source against this run's data: every wrapper's entitlement descriptor (`feature_id` — its prefix carries the type; a paired add must carry the shared `custom_entitlements` `custom_`-prefixed id from `database_record.custom_entitlement_id`, never the database-record id and never the tool's own `_meta` id), its **operation against its role** (`track_usage` for a solo paid tool, `check_remaining` for a paired add — a solo tool wrongly calling `check_remaining` authorizes without ever consuming, a silent under-metering nothing downstream catches), its denial's call echo (the tool's own name and its actual arguments) and marker rule (the renderer given the tool's own registered `_meta` and the request's — never a baked constant), and the baked `ENTITLEMENT_API_ORIGIN` default (proxy + wrappers) against the response's `entitlement_api_origin`. (The PRM probe above already pins `RESOURCE_URL` and `ISSUER` on the wire.)
+   When the directive names `ui_paywall`, read back the layer the same way — `resources/read` carries the same bearer requirement as `tools/list`, so this is source-level too: the baked `PAYWALL_SCRIPT_URL` equals the response's `paywall_script_url`, and every resource read whose MIME type is `text/html;profile=mcp-app` passes through the injection helper (the script tag first in `<head>`, the origin in `resourceDomains`).
 6. **Every tool declares all four annotations in its registration** — `readOnlyHint`, `destructiveHint`, `idempotentHint`, `openWorldHint` — and each solo paid tool's read the consuming shape (`readOnlyHint: false`, `idempotentHint: false`). Read this back from the written source, tool by tool, the same way item 5 reads back the baked values. A missing hint is invisible on this server and only shows up as a wrong destructive/confirm badge in the end user's client, so it is worth asserting even though the assertion is source-level. See Tool annotations.
 
    **Do not try to read this off the `tools/list` wire.** The resource-server layer gates every `/mcp` request, so `tools/list` needs a valid bearer — which no local probe has, and which deploying does not provide either (a deployed server is gated identically). The residual this leaves: an annotation block that is declared in source but never reaches the descriptor — a mis-shaped field, or an SDK/framework that drops it silently — is not caught here. That case belongs to the pre-publish connect loop below, which is the only surface with a real token.

@@ -6,7 +6,7 @@ description: >
   The plugin's skills and MCP tools are automatically added, renamed, or removed
   in Plugpass, so they can be subsequently mapped to subscription plans in the
   Plugpass dashboard.
-allowed-tools: mcp__plugin_plugpass_plugpass-publisher__plugpass_sync_plugin, mcp__plugin_plugpass_plugpass-publisher__plugpass_get_plugin_data, Read, Write, Edit, Glob, Bash(open:*), Bash(xdg-open:*), Bash(echo:*), Bash(git remote:*), Bash(git rev-parse:*), PowerShell(Start-Process:*), PowerShell(Write-Output:*), PowerShell(git remote:*), PowerShell(git rev-parse:*), AskUserQuestion, Skill
+allowed-tools: mcp__plugin_plugpass_plugpass-publisher__plugpass_sync_plugin, mcp__plugin_plugpass_plugpass-publisher__plugpass_get_plugin_data, Read, Write, Edit, Glob, Grep, Bash(open:*), Bash(xdg-open:*), Bash(echo:*), Bash(git remote:*), Bash(git rev-parse:*), PowerShell(Start-Process:*), PowerShell(Write-Output:*), PowerShell(git remote:*), PowerShell(git rev-parse:*), AskUserQuestion, Skill
 ---
 
 This skill works in the publisher's plugin repo: it reads and edits files in the current working directory and runs terminal commands there. If your environment cannot do both, tell the user "Plugpass needs to read and edit files in your plugin's repo and run terminal commands, which isn't possible here. Open your plugin's directory in an AI coding tool like Claude Code or Codex and run this skill again." and end the skill.
@@ -24,7 +24,7 @@ The Plugpass Publisher MCP server (this plugin's `.mcp.json` `plugpass-publisher
 
 **Don't narrate your actions or think out loud while working. Work silently. Do not print step-by-step commentary.**
 
-- PUBLISHER_PLUGIN_VERSION = `0.0.1` (stamped by the release pipeline). Include it as `publisher_plugin_version` on every Publisher MCP tool call in this skill.
+- PUBLISHER_PLUGIN_VERSION = `0.0.2` (stamped by the release pipeline). Include it as `publisher_plugin_version` on every Publisher MCP tool call in this skill.
 - USER_INPUT_TOOL = A tool that presents the user a question with selectable options and returns their choice (e.g. `AskUserQuestion`, `ask_user_input_v0`, etc.) that can be used in the default session state (not limited to a certain mode, e.g. plan mode). Where a prompt below calls for USER_INPUT_TOOL and no such tool is available, ask the question in chat and wait for the reply.
 - PLATFORM = If your system instructions indicate an OpenAI product (Codex or ChatGPT), then `openai`; otherwise (an Anthropic / Claude product) `claude`.
 - OS = If your system instructions indicate the platform is `darwin`, then `mac`; if `linux`, then `linux`; if `win32`, then `windows`.
@@ -34,7 +34,9 @@ The Plugpass Publisher MCP server (this plugin's `.mcp.json` `plugpass-publisher
 
 ## Step 0: Mode check
 
-Read the plugin manifest from the current working directory (the publisher's plugin repo root): `.claude-plugin/plugin.json` when present, else `.codex-plugin/plugin.json` (a Codex-only plugin — same one-repo format, Codex reads either). The file you read is `{manifest}` for every later manifest read and write in this skill. If neither exists, tell the user "No Claude or Codex plugin manifest found. Run this skill again from inside your plugin repo." and end the skill.
+Check the current working directory (the publisher's plugin repo root) for both plugin manifests: `.claude-plugin/plugin.json` (family `claude`) and `.codex-plugin/plugin.json` (family `codex`). A plugin repo may carry either or both. `{manifests}` is the list of families present, and step 7 writes the plugpass-plugin-id back to every one of them. If neither exists, tell the user "No Claude or Codex plugin manifest found. Run this skill again from inside your plugin repo." and end the skill.
+
+`{manifest}` — where this skill reads the plugin's metadata — is `.claude-plugin/plugin.json` when present, else `.codex-plugin/plugin.json`. Read it.
 
 Check `{manifest}`'s `metadata.plugpass-plugin-id` field:
 
@@ -172,6 +174,8 @@ Then help them fix it in place, as above.
 
 Compute the eligible set: a server qualifies for Q2 iff its **effective** ownership is `owned` (just answered Yes in Q1, or — SYNC mode — already `owned` server-side) AND its effective `has_ungated_tools` is true. In REGISTER mode every owned server qualifies. Servers marked `not_owned` are skipped — neither their tools nor any restriction question apply. If the eligible set is empty, skip Q2 entirely.
 
+An effectively-owned server whose `has_ungated_tools` is false — every tool it has is already restricted — is **not asked and counts as checked**: the publisher restricted it on a prior run, and its tools are enumerated below exactly as a checked server's are. (Leaving it out would send a payload with none of its tools, which reconciles as removing every one of them.)
+
 **Format by count of eligible servers:**
 
 - **2 or more eligible servers** — multi-select via USER_INPUT_TOOL (multi-select mode). **Use this exact question text verbatim**:
@@ -190,30 +194,13 @@ Compute the eligible set: a server qualifies for Q2 iff its **effective** owners
 
 **Pre-check state.** In REGISTER mode, no server is pre-checked — the publisher's selection drives which servers participate in tool enumeration. In SYNC mode, a server option is pre-checked (or, for the single-server case, the Yes/No default leans toward "Yes") if the server currently has paid tools — i.e., any of its tools appear with `in_any_tier: true` in the pre-check response; the publisher can uncheck to remove all of that server's tools from the new sync.
 
-Servers marked `not_owned` in Q1 still get an `mcp_dependency` entry in the payload (with `ownership: 'not_owned'`) — they're persisted so we know not to re-ask on the next run — but they contribute no tools. Servers whose effective ownership is `owned` but that are unchecked in Q2 also contribute no tools; they stay free on a first run, or unchanged on re-runs.
+Servers marked `not_owned` in Q1 still get an `mcp_dependency` entry in the payload (with `ownership: 'not_owned'`) — they're persisted so we know not to re-ask on the next run — but they contribute no tools. Servers whose effective ownership is `owned` but that are unchecked in Q2 also contribute no tools; they stay free on a first run, and on a re-run their previously-registered tools are dropped from Plugpass.
 
-### For each checked server: enumerate tools
+The **enumerated set** is every server checked in Q2 plus every effectively-owned server not asked because all its tools are already restricted. Steps below run over that set.
 
-For every server the publisher checked:
+### For each enumerated server: locate the source
 
-1. **Determine the plugin's tool-catalog namespace.** Tools for this plugin's servers appear in your tool catalog as `mcp__plugin_{plugin-name}_{server-name}__{tool-name}`, where `{plugin-name}` is the `name` field from `plugin.json` (clients normalize special characters; treat the namespace as best-effort) and `{server-name}` is the `mcpServers` key.
-
-2. **Check the catalog.** If no tools appear under that namespace, the server hasn't been
-   authenticated yet: tell the user "Your `{server-name}` MCP server
-   isn't connected in this session. Connect it, then tell me to continue." and wait for
-   their reply, then check the catalog again. If its tools are still absent, continue the
-   sync anyway but exclude that server's tools from the run and note it in the Step 10
-   summary.
-
-3. **Collect tools.** Once tools are visible, enumerate them. For each tool, capture:
-   - `tool_name` — the part after the final `__` in the catalog name.
-   - `description` — the tool's description string (used by paired-tool detection below).
-
-4. **SYNC mode only:** attempt to read each tool's `_meta.plugpass_component_id` field from the catalog metadata. If present, capture it as the tool's existing `plugpass_id`. If absent, fall back to the `(server_name, tool_name)` → plugpass_id map built from the pre-check. If neither source has an id, the plugpass_id is left absent — `plugpass_sync_plugin` will mint a new one. (In REGISTER mode ids are always absent.)
-
-### For each checked server: record the source location
-
-You'll stamp each paid tool's plugpass id into the publisher's MCP server source in Step 8, so make sure its location is on record while the premium-tool decision is fresh. Per-server paths are stored in the plugin repo's gitignored `.plugpass/` directory (per-machine, never shared — each collaborator keeps their own):
+Tools are enumerated from the publisher's own MCP server source, so its location is resolved first — and Step 8 stamps each tool's plugpass id back into that same source. Per-server paths are stored in the plugin repo's gitignored `.plugpass/` directory (per-machine, never shared — each collaborator keeps their own):
 
 ```
 .plugpass/mcp-server-paths.json
@@ -221,15 +208,43 @@ You'll stamp each paid tool's plugpass id into the publisher's MCP server source
 
 (relative to the plugin repo root) — a JSON object mapping `server-name → absolute path to the server's source directory`.
 
-`Read` it (a missing file is an empty map `{}`). For each checked server: if the map already has a path that still resolves (the directory exists), keep it — a prior run usually recorded it. Otherwise — a newly-monetized server, or the source moved — elicit the **absolute** path with USER_INPUT_TOOL, one server at a time, then `Write` the merged map back (creating `.plugpass/` if absent). Absolute paths only, since this file is per-publisher and never shared (a relative path would be meaningless on a collaborator's machine). After writing, ensure the plugin repo's `.gitignore` has a `.plugpass/` line — append one if it's missing (skip when the plugin directory isn't in a git repo).
+`Read` it (a missing file is an empty map `{}`). For each enumerated server: if the map already has a path that still resolves (the directory exists), keep it — a prior run usually recorded it; the server's source living inside the plugin repo resolves it too. Otherwise — a newly-monetized server, or the source moved — elicit the **absolute** path with USER_INPUT_TOOL, one server at a time, then `Write` the merged map back (creating `.plugpass/` if absent). Absolute paths only, since this file is per-publisher and never shared (a relative path would be meaningless on a collaborator's machine). After writing, ensure the plugin repo's `.gitignore` has a `.plugpass/` line — append one if it's missing (skip when the plugin directory isn't in a git repo).
 
-Prompt: "I'm having trouble locating the source directory for the {server-name} MCP server. Please provide its absolute path." If the publisher can't or won't provide it, continue the sync anyway but skip stamping that server's tool ids in Step 8 and note it in the Step 10 summary.
+Prompt: "I'm having trouble locating the source directory for the {server-name} MCP server. Please provide its absolute path."
 
-### For each checked server: paired-tool detection
+The path is **required**. If the publisher can't or won't provide one that resolves, stop: make no `plugpass_sync_plugin` call at all, tell them
 
-For each checked server's tool set, identify candidate **paired tools** — two tools on the same server where one adds a database record to some collection in the publisher's database and the other removes a database record of that same kind. Common examples: `connect_brokerage` ↔ `disconnect_brokerage`, `add_seat` ↔ `remove_seat`, `task_add` ↔ `task_remove`, `subscribe` ↔ `unsubscribe`, `lock_door` ↔ `unlock_door`.
+> I can't read the tools on your {server-name} MCP server without its source. Tell me where that server's source directory is to continue.
 
-There is no fixed verb table or required name shape — the publisher may have named their tools in any natural style (`verb_noun`, `noun_verb`, `verbNoun`, single-word inverses, etc.). Use both tool names and their `description` fields to judge whether two tools form a candidate pair. When in doubt, propose the pair to the publisher in prompt 1 below — they confirm or reject it; one-off false positives are cheap to reject.
+and end the skill. Syncing the rest and leaving that server's tools out would silently un-register them.
+
+### For each enumerated server: enumerate tools from its source
+
+Read the server's source and collect every tool it registers. Start from the entry file and follow its setup path, and `Grep` the source tree for the SDK's registration idiom to catch tools defined elsewhere — `registerTool` / `server.tool` / `add_tool`, a `@mcp.tool` decorator or `#[tool]` attribute, a tool struct or hash carrying a `name` field, a builder. Every SDK carries the tool's registered name, description, and metadata block together in one registration. A tool registered behind a condition (only when the client declares UI support, say) is still one of the server's tools — collect it.
+
+For each tool, capture:
+
+- `tool_name` — the name the server registers the tool under (the string clients call), never the function or handler name.
+- `description` — the registered description (paired-tool detection and pitch drafting below read it, alongside the handler's own code).
+- `plugpass_id` — the registration's `_meta.plugpass_component_id`, when it carries one. Absent for a tool that has never been synced; in REGISTER mode ignore any value found, exactly as step 2 ignores stale skill ids.
+- `visibility` — from the registration's `_meta.ui.visibility`: `model` when it lists only `"model"`, `app` when it lists only `"app"`, and `both` when it lists both or the field is absent (absent is the MCP Apps default, which is both).
+- `ui_backed` — `true` when the registration carries `_meta.ui.resourceUri` (the tool renders a UI resource), `false` otherwise.
+
+The metadata block's field name follows the SDK (`_meta`, `meta`, `Meta`); the keys inside it are the wire names above.
+
+If the same `tool_name` is registered more than once (per-client variants), it is one tool: `ui_backed` is true if any variant declares a resource, and `visibility` is the union of the variants'.
+
+**Drop the plugin's Plugpass-owned tools** — `{plugin_name}_check_access`, where `{plugin_name}` is the manifest `name` with every `-` replaced by `_` — from the collected list. That tool is Plugpass infrastructure `plugpass-implement-code-changes` registers on the publisher's server, never a publisher component, so it must never be registered as a `tool` (it would otherwise surface in `/plans`, the pitch flow, etc.). Same recognize-and-filter shape as the platform-owned MCP-server filter in step 3.
+
+If you can't find the server's tool registrations at all, treat it exactly as a missing source path above: stop, say so naming that server, and end the skill.
+
+This reads source, not your tool catalog: a tool the server exposes only to a UI is absent from the catalog by design, and the server does not need to be connected in this session.
+
+### For each enumerated server: paired-tool detection
+
+For each enumerated server's tool set, identify candidate **paired tools** — two tools on the same server where one adds a database record to some collection in the publisher's database and the other removes a database record of that same kind. Common examples: `connect_brokerage` ↔ `disconnect_brokerage`, `add_seat` ↔ `remove_seat`, `task_add` ↔ `task_remove`, `subscribe` ↔ `unsubscribe`, `lock_door` ↔ `unlock_door`.
+
+There is no fixed verb table or required name shape — the publisher may have named their tools in any natural style (`verb_noun`, `noun_verb`, `verbNoun`, single-word inverses, etc.). Judge from the tool names, their descriptions, and what their handlers actually do in the source you just read. A pair's two sides need not share a visibility — a widget-driven add and a model-facing remove act on the same records. When in doubt, propose the pair to the publisher in prompt 1 below — they confirm or reject it; one-off false positives are cheap to reject.
 
 **Pre-confirmation (SYNC mode only).** A candidate pair is **pre-confirmed** if both tools in the pre-check response carry a `database_record` subfield referencing the same canonical database_record plugpass_id (with opposite `operation` values). Skip both prompts for pre-confirmed pairs — the publisher already confirmed them on a prior run. Pass the existing `database_record`'s `{ plugpass_id, name, title }` through unchanged in the `plugpass_sync_plugin` payload so server reconciliation updates the existing row in place rather than creating a duplicate.
 
@@ -268,19 +283,21 @@ For each confirmed pair (pre-confirmed or newly confirmed), emit:
 
 ### Assemble the tool component list
 
-For each tool on each checked server, emit a `tool` component:
+For each tool on each enumerated server, emit a `tool` component:
 
 - `server_name` — the server key (`mcpServers` key verbatim).
-- `tool_name` — the tool's bare name (without the `mcp__plugin_..._` prefix).
+- `tool_name` — the name the server registers the tool under.
+- `visibility` — `model`, `app`, or `both`, as read from the registration. Always sent.
+- `ui_backed` — `true` or `false`, as read from the registration. Always sent.
 - `database_record_name` — set only when this tool is part of a confirmed pair (references the `database_record` entry in the same call by name); omit otherwise.
 - `operation` — set only when this tool is part of a confirmed pair (`add` for the tool that adds a database record, `remove` for the tool that removes a database record); omit otherwise. `database_record_name` and `operation` move together — either both present (paired) or both omitted (solo).
-- `plugpass_id` — SYNC mode: from `_meta.plugpass_component_id` or the pre-check map if available; omitted otherwise. Always absent in REGISTER mode.
+- `plugpass_id` — SYNC mode: from the registration's `_meta.plugpass_component_id`, else the pre-check map, if either has one; omitted otherwise. Always absent in REGISTER mode.
 
-**All discovered `mcp_dependency` entries from step 3 are included in the payload regardless of Q2 outcome** — they're how Plugpass persists per-server `ownership` and tracks dependency identity. Entries for `not_owned` servers carry their ownership and never contribute tools. Entries for effectively-owned servers contribute tools only when checked in Q2.
+**All discovered `mcp_dependency` entries from step 3 are included in the payload regardless of Q2 outcome** — they're how Plugpass persists per-server `ownership` and tracks dependency identity. Entries for `not_owned` servers carry their ownership and never contribute tools. Entries for effectively-owned servers contribute tools only when they're in the enumerated set.
 
 ## Step 5: Draft suggested pitches
 
-Draft one suggested pitch per component going into the payload — skills, tools on checked servers, and database records. The drafts ride the `plugpass_sync_plugin` payload as `suggested_pitch` fields; they are suggestions only, pre-filling the dashboard's features page where the publisher reviews, edits, and confirms them. **Don't show the drafts to the publisher or ask for confirmation here** — the features page is the review surface.
+Draft one suggested pitch per component going into the payload — skills, tools on enumerated servers, and database records. The drafts ride the `plugpass_sync_plugin` payload as `suggested_pitch` fields; they are suggestions only, pre-filling the dashboard's features page where the publisher reviews, edits, and confirms them. **Don't show the drafts to the publisher or ask for confirmation here** — the features page is the review surface.
 
 **Always draft and send `suggested_pitch` for every component, on every run.** The server's reconcile rule makes this safe and keeps this skill stateless about pitch status: a publisher-confirmed pitch is never overwritten (the suggestion isn't even stored for it), while an unconfirmed component's suggestion gets refreshed — so a component whose body changed picks up a fresher draft automatically.
 
@@ -292,7 +309,7 @@ Each pitch is the predicate completing the component's fixed sentence form (the 
 
 Drafting rules:
 
-- Source material: a skill's frontmatter `description` plus body (kept from Step 2); a tool's catalog `description` (collected in Step 4); a database record's two partner-tool descriptions plus its publisher-chosen `title`.
+- Source material: a skill's frontmatter `description` plus body (kept from Step 2); a tool's registered `description` and handler (read in Step 4); a database record's two partner-tool descriptions plus its publisher-chosen `title`.
 - Start with a lowercase present-tense verb that agrees with the sentence's subject — singular for skills/tools (e.g. "generates", "refines"), plural for database records (e.g. "track", "store").
 - One clause, roughly 5–15 words.
 - No trailing period (the rendering surfaces append it), and don't restate the component name.
@@ -312,6 +329,7 @@ Call the `plugpass_sync_plugin` tool (under any connector prefix) with the full 
     "description": "{description, omit if absent}",
     "license": "{plugin.json license id, omit if absent}",
     "plugpass_id": "{plugin-plugpass-id from step 0 — SYNC mode only; omit in REGISTER mode}",
+    "manifests": ["{each family from {manifests} — \"claude\", \"codex\", or both}"],
     "source": { "repository": "{repository from step 1b}", "subdirectory": "{subdirectory from step 1b}" }
   },
   "components": [
@@ -332,6 +350,8 @@ Call the `plugpass_sync_plugin` tool (under any connector prefix) with the full 
     { "type": "tool",
       "server_name": "{server-key}",
       "tool_name": "{name}",
+      "visibility": "{model | app | both, from the registration}",
+      "ui_backed": "{true | false, from the registration}",
       "plugpass_id": "{from _meta or the pre-check map, omit if absent}",
       "database_record_name": "{matching database_record entry's name, omit for solo}",
       "operation": "{add | remove, omit for solo}",
@@ -351,9 +371,9 @@ Capture from the successful response:
 - `continuation_url` — points at the dashboard page the server chose as this sync's follow-up surface: the plugin settings (confirmation) page normally, the plans page when an already-published plugin gained new components (which need assigning to plans there), or the page that fixes an outstanding connector-setup gap.
 - `continuation_message` — optional. Present when the plugin's connector state needs the publisher's attention (e.g. connector setup to complete, which the message lists as errors to fix, or the connector switching back to the Plugpass-hosted one). Relay it VERBATIM in Step 10 — never paraphrase or omit it.
 
-## Step 7: Write plugpass-plugin-id back to the manifest
+## Step 7: Write plugpass-plugin-id back to every manifest
 
-If `{manifest}`'s `metadata.plugpass-plugin-id` doesn't match the returned `plugin_id`, use `Edit` to set it. Add a `metadata` block if one doesn't exist yet. Preserve all other manifest fields exactly. (In SYNC mode the id should already match — this is a verify; in REGISTER mode this is the write that links the working copy.)
+For each manifest in `{manifests}`: if its `metadata.plugpass-plugin-id` doesn't match the returned `plugin_id`, use `Edit` to set it. Add a `metadata` block if one doesn't exist yet. Preserve all other manifest fields exactly; leave a manifest already carrying the right id alone. (In SYNC mode the ids should already match — this is a verify; in REGISTER mode this is the write that links the working copy. A repo that has gained a second manifest since the last run picks the id up here.)
 
 ## Step 8: Write plugpass-component-ids back to source
 
@@ -364,7 +384,7 @@ For every `skill` component in the response, find the matching source file (by c
 
 Preserve indentation, comments, and unrelated frontmatter fields. Do not modify the skill body or anything below the closing `---`.
 
-For every `tool` component in the response, stamp its plugpass id into the publisher's MCP server source so renames stay detectable across runs. Using that server's source path recorded in Step 4 (`.plugpass/mcp-server-paths.json`), locate the tool's registration in the source and add (or correct) a `_meta` field carrying `plugpass_component_id: "{plugpass_id}"`. Placement follows the server's MCP SDK — e.g. the tool-config object passed to `registerTool` in the TS SDK (`{ title, description, inputSchema, _meta: { plugpass_component_id } }`); adapt to the server's language (requires MCP protocol revision 2025-06-18+). This is **identity only** — not the premium feature access check wrapper, which `plugpass-implement-code-changes` adds later once plans are configured. Idempotent: if `_meta.plugpass_component_id` already matches, leave it — this is also how renames stay linked across runs. Skip (and note in Step 10) any server whose source you couldn't locate in Step 4.
+For every `tool` component in the response, stamp its plugpass id into the publisher's MCP server source so renames stay detectable across runs. Go back to the registration you read in Step 4 and add (or correct) a `_meta` field carrying `plugpass_component_id: "{plugpass_id}"`. Placement follows the server's MCP SDK — e.g. the tool-config object passed to `registerTool` in the TS SDK (`{ title, description, inputSchema, _meta: { plugpass_component_id } }`); adapt to the server's language (requires MCP protocol revision 2025-06-18+). Leave every other `_meta` field alone — `_meta.ui` is the publisher's. This is **identity only** — not the premium feature access check wrapper, which `plugpass-implement-code-changes` adds later once plans are configured. Idempotent: if `_meta.plugpass_component_id` already matches, leave it — this is also how renames stay linked across runs.
 
 `mcp_dependency` components skip this step — `.mcp.json` has no metadata slot to write an id into.
 

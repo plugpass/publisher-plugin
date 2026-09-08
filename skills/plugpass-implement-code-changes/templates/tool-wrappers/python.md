@@ -26,6 +26,9 @@ JWKS_URL = "<plugpass_jwks_url>"
 ENTITLEMENT_API_ORIGIN = "<entitlement_api_origin>"
 # This server's own public MCP URL — the JWT `aud` pin and the PRM `resource`.
 RESOURCE_URL = "<this server's RESOURCE_URL>"
+# Where the Plugpass paywall for MCP Apps widgets loads from (the `ui_paywall`
+# layer — only on a server whose directive names it).
+PAYWALL_SCRIPT_URL = "<paywall_script_url>"
 
 
 @dataclass(frozen=True)
@@ -34,6 +37,7 @@ class PlugpassConfig:
     jwks_url: str
     entitlement_api_origin: str
     resource_url: str
+    paywall_script_url: str
 
     @property
     def prm_url(self) -> str:
@@ -48,6 +52,7 @@ def plugpass_config() -> PlugpassConfig:
         jwks_url=JWKS_URL,
         entitlement_api_origin=ENTITLEMENT_API_ORIGIN,
         resource_url=RESOURCE_URL,
+        paywall_script_url=PAYWALL_SCRIPT_URL,
     )
 
 
@@ -135,6 +140,80 @@ def non_authorized_text(result: dict) -> str:
     trigger keys inside it auto-fire the plugin's access-handler skill).
     Never parse, reformat, or re-serialize it."""
     return str(result["result_text"])
+
+
+# The marker a UI-backed tool's denial carries when the client renders widgets.
+PAYWALL_UI_MARKER = "PLUGPASS_PAYWALL_UI=true"
+
+
+def non_authorized_tool_response(
+    result: dict,
+    call: dict[str, Any],
+    tool_meta: dict[str, Any],
+    request_meta: types.RequestParams.Meta | None,
+) -> types.CallToolResult:
+    """non_authorized → result_text verbatim as the tool's text. Two things ride
+    beside it for the Plugpass paywall an MCP Apps widget shows (both inert
+    everywhere else): the denial NAMES the call it denied (`call`: the tool's
+    name and the arguments it was called with) on the result's `_meta` — which
+    hosts pass to a widget and never show the model — so the paywall can replay
+    it once the user has upgraded, and says whether a widget may call the tool
+    at all (widget_callable below; a host refuses a widget's call to a
+    model-only tool, so the paywall then hands the retry to the conversation);
+    and the marker (a UI-backed tool AND a client that renders widgets,
+    paywall_ui below) — a second text block carrying PLUGPASS_PAYWALL_UI=true,
+    so the widget's paywall is the one asking the user and the access-handler
+    skill posts nothing beside it. Both read the tool's own registered meta and
+    the request's, at runtime."""
+    content: list[types.ContentBlock] = [
+        types.TextContent(type="text", text=non_authorized_text(result))
+    ]
+    if paywall_ui(tool_meta, request_meta):
+        content.append(types.TextContent(type="text", text=PAYWALL_UI_MARKER))
+    return types.CallToolResult(
+        content=content,
+        _meta={"plugpass_denied_call": {**call, "widget_callable": widget_callable(tool_meta)}},
+    )
+
+
+# Whether the calling client renders MCP Apps widgets: it declared the UI
+# extension among the client capabilities every request carries in its `_meta`
+# (`io.modelcontextprotocol/clientCapabilities` — the stateless protocol's
+# per-request declaration; this server keeps no session, so the initialize
+# handshake is not a source). Read off `ctx.request_context.meta`.
+CLIENT_CAPABILITIES_META_KEY = "io.modelcontextprotocol/clientCapabilities"
+UI_EXTENSION_ID = "io.modelcontextprotocol/ui"
+
+
+def client_renders_widgets(meta: types.RequestParams.Meta | None) -> bool:
+    extra = meta.model_extra if meta is not None else None
+    capabilities = extra.get(CLIENT_CAPABILITIES_META_KEY) if extra else None
+    if not isinstance(capabilities, dict):
+        return False
+    extensions = capabilities.get("extensions")
+    return isinstance(extensions, dict) and isinstance(extensions.get(UI_EXTENSION_ID), dict)
+
+
+# Whether the widget's paywall is the one asking on this denial: the tool renders
+# a widget (its own registration's meta declares `ui.resourceUri`) AND the client
+# renders widgets. Read off the registration at runtime, so a tool that gains or
+# loses its widget changes nothing here.
+def paywall_ui(tool_meta: dict[str, Any], request_meta: types.RequestParams.Meta | None) -> bool:
+    ui = tool_meta.get("ui")
+    return (
+        isinstance(ui, dict)
+        and isinstance(ui.get("resourceUri"), str)
+        and client_renders_widgets(request_meta)
+    )
+
+
+# Who may call the tool, off the same registration: an undeclared visibility
+# means the model and a widget both may; a declared list means exactly its
+# members. A widget's paywall replays a denied call itself only when it may.
+def widget_callable(tool_meta: dict[str, Any]) -> bool:
+    ui = tool_meta.get("ui")
+    visibility = ui.get("visibility") if isinstance(ui, dict) else None
+    return not isinstance(visibility, list) or "app" in visibility
 
 
 # The check proxy's unavailable grant — Plugpass could not answer, so the check
@@ -245,13 +324,18 @@ async def check_premium_access(
 **Solo paid tool wrapper** (consume-on-invocation; no `auth_token` parameter on this path):
 
 ```python
+# The registration's meta, hoisted so the marker rule reads the same object the
+# tool registers with. A UI-backed tool keeps its "ui": {"resourceUri": …,
+# "visibility": …} here beside the id.
+PAID_TOOL_META: dict[str, Any] = {"plugpass_component_id": "<plugpass_id>"}
+
 @mcp.tool(name="paid_tool", description="...", structured_output=False,
           # Metering makes this tool neither read-only nor idempotent, whatever it
           # was before the wrap. The other two hints keep the tool's own values.
           annotations=types.ToolAnnotations(
               readOnlyHint=False, destructiveHint=<the tool's own value>,
               idempotentHint=False, openWorldHint=<the tool's own value>),
-          meta={"plugpass_component_id": "<plugpass_id>"})
+          meta=PAID_TOOL_META)
 async def paid_tool(..., ctx: Context) -> str:
     request = ctx.request_context.request
     sub = request.user.access_token.subject
@@ -263,8 +347,14 @@ async def paid_tool(..., ctx: Context) -> str:
     if result["status"] == "reauth_required":
         request.state.plugpass_reauth_required = True
         return "Re-authentication required."
+    # The denial names this call (the tool's name and its actual arguments); the
+    # renderer reads the tool's own registered meta (its widget, who may call it)
+    # and the request's: never a baked per-tool constant.
     if result["status"] == "non_authorized":
-        return non_authorized_text(result)
+        return non_authorized_tool_response(
+            result, {"name": "paid_tool", "arguments": {...the call's arguments...}},
+            PAID_TOOL_META, ctx.request_context.meta,
+        )
     # ...existing tool body — keyed / scoped to `sub`; "unavailable" consumed
     # nothing and grants...
 ```
@@ -273,4 +363,39 @@ async def paid_tool(..., ctx: Context) -> str:
 
 **Identity tool** (the paired remove side, or any per-user free tool): no Entitlement API call — read `ctx.request_context.request.user.access_token.subject` and scope the body to it.
 
-**Placement guidance.** A FastMCP server keeps its existing tool modules; the verifier + middleware live in `premium_feature_access_check.py`; the entry file gains the `FastMCP(...)` auth kwargs + the two-line app assembly. When the publisher mounts the MCP app inside a larger Starlette/FastAPI app instead, `Mount("/…", mcp.streamable_http_app())` works but the **parent** app's lifespan must run `mcp.session_manager.run()`, and the reauth middleware wraps the parent. Invariants regardless of layout: `stateless_http=True, json_response=True`; `resource_server_url` includes `/mcp`; wrapped tools keep `meta={"plugpass_component_id": …}`, declare `structured_output=False`, and never declare an output schema.
+**The in-widget paywall (`ui_paywall`, servers that render widgets).** The helper below, in `premium_feature_access_check.py`, is applied to every resource the server reads out whose MIME type is `text/html;profile=mcp-app`: the paywall script tag goes first in `<head>`, and the script's origin joins the resource's `resourceDomains`. The widget HTML itself is never edited.
+
+```python
+import re
+from urllib.parse import urlsplit
+
+_HEAD_OPEN = re.compile(r"<head(\s[^>]*)?>", re.IGNORECASE)
+
+
+def with_paywall(html: str, csp: dict[str, list[str]], cfg: PlugpassConfig) -> tuple[str, dict[str, list[str]]]:
+    """The script tag first in <head> (ahead of the widget's own code; prepended
+    to the document when it has no <head>), its origin added to `resourceDomains`
+    so the sandbox lets it load. Returns the injected HTML and the widened CSP."""
+    tag = f'<script src="{cfg.paywall_script_url}"></script>'
+    head = _HEAD_OPEN.search(html)
+    injected = f"{tag}{html}" if head is None else f"{html[: head.end()]}{tag}{html[head.end() :]}"
+    parts = urlsplit(cfg.paywall_script_url)
+    origin = f"{parts.scheme}://{parts.netloc}"
+    resource_domains = list(csp.get("resourceDomains", []))
+    if origin not in resource_domains:
+        resource_domains.append(origin)
+    return injected, {**csp, "resourceDomains": resource_domains}
+```
+
+Every UI resource read passes through it. FastMCP carries a resource's `meta` onto the contents it reads out (as `_meta`), so a static resource applies the helper at registration and declares the widened CSP there:
+
+```python
+html, csp = with_paywall(WIDGET_HTML, WIDGET_CSP, cfg)
+
+@mcp.resource("ui://<plugin>/<widget>", name="widget", title="…", description="…",
+              mime_type="text/html;profile=mcp-app", meta={"ui": {"csp": csp}})
+def widget() -> str:
+    return html
+```
+
+**Placement guidance.** A FastMCP server keeps its existing tool modules; the verifier + middleware live in `premium_feature_access_check.py`; the entry file gains the `FastMCP(...)` auth kwargs + the two-line app assembly. When the publisher mounts the MCP app inside a larger Starlette/FastAPI app instead, `Mount("/…", mcp.streamable_http_app())` works but the **parent** app's lifespan must run `mcp.session_manager.run()`, and the reauth middleware wraps the parent. Invariants regardless of layout: `stateless_http=True, json_response=True`; `resource_server_url` includes `/mcp`; wrapped tools keep their hoisted `meta=` (the `plugpass_component_id`, plus `"ui"` on a UI-backed tool), declare `structured_output=False`, and never declare an output schema; on a server whose directive names `ui_paywall`, every `text/html;profile=mcp-app` resource read passes through `with_paywall`.
