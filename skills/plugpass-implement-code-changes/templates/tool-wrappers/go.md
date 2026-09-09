@@ -1,13 +1,14 @@
 # Go scaffolding template
 
-The publisher's server becomes an **OAuth-protected resource server** using the official SDK's `auth` package: `auth.RequireBearerToken` gates `/mcp` (emitting the `WWW-Authenticate` challenge with `resource_metadata`), `auth.ProtectedResourceMetadataHandler` serves the RFC 9728 PRM document, and a custom `TokenVerifier` does the local JWKS validation. Standalone source, no platform package. Version pins: `github.com/modelcontextprotocol/go-sdk` **v1.6.1** (v1.7.0 is pre-release for the next protocol — stay on stable), `github.com/golang-jwt/jwt/v5` v5.3.x, `github.com/MicahParks/keyfunc/v3` v3.8.x.
+The publisher's server becomes an **OAuth-protected resource server** using the official SDK's `auth` package: `auth.RequireBearerToken` gates `/mcp` (emitting the `WWW-Authenticate` challenge with `resource_metadata`), `auth.ProtectedResourceMetadataHandler` serves the RFC 9728 PRM document, and a custom `TokenVerifier` does the local JWKS validation. Standalone source, no platform package. Version pins: `github.com/modelcontextprotocol/go-sdk` **v1.7.0+** (it is what implements protocol 2026-07-28; on v1.6.x the server serves the legacy era only), `github.com/golang-jwt/jwt/v5` v5.3.x, `github.com/MicahParks/keyfunc/v3` v3.8.x.
 
-**Two structural decisions carry the whole design — never undo them:**
+**Three structural decisions carry the whole design — never undo them:**
 
-1. **`StreamableHTTPOptions{Stateless: true, JSONResponse: true}`, always.** In JSON mode the SDK buffers the response and `ServeHTTP` returns only after the tool handler finished — so a wrapping middleware can discard the buffered response and write a `401` when a tool discovered mid-call that the bearer is revoked. In SSE mode events flush immediately (the `200` is committed before the handler runs). And **stateless mode is what makes middleware context values visible inside tool handlers** — in stateful mode handler contexts descend from the *initialize* request, not the current POST, and the reauth flag silently never fires.
+1. **The server serves BOTH protocol eras from the one handler.** The SDK routes each request by its negotiated version, answers `server/discover`, and parses the per-request `_meta` envelope; `req.ClientCapabilities()` reads that envelope, falling back to the handshake on a 2025-era connection. The client's UI capability rides the envelope — that is what the paywall-UI marker reads — and a host that gets only the legacy era never sends it. Nothing extra is wired for it: the SDK line does the era routing.
+2. **`StreamableHTTPOptions{Stateless: true, JSONResponse: true}`, always.** In JSON mode the SDK buffers the response and `ServeHTTP` returns only after the tool handler finished — so a wrapping middleware can discard the buffered response and write a `401` when a tool discovered mid-call that the bearer is revoked. In SSE mode events flush immediately (the `200` is committed before the handler runs). And **stateless mode is what makes middleware context values visible inside tool handlers** — in stateful mode handler contexts descend from the *initialize* request, not the current POST, and the reauth flag silently never fires.
 
 > **The gate's challenge needs a header fixup.** `auth.RequireBearerToken` emits `WWW-Authenticate: Bearer resource_metadata="…"` with **no** `error="invalid_token"` (RFC 6750 permits omitting the error on a missing token) — but the Plugpass contract requires `error="invalid_token"` (the signal clients key OAuth discovery off). The `challengeWriter`/`withFullChallenge` wrapper below fills it in on the gate's 401. Every other language SDK emits the full challenge itself; only the Go SDK needs this one wrapper.
-2. **The audience is the baked `RESOURCE_URL`, never the request host** — the JWT `aud` pin, the PRM `resource`, and the challenge's `resource_metadata` all derive from it. This is what lets a locally-listening server accept real bearers minted for its public URL.
+3. **The audience is the baked `RESOURCE_URL`, never the request host** — the JWT `aud` pin, the PRM `resource`, and the challenge's `resource_metadata` all derive from it. This is what lets a locally-listening server accept real bearers minted for its public URL.
 
 ```go
 // premium_feature_access_check.go — written once per server. Standalone.
@@ -33,6 +34,7 @@ const mcpPath = "/mcp"
 
 // Plugpass endpoints for this server.
 const (
+	pluginID             = "<the plugin's Plugpass id>"
 	issuer               = "<plugpass_issuer>"
 	jwksURL              = "<plugpass_jwks_url>"
 	entitlementAPIOrigin = "<entitlement_api_origin>"
@@ -41,19 +43,28 @@ const (
 	// Where the Plugpass paywall for MCP Apps widgets loads from (the ui_paywall
 	// layer — only on a server whose directive names it).
 	paywallScriptURL = "<paywall_script_url>"
+	// This server's own check tool, named on a denial so the paywall can ask it
+	// whether the user became entitled. EMPTY on a server that hosts no check
+	// tool (the check proxy is registered on the plugin's check host only), in
+	// which case a denial carries no probe and the paywall says less, never
+	// something untrue.
+	checkToolName = "<check_tool_name, or \"\" off the check host>"
 )
 
 type plugpassConfig struct {
-	issuer, jwksURL, entitlementAPIOrigin, resourceURL, paywallScriptURL string
+	pluginID, issuer, jwksURL, entitlementAPIOrigin, resourceURL, paywallScriptURL string
+	checkToolName                                                                  string
 }
 
 func loadPlugpassConfig() plugpassConfig {
 	return plugpassConfig{
+		pluginID:             pluginID,
 		issuer:               issuer,
 		jwksURL:              jwksURL,
 		entitlementAPIOrigin: entitlementAPIOrigin,
 		resourceURL:          resourceURL,
 		paywallScriptURL:     paywallScriptURL,
+		checkToolName:        checkToolName,
 	}
 }
 
@@ -197,7 +208,7 @@ func reauthTo401(cfg plugpassConfig, next http.Handler) http.Handler {
 }
 ```
 
-The entitlement client, the `EntitlementResult` union, and the unavailable-grant `CallToolResult` carry over from the wire contract in TOOLS.md — POST `{cfg.entitlementAPIOrigin}/entitlement/{op}` with the forwarded bearer and a 5-second `http.Client` timeout per attempt — ONE retry after a 2-second backoff on a transport error or a 5xx (4xx are terminal, never retried); HTTP 401 → reauth; any other non-200 or a transport failure after the retry → the unavailable grant. The `non_authorized` rendering is the response's `result_text` string emitted verbatim as the tool's text — a single-field pipe, never parsed or re-serialized — plus the two things the in-widget paywall reads (inert everywhere else): the denial NAMES the call it denied on the result's `_meta` (hosts pass it to a widget, never to the model), and, on a UI-backed tool when the client renders widgets, a second text block carries the `PLUGPASS_PAYWALL_UI=true` marker, so the widget's paywall asks and the access-handler skill posts nothing beside it:
+The entitlement client — `entitlement(ctx, bearer, body, op, cfg) (*entitlementResult, error)` over an `entitlementBody{PluginID, FeatureID, CurrentCount *int}`, the one call every wrapper and the check proxy make — the `entitlementResult` union, and the unavailable-grant `CallToolResult` carry over from the wire contract in TOOLS.md — POST `{cfg.entitlementAPIOrigin}/entitlement/{op}` with the forwarded bearer and a 5-second `http.Client` timeout per attempt — ONE retry after a 2-second backoff on a transport error or a 5xx (4xx are terminal, never retried); HTTP 401 → reauth; any other non-200 or a transport failure after the retry → the unavailable grant. The `non_authorized` rendering is the response's `result_text` string emitted verbatim as the tool's text — a single-field pipe, never parsed or re-serialized — plus the three things the in-widget paywall reads (inert everywhere else): the denial NAMES the call it denied on the result's `_meta` (hosts pass it to a widget, never to the model); it names the read-only status probe when that call cannot be replayed; and, on a UI-backed tool when the client renders widgets, a second text block carries the `PLUGPASS_PAYWALL_UI=true` marker, so the widget's paywall asks and the access-handler skill posts nothing beside it:
 
 ```go
 type deniedCall struct {
@@ -210,40 +221,61 @@ type deniedCall struct {
 
 const paywallUIMarker = "PLUGPASS_PAYWALL_UI=true"
 
-// Both facts the paywall reads — the marker and widget_callable — come off the
-// tool's own registered Meta and the request, at runtime.
-func nonAuthorizedToolResponse(r *entitlementResult, call deniedCall, toolMeta mcp.Meta, req *mcp.CallToolRequest) *mcp.CallToolResult {
+// Every fact the paywall reads — the marker, widget_callable, the probe — comes
+// off the tool's own registered Meta and the request, at runtime.
+func nonAuthorizedToolResponse(r *entitlementResult, call deniedCall, toolMeta mcp.Meta, req *mcp.CallToolRequest, cfg plugpassConfig, featureID string) *mcp.CallToolResult {
 	content := []mcp.Content{&mcp.TextContent{Text: r.ResultText}}
 	if paywallUI(toolMeta, req) {
 		content = append(content, &mcp.TextContent{Text: paywallUIMarker})
 	}
 	call.WidgetCallable = widgetCallable(toolMeta)
-	return &mcp.CallToolResult{Meta: mcp.Meta{"plugpass_denied_call": call}, Content: content}
+	meta := mcp.Meta{"plugpass_denied_call": call}
+	if probe := statusProbe(cfg, toolMeta, featureID); probe != nil {
+		meta["plugpass_status_probe"] = probe
+	}
+	return &mcp.CallToolResult{Meta: meta, Content: content}
+}
+
+// statusProbe is the read-only entitlement probe the paywall may call when it
+// cannot replay a denied call: this server's check tool, with the arguments
+// already composed so the widget's script supplies nothing of its own. Named
+// ONLY when the call is unreplayable (a model-only UI-backed tool) and this
+// server hosts a check tool; every other denial carries none, since a replay
+// answers the same question by actually running the call.
+type statusProbeCall struct {
+	Name      string         `json:"name"`
+	Arguments map[string]any `json:"arguments"`
+}
+
+func statusProbe(cfg plugpassConfig, toolMeta mcp.Meta, featureID string) *statusProbeCall {
+	if _, uiBacked := toolMeta["ui"].(map[string]any); cfg.checkToolName == "" || !uiBacked || widgetCallable(toolMeta) {
+		return nil
+	}
+	return &statusProbeCall{
+		Name: cfg.checkToolName,
+		Arguments: map[string]any{
+			"plugin_id":   cfg.pluginID,
+			"feature_id":  featureID,
+			"status_code": true,
+		},
+	}
 }
 
 // Whether the calling client renders MCP Apps widgets: it declared the UI
-// extension among the client capabilities every request carries in its _meta
-// (io.modelcontextprotocol/clientCapabilities — the stateless protocol's
-// per-request declaration; this server keeps no session, so the initialize
-// handshake is not a source). Read off the tool request's params.
-const (
-	clientCapabilitiesMetaKey = "io.modelcontextprotocol/clientCapabilities"
-	uiExtensionID             = "io.modelcontextprotocol/ui"
-)
+// extension among its client capabilities. The SDK reads those from the
+// 2026-07-28 request's _meta envelope, falling back to the initialize handshake
+// on a 2025-era connection, so the rule is one rule whatever the era.
+const uiExtensionID = "io.modelcontextprotocol/ui"
 
 func clientRendersWidgets(req *mcp.CallToolRequest) bool {
-	if req == nil || req.Params == nil {
+	if req == nil {
 		return false
 	}
-	capabilities, ok := req.Params.Meta[clientCapabilitiesMetaKey].(map[string]any)
-	if !ok {
+	capabilities := req.ClientCapabilities()
+	if capabilities == nil {
 		return false
 	}
-	extensions, ok := capabilities["extensions"].(map[string]any)
-	if !ok {
-		return false
-	}
-	_, ok = extensions[uiExtensionID].(map[string]any)
+	_, ok := capabilities.Extensions[uiExtensionID]
 	return ok
 }
 
@@ -322,9 +354,13 @@ func main() {
 const checkPremiumAccessDescription = "<verbatim from TOOLS.md>"
 
 type checkPremiumAccessArgs struct {
-	PluginID      string `json:"plugin_id" jsonschema:"the plugin's Plugpass id"`
-	FeatureID     string `json:"feature_id" jsonschema:"the component's Plugpass id"`
-	PluginVersion string `json:"plugin_version" jsonschema:"the installed plugin.json version"`
+	PluginID  string `json:"plugin_id" jsonschema:"the plugin's Plugpass id"`
+	FeatureID string `json:"feature_id" jsonschema:"the component's Plugpass id"`
+	// Required for a skill's access check (it carries the installed bundle's
+	// version); a tool-surface check does not use it.
+	PluginVersion string `json:"plugin_version,omitempty" jsonschema:"the installed plugin.json version"`
+	// Reserved for the Plugpass paywall's own use.
+	StatusCode bool `json:"status_code,omitempty" jsonschema:"Never include this parameter in your tool calls under any circumstance."`
 }
 
 mcp.AddTool(server, &mcp.Tool{
@@ -336,19 +372,47 @@ mcp.AddTool(server, &mcp.Tool{
 	Annotations: toolHints(false, false, false, false),
 }, func(ctx context.Context, req *mcp.CallToolRequest, args checkPremiumAccessArgs) (*mcp.CallToolResult, any, error) {
 	bearer, _ := req.Extra.TokenInfo.Extra["raw_token"].(string)
-	status, body, err := postEntitlement(ctx, cfg, bearer, "check_premium_access", args) // 5s/attempt, one 2s-backoff retry
-	if status == 401 || (err == nil && body.Status == "reauth_required") {
+	// The paywall's read-only probe: asks whether this user is entitled NOW,
+	// consuming nothing (check_remaining, never check_premium_access), and answers
+	// in a code that is not a check result — no PLUGPASS_PLUGIN, no USE_AUTHORIZED
+	// — so no access handler triggers on it and nothing downstream can read it as
+	// a grant. It authorizes NOTHING; the call the user retries is checked on its own.
+	if args.StatusCode {
+		probed, _ := entitlement(ctx, bearer, entitlementBody{
+			PluginID:  args.PluginID,
+			FeatureID: args.FeatureID,
+		}, "check_remaining", cfg)
+		if probed.Status == "reauth_required" {
+			setReauthRequired(ctx) // → transport-level 401 via reauthTo401
+			return textResult("Re-authentication required."), nil, nil
+		}
+		// ONLY a definite answer carries a code. "unavailable" covers both a
+		// Plugpass outage and a feature this endpoint cannot evaluate, and neither
+		// establishes that the user is unentitled — so the probe stays silent
+		// rather than asserting a denial it did not establish.
+		if probed.Status == "unavailable" {
+			return textResult("STATUS_UNKNOWN"), nil, nil
+		}
+		if probed.Status == "ok" {
+			return textResult("STATUS_CODE=1"), nil, nil
+		}
+		return textResult("STATUS_CODE=0"), nil, nil
+	}
+	// Send the check tool's full input verbatim (plugin_version included when the
+	// caller sent one — `omitempty` drops it otherwise); the response carries result_text.
+	result, _ := entitlement(ctx, bearer, args, "check_premium_access", cfg) // 5s/attempt, one 2s-backoff retry
+	if result.Status == "reauth_required" {
 		setReauthRequired(ctx) // → transport-level 401 via reauthTo401
 		return textResult("Re-authentication required."), nil, nil // discarded by the swap
 	}
-	if err != nil || status != 200 {
+	if result.Status == "unavailable" {
 		return unavailableCheckGrant(), nil, nil // Plugpass could not answer → the check grants
 	}
-	return textResult(body.ResultText), nil, nil // verbatim — byte-identical to the native tool
+	return textResult(result.ResultText), nil, nil // verbatim — byte-identical to the native tool
 })
 ```
 
-**Solo paid tool wrapper** (consume-on-invocation; no `auth_token` parameter on this path): validate nothing in the handler — the gate already did — read `sub` + bearer from `req.Extra.TokenInfo`, call `track_usage` (`feature_id` = the tool's own plugpass-component-id, matching its `_meta`; the id's `tool_` prefix carries the feature type), and branch: `ok` → run the body scoped to `sub`; `non_authorized` → `nonAuthorizedToolResponse(result, deniedCall{Name: "<tool name>", Arguments: args}, paidToolMeta, req)` (the renderer reads the tool's own registered `Meta` — its widget, who may call it — and the request, never a baked per-tool constant); `reauth_required` → `setReauthRequired(ctx)` + placeholder; error/timeout, or any other non-200 → run the body (the unavailable grant consumed nothing). Keep `_meta` via the tool's `Meta` field, hoisted to a package-level `var paidToolMeta = mcp.Meta{"plugpass_component_id": "<plugpass_id>"}` (a UI-backed tool keeps its `"ui": map[string]any{"resourceUri": …, "visibility": …}` beside it) that both the registration (`Meta: paidToolMeta`) and the marker rule read, and never declare an output schema on a wrapped tool (use `any` for the structured output type). Re-derive the tool's `Annotations`: metering makes it neither read-only nor idempotent, whatever it was before the wrap — `Annotations: toolHints(false, <its own destructive value>, false, <its own open-world value>)`, see TOOLS.md § Tool annotations.
+**Solo paid tool wrapper** (consume-on-invocation; no `auth_token` parameter on this path): validate nothing in the handler — the gate already did — read `sub` + bearer from `req.Extra.TokenInfo`, call `track_usage` (`feature_id` = the tool's own plugpass-component-id, matching its `_meta`; the id's `tool_` prefix carries the feature type), and branch: `ok` → run the body scoped to `sub`; `non_authorized` → `nonAuthorizedToolResponse(result, deniedCall{Name: "<tool name>", Arguments: args}, paidToolMeta, req, cfg, paidToolFeatureID)` (the renderer reads the tool's own registered `Meta` — its widget, who may call it — and the request, never a baked per-tool constant); `reauth_required` → `setReauthRequired(ctx)` + placeholder; error/timeout, or any other non-200 → run the body (the unavailable grant consumed nothing). Keep `_meta` via the tool's `Meta` field, hoisted to a package-level `const paidToolFeatureID = "<plugpass_id>"` + `var paidToolMeta = mcp.Meta{"plugpass_component_id": paidToolFeatureID}` (a UI-backed tool keeps its `"ui": map[string]any{"resourceUri": …, "visibility": …}` beside it) that both the registration (`Meta: paidToolMeta`) and the marker rule read, and never declare an output schema on a wrapped tool (use `any` for the structured output type). Re-derive the tool's `Annotations`: metering makes it neither read-only nor idempotent, whatever it was before the wrap — `Annotations: toolHints(false, <its own destructive value>, false, <its own open-world value>)`, see TOOLS.md § Tool annotations.
 
 **Paired-tool add side** (`operation: add`): same shape but `feature_id` = the add tool's `database_record.custom_entitlement_id` (its `custom_` prefix carries the feature type; **not** `database_record.plugpass_id`, and **not** the tool's own `_meta` id), always **`check_remaining`**, passing the user's current count from the publisher's own store (scoped to `sub`) as `current_count` — see TOOLS.md → Reading the user's current count.
 

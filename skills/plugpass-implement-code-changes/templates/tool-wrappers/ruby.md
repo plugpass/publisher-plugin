@@ -1,12 +1,13 @@
 # Ruby scaffolding template
 
-The publisher's server becomes an **OAuth-protected resource server**: a Rack layer in front of the official `mcp` gem's `StreamableHTTPTransport` gates `/mcp` (validating the bearer against Plugpass's JWKS), serves the RFC 9728 PRM document, and carries per-request identity on a thread-local. Standalone source, no platform package. Version pins: `gem "mcp", "~> 0.24"` (**pin it — the gem ships breaking security defaults across minor versions**), `gem "jwt", "~> 3.2"`, `puma`, `rack`, `rackup`. Ruby ≥ 3.1 (stdlib OpenSSL verifies Ed25519 — **no `ed25519`/`rbnacl` native gems**).
+The publisher's server becomes an **OAuth-protected resource server**: a Rack layer in front of the official `mcp` gem's `StreamableHTTPTransport` gates `/mcp` (validating the bearer against Plugpass's JWKS), serves the RFC 9728 PRM document, and carries per-request identity on a thread-local. Standalone source, no platform package. Version pins: `gem "mcp", "~> 1.5"` (**pin it — the gem ships breaking security defaults across minor versions; 1.2+ is the floor for protocol 2026-07-28, and below it the server serves the legacy era only**), `gem "jwt", "~> 3.2"`, `puma`, `rack`, `rackup`. Ruby ≥ 3.1 (stdlib OpenSSL verifies Ed25519 — **no `ed25519`/`rbnacl` native gems**).
 
-**Three structural decisions carry the whole design — never undo them:**
+**Four structural decisions carry the whole design — never undo them:**
 
-1. **`enable_json_response: true` on the transport, always.** In JSON mode the whole JSON-RPC dispatch — including your tool blocks — runs synchronously on the request thread inside `transport.call(env)`, so the wrapping Rack layer regains control with the response uncommitted: thread-local identity works, and the layer can swap in a `401` when a tool discovered mid-call that the bearer is revoked. In the default SSE mode dispatch happens inside the streaming body *after* the middleware returned — both mechanisms silently die.
-2. **`dns_rebinding_protection: false`.** The gem's ≥ 0.23 default validates `Host` against loopback-only allowlists — dev on localhost works, then **every request to the deployed public host 403s**. Rebinding protection defends unauthenticated localhost servers; here every request requires a validated bearer, so disable it (or set `allowed_hosts` from env).
-3. **The audience is the baked `RESOURCE_URL`, never the request host** — the JWT `aud` pin, the PRM `resource`, and the challenge's `resource_metadata` all derive from it. This is what lets a locally-listening server accept real bearers minted for its public URL.
+1. **The server serves BOTH protocol eras from the one transport.** The gem classifies each request by its protocol version, answers `server/discover`, and parses the per-request `_meta` envelope onto `server_context.client_capabilities`. The client's UI capability rides that envelope — that is what the paywall-UI marker reads — and a host that gets only the legacy era never sends it. Nothing extra is wired for it: the gem does the era routing.
+2. **`enable_json_response: true` on the transport, always.** In JSON mode the whole JSON-RPC dispatch — including your tool blocks — runs synchronously on the request thread inside `transport.call(env)`, so the wrapping Rack layer regains control with the response uncommitted: thread-local identity works, and the layer can swap in a `401` when a tool discovered mid-call that the bearer is revoked. In the default SSE mode dispatch happens inside the streaming body *after* the middleware returned — both mechanisms silently die.
+3. **`dns_rebinding_protection: false`.** The gem's ≥ 0.23 default validates `Host` against loopback-only allowlists — dev on localhost works, then **every request to the deployed public host 403s**. Rebinding protection defends unauthenticated localhost servers; here every request requires a validated bearer, so disable it (or set `allowed_hosts` from env).
+4. **The audience is the baked `RESOURCE_URL`, never the request host** — the JWT `aud` pin, the PRM `resource`, and the challenge's `resource_metadata` all derive from it. This is what lets a locally-listening server accept real bearers minted for its public URL.
 
 ```ruby
 # premium_feature_access_check.rb — written once per server. Standalone.
@@ -20,6 +21,7 @@ module PremiumFeatureAccessCheck
   MCP_PATH = "/mcp"
 
   # Plugpass endpoints for this server.
+  PLUGIN_ID = "<the plugin's Plugpass id>"
   ISSUER = "<plugpass_issuer>"
   JWKS_URL = "<plugpass_jwks_url>"
   ENTITLEMENT_API_ORIGIN = "<entitlement_api_origin>"
@@ -28,12 +30,20 @@ module PremiumFeatureAccessCheck
   # Where the Plugpass paywall for MCP Apps widgets loads from (the `ui_paywall`
   # layer — only on a server whose directive names it).
   PAYWALL_SCRIPT_URL = "<paywall_script_url>"
+  # This server's own check tool, named on a denial so the paywall can ask it
+  # whether the user became entitled. nil on a server that hosts no check tool
+  # (the check proxy is registered on the plugin's check host only), in which
+  # case a denial carries no probe and the paywall says less, never something
+  # untrue.
+  CHECK_TOOL_NAME = "<check_tool_name, or nil off the check host>"
 
+  def self.plugin_id = PLUGIN_ID
   def self.issuer = ISSUER
   def self.jwks_url = JWKS_URL
   def self.entitlement_api_origin = ENTITLEMENT_API_ORIGIN
   def self.resource_url = RESOURCE_URL
   def self.paywall_script_url = PAYWALL_SCRIPT_URL
+  def self.check_tool_name = CHECK_TOOL_NAME
   # RFC 9728 path-aware form: origin + /.well-known/oauth-protected-resource + /mcp.
   def self.prm_url = "#{resource_url.delete_suffix(MCP_PATH)}/.well-known/oauth-protected-resource#{MCP_PATH}"
 
@@ -138,34 +148,59 @@ module PremiumFeatureAccessCheck
   #     carries PLUGPASS_PAYWALL_UI=true. The widget's paywall is then the one
   #     asking the user, and the plugin's access-handler skill posts nothing
   #     beside it. The composed text stays untouched in its own block.
-  # Both read the tool's own registered meta and the request's, at runtime.
-  def self.non_authorized_tool_response(result, call, tool_meta, server_context)
+  # All read the tool's own registered meta and the request, at runtime.
+  def self.non_authorized_tool_response(result, call, tool_meta, server_context, feature_id)
     content = [{ type: "text", text: result.fetch("result_text") }]
     content << { type: "text", text: PAYWALL_UI_MARKER } if paywall_ui(tool_meta, server_context)
-    MCP::Tool::Response.new(content, meta: { plugpass_denied_call: call.merge(widget_callable: widget_callable(tool_meta)) })
+    meta = { plugpass_denied_call: call.merge(widget_callable: widget_callable(tool_meta)) }
+    probe = status_probe(tool_meta, feature_id)
+    meta[:plugpass_status_probe] = probe if probe
+    MCP::Tool::Response.new(content, meta: meta)
+  end
+
+  # The read-only entitlement probe the paywall may call when it cannot replay a
+  # denied call: this server's check tool, with the arguments already composed so
+  # the widget's script supplies nothing of its own. Named ONLY when the call is
+  # unreplayable (a model-only UI-backed tool) and this server hosts a check
+  # tool; every other denial carries none, since a replay answers the same
+  # question by actually running the call.
+  def self.status_probe(tool_meta, feature_id)
+    return nil if check_tool_name.nil? || !tool_meta.key?(:ui) || widget_callable(tool_meta)
+
+    { name: check_tool_name,
+      arguments: { plugin_id: plugin_id, feature_id: feature_id, status_code: true } }
   end
 
   # Whether the calling client renders MCP Apps widgets: it declared the UI
-  # extension among the client capabilities every request carries in its `_meta`
-  # (`io.modelcontextprotocol/clientCapabilities` — the stateless protocol's
-  # per-request declaration; this server keeps no session, so the initialize
-  # handshake is not a source). The gem hands a tool the request's `_meta` on
-  # its `server_context` (symbol keys throughout). A client that declares
-  # nothing renders nothing, and gets no marker.
+  # extension among its client capabilities. Two sources, because this server
+  # answers both protocol eras: on 2026-07-28 the capabilities ride every
+  # request's `_meta` envelope, which the gem parses onto
+  # `server_context.client_capabilities`; a 2025-era client declares them at the
+  # initialize handshake, which reaches the same reader, or repeats the key in a
+  # bare per-request `_meta`, which the gem hands through unparsed on
+  # `server_context[:_meta]` (symbol keys throughout). Read both, so the rule is
+  # one rule whatever the era.
   CLIENT_CAPABILITIES_META_KEY = :"io.modelcontextprotocol/clientCapabilities"
   UI_EXTENSION_ID = :"io.modelcontextprotocol/ui"
 
+  def self.declares_ui_extension?(capabilities)
+    return false unless capabilities.is_a?(Hash)
+
+    extensions = capabilities[:extensions] || capabilities["extensions"]
+    return false unless extensions.is_a?(Hash)
+
+    extensions.key?(UI_EXTENSION_ID) || extensions.key?(UI_EXTENSION_ID.to_s)
+  end
+
   def self.client_renders_widgets(server_context)
+    if server_context.respond_to?(:client_capabilities) &&
+       declares_ui_extension?(server_context.client_capabilities)
+      return true
+    end
     return false unless server_context.respond_to?(:[])
 
     meta = server_context[:_meta]
-    return false unless meta.is_a?(Hash)
-
-    capabilities = meta[CLIENT_CAPABILITIES_META_KEY]
-    return false unless capabilities.is_a?(Hash)
-
-    extensions = capabilities[:extensions]
-    extensions.is_a?(Hash) && extensions[UI_EXTENSION_ID].is_a?(Hash)
+    meta.is_a?(Hash) && declares_ui_extension?(meta[CLIENT_CAPABILITIES_META_KEY])
   end
 
   # Whether the widget's paywall is the one asking on this denial: the tool
@@ -268,9 +303,16 @@ CheckPremiumAccess = MCP::Tool.define(
     properties: {
       plugin_id: { type: "string" },
       feature_id: { type: "string" },
+      # Required for a skill's access check (it carries the installed bundle's
+      # version); a tool-surface check does not use it.
       plugin_version: { type: "string" },
+      # Reserved for the Plugpass paywall's own use.
+      status_code: {
+        type: "boolean",
+        description: "Never include this parameter in your tool calls under any circumstance.",
+      },
     },
-    required: %w[plugin_id feature_id plugin_version],
+    required: %w[plugin_id feature_id],
   },
   annotations: {
     read_only_hint: false,
@@ -279,13 +321,34 @@ CheckPremiumAccess = MCP::Tool.define(
     open_world_hint: false,
   }
   # No output_schema.
-) do |plugin_id:, feature_id:, plugin_version:, **|
+) do |plugin_id:, feature_id:, plugin_version: nil, status_code: false, **|
   identity = PremiumFeatureAccessCheck.identity
-  result = PremiumFeatureAccessCheck.entitlement(
-    identity[:token],
-    { plugin_id:, feature_id:, plugin_version: },
-    "check_premium_access"
-  )
+  # The paywall's read-only probe: asks whether this user is entitled NOW,
+  # consuming nothing (check_remaining, never check_premium_access), and answers
+  # in a code that is not a check result — no PLUGPASS_PLUGIN, no USE_AUTHORIZED
+  # — so no access handler triggers on it and nothing downstream can read it as a
+  # grant. It authorizes NOTHING; the call the user retries is checked on its own.
+  if status_code
+    probed = PremiumFeatureAccessCheck.entitlement(
+      identity[:token], { plugin_id:, feature_id: }, "check_remaining"
+    )
+    if probed["status"] == "reauth_required"
+      PremiumFeatureAccessCheck.reauth_required!
+      next MCP::Tool::Response.new([{ type: "text", text: "Re-authentication required." }])
+    end
+    # ONLY a definite answer carries a code. "unavailable" covers both a Plugpass
+    # outage and a feature this endpoint cannot evaluate, and neither establishes
+    # that the user is unentitled — so the probe stays silent rather than
+    # asserting a denial it did not establish.
+    next MCP::Tool::Response.new([{ type: "text", text: "STATUS_UNKNOWN" }]) if probed["status"] == "unavailable"
+
+    code = probed["status"] == "ok" ? "1" : "0"
+    next MCP::Tool::Response.new([{ type: "text", text: "STATUS_CODE=#{code}" }])
+  end
+  # An omitted plugin_version is absent from the body, never sent empty.
+  body = { plugin_id:, feature_id: }
+  body[:plugin_version] = plugin_version unless plugin_version.nil?
+  result = PremiumFeatureAccessCheck.entitlement(identity[:token], body, "check_premium_access")
   if result["status"] == "unavailable"
     next MCP::Tool::Response.new([{ type: "text", text: PremiumFeatureAccessCheck::UNAVAILABLE_CHECK_GRANT }])
   end
@@ -297,7 +360,7 @@ CheckPremiumAccess = MCP::Tool.define(
 end
 ```
 
-**Solo paid tool wrapper** (consume-on-invocation; no `auth_token` parameter on this path): the block takes `|server_context:, **args|` (the request's `_meta` rides on `server_context`; `args` is the call as sent, symbol-keyed), read `PremiumFeatureAccessCheck.identity` (`[:sub]` scopes the body, `[:token]` is the bearer to forward), call `entitlement(token, { plugin_id:, feature_id: "<plugpass_id>" }, "track_usage")`, and branch: `ok` → run the body; `non_authorized` → `non_authorized_tool_response(result, { name: "<tool name>", arguments: args }, PAID_TOOL_META, server_context)` (the renderer reads the tool's own registered meta — its widget, who may call it — and the request's, never a baked per-tool constant); `reauth_required` → `reauth_required!` + placeholder; `unavailable` → run the body (it consumed nothing and grants). Keep the tool's meta on `Tool.define`, hoisted to a frozen constant both the registration and the marker rule read — `PAID_TOOL_META = { plugpass_component_id: "<plugpass_id>" }.freeze` (a UI-backed tool's also carries its `ui: { resourceUri: …, visibility: … }`), passed as `meta: PAID_TOOL_META` — and never declare an `output_schema` on a wrapped tool (the gem validates `structuredContent` against it, which paywall/reauth text responses would fail). Re-derive the tool's `annotations:`: metering makes it neither read-only nor idempotent, whatever it was before the wrap — `read_only_hint: false, idempotent_hint: false`, the other two keeping the tool's own values; see TOOLS.md § Tool annotations.
+**Solo paid tool wrapper** (consume-on-invocation; no `auth_token` parameter on this path): the block takes `|server_context:, **args|` (the request's `_meta` rides on `server_context`; `args` is the call as sent, symbol-keyed), read `PremiumFeatureAccessCheck.identity` (`[:sub]` scopes the body, `[:token]` is the bearer to forward), call `entitlement(token, { plugin_id:, feature_id: "<plugpass_id>" }, "track_usage")`, and branch: `ok` → run the body; `non_authorized` → `non_authorized_tool_response(result, { name: "<tool name>", arguments: args }, PAID_TOOL_META, server_context, PAID_TOOL_FEATURE_ID)` (the renderer reads the tool's own registered meta — its widget, who may call it — and the request, never a baked per-tool constant); `reauth_required` → `reauth_required!` + placeholder; `unavailable` → run the body (it consumed nothing and grants). Keep the tool's meta on `Tool.define`, hoisted to a frozen constant both the registration and the marker rule read — `PAID_TOOL_FEATURE_ID = "<plugpass_id>"` + `PAID_TOOL_META = { plugpass_component_id: PAID_TOOL_FEATURE_ID }.freeze` (a UI-backed tool's also carries its `ui: { resourceUri: …, visibility: … }`), passed as `meta: PAID_TOOL_META` — and never declare an `output_schema` on a wrapped tool (the gem validates `structuredContent` against it, which paywall/reauth text responses would fail). Re-derive the tool's `annotations:`: metering makes it neither read-only nor idempotent, whatever it was before the wrap — `read_only_hint: false, idempotent_hint: false`, the other two keeping the tool's own values; see TOOLS.md § Tool annotations.
 
 **Paired-tool add side** (`operation: add`): same shape but `feature_id` = the add tool's `database_record.custom_entitlement_id` (its `custom_` prefix carries the feature type; **not** `database_record.plugpass_id`, and **not** the tool's own `_meta` id), always **`check_remaining`**, passing the user's current count from the publisher's own store (scoped to `sub`) as `current_count` — see TOOLS.md → Reading the user's current count.
 

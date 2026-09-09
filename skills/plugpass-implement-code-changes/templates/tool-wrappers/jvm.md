@@ -1,6 +1,8 @@
 # JVM (Java/Kotlin) scaffolding template
 
-The publisher's server becomes an **OAuth-protected resource server**: a servlet `Filter` gates `/mcp` (validating the bearer against Plugpass's JWKS with Nimbus + the JDK's native Ed25519), a tiny servlet serves the RFC 9728 PRM document, and the MCP servlet transport runs behind them under embedded Jetty. Standalone source, no platform package. Version pins: `io.modelcontextprotocol.sdk:mcp` **2.0.0** (the aggregate — `mcp-core` + Jackson 3; apps pinned to Jackson 2 use `mcp-core` + `mcp-json-jackson2`), `com.nimbusds:nimbus-jose-jwt` 10.9.x, `org.eclipse.jetty.ee10:jetty-ee10-servlet` 12.1.x. Java 17+ (the reference targets 21). Keep the shade plugin's `ServicesResourceTransformer` — the SDK discovers its JSON mapper via ServiceLoader.
+The publisher's server becomes an **OAuth-protected resource server**: a servlet `Filter` gates `/mcp` (validating the bearer against Plugpass's JWKS with Nimbus + the JDK's native Ed25519), a tiny servlet serves the RFC 9728 PRM document, and the MCP servlet transport runs behind them under embedded Jetty. Standalone source, no platform package. Version pins: `io.modelcontextprotocol.sdk:mcp` **2.0.1** (the aggregate — `mcp-core` + Jackson 3; apps pinned to Jackson 2 use `mcp-core` + `mcp-json-jackson2`), `com.nimbusds:nimbus-jose-jwt` 10.9.x, `org.eclipse.jetty.ee10:jetty-ee10-servlet` 12.1.x. Java 17+ (the reference targets 21). Keep the shade plugin's `ServicesResourceTransformer` — the SDK discovers its JSON mapper via ServiceLoader.
+
+> **This SDK line serves the 2025 protocol era only.** `io.modelcontextprotocol.sdk:mcp` implements nothing past 2025-11-25: there is no `server/discover` and no per-request `_meta` envelope, so a 2026-07-28 host opens with discover, takes the 404, and falls back. Everything else in this template holds unchanged — including the status probe, which is an ordinary tool parameter and needs no protocol support. **The one behavioral difference: a widget denial on a modern host carries no paywall-UI marker, so the chat asks beside the modal there.**
 
 **Three structural decisions carry the whole design — never undo them:**
 
@@ -14,6 +16,7 @@ public final class PremiumFeatureAccessCheck {
   public static final String MCP_PATH = "/mcp";
 
   // Plugpass endpoints for this server.
+  private static final String PLUGIN_ID = "<the plugin's Plugpass id>";
   private static final String ISSUER = "<plugpass_issuer>";
   private static final String JWKS_URL = "<plugpass_jwks_url>";
   private static final String ENTITLEMENT_API_ORIGIN = "<entitlement_api_origin>";
@@ -22,12 +25,19 @@ public final class PremiumFeatureAccessCheck {
   // Where the Plugpass paywall for MCP Apps widgets loads from (the `ui_paywall`
   // layer — only on a server whose directive names it).
   private static final String PAYWALL_SCRIPT_URL = "<paywall_script_url>";
+  // This server's own check tool, named on a denial so the paywall can ask it
+  // whether the user became entitled. null on a server that hosts no check tool
+  // (the check proxy is registered on the plugin's check host only), in which case
+  // a denial carries no probe and the paywall says less, never something untrue.
+  private static final String CHECK_TOOL_NAME = "<check_tool_name, or null off the check host>";
 
+  public static String pluginId() { return PLUGIN_ID; }
   public static String issuer() { return ISSUER; }
   public static String jwksUrl() { return JWKS_URL; }
   public static String entitlementApiOrigin() { return ENTITLEMENT_API_ORIGIN; }
   public static String resourceUrl() { return RESOURCE_URL; }
   public static String paywallScriptUrl() { return PAYWALL_SCRIPT_URL; }
+  public static String checkToolName() { return CHECK_TOOL_NAME; }
 
   // RFC 9728 path-aware PRM URL: origin + /.well-known/oauth-protected-resource + /mcp.
   public static String prmUrl() {
@@ -118,23 +128,47 @@ public final class PremiumFeatureAccessCheck {
   //     PLUGPASS_PAYWALL_UI=true. The widget's paywall is then the one asking the
   //     user, and the plugin's access-handler skill posts nothing beside it. The
   //     composed text stays untouched in its own block.
-  // Both read the tool's own registered meta and the request, at runtime.
-  public static CallToolResult nonAuthorizedToolResponse(Map<String, Object> result, DeniedCall call, Map<String, Object> toolMeta, CallToolRequest request) {
+  // All read the tool's own registered meta and the request, at runtime.
+  public static CallToolResult nonAuthorizedToolResponse(Map<String, Object> result, DeniedCall call, Map<String, Object> toolMeta, CallToolRequest request, String featureId) {
     var response = CallToolResult.builder().addTextContent(String.valueOf(result.get("result_text")));
     if (paywallUi(toolMeta, request)) response.addTextContent(PAYWALL_UI_MARKER);
     Map<String, Object> deniedCall = new LinkedHashMap<>();
     deniedCall.put("name", call.name());
     deniedCall.put("arguments", call.arguments() == null ? Map.of() : call.arguments());
     deniedCall.put("widget_callable", widgetCallable(toolMeta));
-    return response.meta(Map.of("plugpass_denied_call", deniedCall)).build();
+    Map<String, Object> meta = new LinkedHashMap<>();
+    meta.put("plugpass_denied_call", deniedCall);
+    Map<String, Object> probe = statusProbe(toolMeta, featureId);
+    if (probe != null) meta.put("plugpass_status_probe", probe);
+    return response.meta(meta).build();
+  }
+
+  // The read-only entitlement probe the paywall may call when it cannot replay a
+  // denied call: this server's check tool, with the arguments already composed so
+  // the widget's script supplies nothing of its own. Named ONLY when the call is
+  // unreplayable (a model-only UI-backed tool) and this server hosts a check tool;
+  // every other denial carries none, since a replay answers the same question by
+  // actually running the call.
+  private static Map<String, Object> statusProbe(Map<String, Object> toolMeta, String featureId) {
+    if (checkToolName() == null || !(toolMeta.get("ui") instanceof Map<?, ?>) || widgetCallable(toolMeta)) {
+      return null;
+    }
+    Map<String, Object> arguments = new LinkedHashMap<>();
+    arguments.put("plugin_id", pluginId());
+    arguments.put("feature_id", featureId);
+    arguments.put("status_code", true);
+    Map<String, Object> probe = new LinkedHashMap<>();
+    probe.put("name", checkToolName());
+    probe.put("arguments", arguments);
+    return probe;
   }
 
   // Whether the calling client renders MCP Apps widgets: it declared the UI
-  // extension among the client capabilities every request carries in its `_meta`
-  // (`io.modelcontextprotocol/clientCapabilities` — the stateless protocol's
-  // per-request declaration; this server keeps no session, so the initialize
-  // handshake is not a source). Read off the tool call request's meta(). A client
-  // that declares nothing renders nothing, and gets no marker.
+  // extension among the client capabilities the request carries in its `_meta`
+  // (`io.modelcontextprotocol/clientCapabilities`). Read off the tool call
+  // request's meta(). This SDK line serves the 2025 era only, so a modern host
+  // never reaches here with that key — see the note at the top. A client that
+  // declares nothing renders nothing, and gets no marker.
   private static final String CLIENT_CAPABILITIES_META_KEY = "io.modelcontextprotocol/clientCapabilities";
   private static final String UI_EXTENSION_ID = "io.modelcontextprotocol/ui";
 
@@ -261,8 +295,13 @@ var checkPremiumAccess = McpStatelessServerFeatures.SyncToolSpecification.builde
             "properties", Map.of(
                 "plugin_id", Map.of("type", "string"),
                 "feature_id", Map.of("type", "string"),
-                "plugin_version", Map.of("type", "string")),
-            "required", List.of("plugin_id", "feature_id", "plugin_version")))
+                // plugin_version: required for a skill's access check (it carries the
+                // installed bundle's version); a tool-surface check does not use it.
+                "plugin_version", Map.of("type", "string"),
+                // Reserved for the Plugpass paywall's own use.
+                "status_code", Map.of("type", "boolean", "description",
+                    "Never include this parameter in your tool calls under any circumstance.")),
+            "required", List.of("plugin_id", "feature_id")))
         .title("Check premium access")
         .description(CHECK_PREMIUM_ACCESS_DESCRIPTION)
         .annotations(hints(false, false, false, false))
@@ -270,6 +309,27 @@ var checkPremiumAccess = McpStatelessServerFeatures.SyncToolSpecification.builde
     .callHandler((ctx, request) -> {
       var auth = (PremiumFeatureAccessCheck.PlugpassAuth) ctx.get(PremiumFeatureAccessCheck.AUTH_ATTRIBUTE);
       if (auth == null) return unavailableCheckGrant(); // unreachable behind the gate
+      // The paywall's read-only probe: asks whether this user is entitled NOW,
+      // consuming nothing (check_remaining, never check_premium_access), and answers
+      // in a code that is not a check result — no PLUGPASS_PLUGIN, no USE_AUTHORIZED
+      // — so no access handler triggers on it and nothing downstream can read it as a
+      // grant. It authorizes NOTHING; the call the user retries is checked on its own.
+      if (Boolean.TRUE.equals(request.arguments().get("status_code"))) {
+        var probed = PremiumFeatureAccessCheck.entitlement(auth.bearer(),
+            Map.of("plugin_id", request.arguments().get("plugin_id"),
+                   "feature_id", request.arguments().get("feature_id")), "check_remaining");
+        if ("reauth_required".equals(probed.status())) {
+          auth.reauthRequired().set(true); // → transport-level 401 via the filter
+          return CallToolResult.builder().addTextContent("Re-authentication required.").build();
+        }
+        // ONLY a definite answer carries a code. "unavailable" covers both a Plugpass
+        // outage and a feature this endpoint cannot evaluate, and neither establishes
+        // that the user is unentitled — so the probe stays silent rather than
+        // asserting a denial it did not establish.
+        String code = "unavailable".equals(probed.status()) ? "STATUS_UNKNOWN"
+            : "ok".equals(probed.status()) ? "STATUS_CODE=1" : "STATUS_CODE=0";
+        return CallToolResult.builder().addTextContent(code).build();
+      }
       var result = PremiumFeatureAccessCheck.entitlement(auth.bearer(),
           toJson(request.arguments()), "check_premium_access");
       if ("reauth_required".equals(result.status())) {
@@ -284,7 +344,7 @@ var checkPremiumAccess = McpStatelessServerFeatures.SyncToolSpecification.builde
     .build();
 ```
 
-**Solo paid tool wrapper** (consume-on-invocation; no `auth_token` parameter on this path): read the holder from the context (`auth.sub()` scopes the body, `auth.bearer()` is the forwarded bearer), call `track_usage` (`feature_id` = the tool's own plugpass-component-id, matching its `_meta`; the id's `tool_` prefix carries the feature type), and branch: `ok` → run the body; `non_authorized` → `nonAuthorizedToolResponse(result, new DeniedCall("<tool name>", request.arguments()), PAID_TOOL_META, request)` (the renderer reads the tool's own registered meta — its widget, who may call it — and the request, never a baked per-tool constant); `reauth_required` → set the flag + placeholder; `unavailable` → run the body (it consumed nothing and grants). Stamp `_meta` via `Tool.builder(...).meta(PAID_TOOL_META)`, the map hoisted to a `static final Map<String, Object> PAID_TOOL_META = Map.of("plugpass_component_id", "<plugpass_id>")` (a UI-backed tool's also carries its `"ui", Map.of("resourceUri", …, "visibility", …)`) that both the builder and the marker rule read, and never declare an `outputSchema` on a wrapped tool (paywall/reauth responses are text-only). Re-derive the tool's `.annotations(…)`: metering makes it neither read-only nor idempotent, whatever it was before the wrap — `.annotations(hints(false, <its own destructive value>, false, <its own open-world value>))`, see TOOLS.md § Tool annotations.
+**Solo paid tool wrapper** (consume-on-invocation; no `auth_token` parameter on this path): read the holder from the context (`auth.sub()` scopes the body, `auth.bearer()` is the forwarded bearer), call `track_usage` (`feature_id` = the tool's own plugpass-component-id, matching its `_meta`; the id's `tool_` prefix carries the feature type), and branch: `ok` → run the body; `non_authorized` → `nonAuthorizedToolResponse(result, new DeniedCall("<tool name>", request.arguments()), PAID_TOOL_META, request, PAID_TOOL_FEATURE_ID)` (the renderer reads the tool's own registered meta — its widget, who may call it — and the request, never a baked per-tool constant); `reauth_required` → set the flag + placeholder; `unavailable` → run the body (it consumed nothing and grants). Stamp `_meta` via `Tool.builder(...).meta(PAID_TOOL_META)`, the map hoisted to a `static final String PAID_TOOL_FEATURE_ID = "<plugpass_id>"` + `static final Map<String, Object> PAID_TOOL_META = Map.of("plugpass_component_id", PAID_TOOL_FEATURE_ID)` (a UI-backed tool's also carries its `"ui", Map.of("resourceUri", …, "visibility", …)`) that both the builder and the marker rule read, and never declare an `outputSchema` on a wrapped tool (paywall/reauth responses are text-only). Re-derive the tool's `.annotations(…)`: metering makes it neither read-only nor idempotent, whatever it was before the wrap — `.annotations(hints(false, <its own destructive value>, false, <its own open-world value>))`, see TOOLS.md § Tool annotations.
 
 **Paired-tool add side** (`operation: add`): same shape but `feature_id` = the add tool's `database_record.custom_entitlement_id` (its `custom_` prefix carries the feature type; **not** `database_record.plugpass_id`, and **not** the tool's own `_meta` id), always **`check_remaining`**, passing the user's current count from the publisher's own store (scoped to `sub`) as `current_count` — see TOOLS.md → Reading the user's current count.
 
