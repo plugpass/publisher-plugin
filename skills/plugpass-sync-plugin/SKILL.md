@@ -24,9 +24,9 @@ The Plugpass Publisher MCP server (this plugin's `.mcp.json` `plugpass-publisher
 
 **Work silently.** The only text you post is what a step calls for. Skip the short preamble that normally precedes a tool call — including the first one — and post no mode or step announcements, no commentary on what you just did or are about to do, and no recap the steps didn't ask for.
 
-**Presenting copy.** A `>` block is finished copy; the `>` characters delimit it here and are never part of it. Reproduce the text exactly — substituting each `{VARIABLE}` with its value — and never print the `>` characters, restyle the wording, or wrap it in a quote block. The surrounding step says where the copy goes: where it says to tell the publisher something, post it as your own normal assistant message with nothing of your own before or after it. Copy given inline in double quotes is delivered the same way, without the quote marks.
+**Presenting copy.** A `>` block is finished copy; the `>` characters delimit it here and are never part of it. Reproduce the text exactly — substituting each `{VARIABLE}` with its value — and never print the `>` characters, restyle the wording, or wrap it in a quote block. The surrounding step says where the copy goes: where it says to tell the publisher something, post it as your own message with nothing of your own before or after it, by whatever messaging method will be visible to them (especially if a tool call will follow it in the same turn). Copy given inline in double quotes is delivered the same way, without the quote marks.
 
-- PUBLISHER_PLUGIN_VERSION = `0.0.4` (stamped by the release pipeline). Include it as `publisher_plugin_version` on every Publisher MCP tool call in this skill.
+- PUBLISHER_PLUGIN_VERSION = `0.0.5` (stamped by the release pipeline). Include it as `publisher_plugin_version` on every Publisher MCP tool call in this skill.
 - USER_INPUT_TOOL = A tool that presents the user a question with selectable options and returns their choice (e.g. `AskUserQuestion`, `ask_user_input_v0`, etc.) that can be used in the default session state (not limited to a certain mode, e.g. plan mode). Where a prompt below calls for USER_INPUT_TOOL and no such tool is available, ask the question in chat and wait for the reply.
 - PLATFORM = If your system instructions indicate an OpenAI product (Codex or ChatGPT), then `openai`; otherwise (an Anthropic / Claude product) `claude`.
 - OS = If your system instructions indicate the platform is `darwin`, then `mac`; if `linux`, then `linux`; if `win32`, then `windows`.
@@ -117,7 +117,7 @@ In SYNC mode, call the `plugpass_get_plugin_data` tool (under any connector pref
 Capture the response. From the `components` array:
 
 - **`mcp_dependency` entries** carry per-server `ownership` (`unknown` / `owned` / `not_owned`) and `has_ungated_tools` (true when the server has at least one solo canonical tool that isn't already paid, OR when the server has no canonical tools at all yet). Build a `server_name → { plugpass_id, ownership, has_ungated_tools }` map — Q1 and Q2 below consume it.
-- **`tool` entries** carry the existing per-tool `database_record` subfield + `operation`. Build a `(server_name, tool_name) → { plugpass_id, database_record, operation }` map for tool enumeration's re-run identity match and paired-tool detection's pre-confirmation.
+- **`tool` entries** carry the existing per-tool `entitlement` subfield + `operation`. Build a `(server_name, tool_name) → { plugpass_id, entitlement, operation }` map for tool enumeration's re-run identity match and paired-tool detection's pre-confirmation.
 
 **In REGISTER mode, skip the call** — there is no plugin id to query. Treat every server's effective state as empty: ownership `unknown`, `has_ungated_tools` true, no tool in any tier, no pre-confirmed pairs, and an empty plugpass-id map.
 
@@ -248,7 +248,7 @@ For each enumerated server's tool set, identify candidate **paired tools** — t
 
 There is no fixed verb table or required name shape — the publisher may have named their tools in any natural style (`verb_noun`, `noun_verb`, `verbNoun`, single-word inverses, etc.). Judge from the tool names, their descriptions, and what their handlers actually do in the source you just read. A pair's two sides need not share a visibility — a widget-driven add and a model-facing remove act on the same records. When in doubt, propose the pair to the publisher in prompt 1 below — they confirm or reject it; one-off false positives are cheap to reject.
 
-**Pre-confirmation (SYNC mode only).** A candidate pair is **pre-confirmed** if both tools in the pre-check response carry a `database_record` subfield referencing the same canonical database_record plugpass_id (with opposite `operation` values). Skip both prompts for pre-confirmed pairs — the publisher already confirmed them on a prior run. Pass the existing `database_record`'s `{ plugpass_id, name, title }` through unchanged in the `plugpass_sync_plugin` payload so server reconciliation updates the existing row in place rather than creating a duplicate.
+**Pre-confirmation (SYNC mode only).** A candidate pair is **pre-confirmed** if both tools in the pre-check response carry an `entitlement` subfield referencing the same entitlement plugpass_id (with opposite `operation` values). Skip both prompts for pre-confirmed pairs — the publisher already confirmed them on a prior run. Pass the existing `entitlement`'s `{ plugpass_id, name, title }` through unchanged in the `plugpass_sync_plugin` payload so server reconciliation updates the existing row in place rather than creating a duplicate.
 
 For candidates that are NOT pre-confirmed (all candidates in REGISTER mode; newly detected pairs, or pairs the publisher rejected last time, in SYNC mode), surface **two** USER_INPUT_TOOL prompts in sequence (one pair = up to two prompts):
 
@@ -258,7 +258,7 @@ For candidates that are NOT pre-confirmed (all candidates in REGISTER mode; newl
 
 Options: "Yes" / "No, treat as independent tools".
 
-If the publisher answers "No", drop the candidate; both tools are treated as solo (no `database_record` entry, no paired routing on either `tool` entry). Skip to the next candidate.
+If the publisher answers "No", drop the candidate; both tools are treated as solo (no `entitlement` entry, no paired routing on either `tool` entry). Skip to the next candidate.
 
 If "Yes", proceed to prompt 2.
 
@@ -278,10 +278,10 @@ Example: "Brainstorm topics" → `brainstorm_topics`. "Saved chart views!" → `
 
 For each confirmed pair (pre-confirmed or newly confirmed), emit:
 
-- One `database_record` component entry carrying `name` + `title` (`plugpass_id` present for pre-confirmed pairs, omitted for newly-confirmed ones).
-- The two paired `tool` entries each carry `database_record_name` (matching the `database_record` entry's `name`) and `operation` (`add` for the tool that adds a database record, `remove` for the tool that removes a database record).
+- One `entitlement` component entry carrying `name` + `title` (`plugpass_id` present for pre-confirmed pairs, omitted for newly-confirmed ones).
+- The two paired `tool` entries each carry `entitlement_name` (matching the `entitlement` entry's `name`) and `operation` (`add` for the tool that adds a database record, `remove` for the tool that removes a database record).
 
-**SYNC mode:** for previously-confirmed pairs that are no longer detected (e.g., the publisher renamed one of the tools so the pattern no longer matches) or that the publisher un-confirms this run, omit the `database_record` entry and omit `database_record_name` + `operation` on both partner tool entries. `plugpass_sync_plugin` reconciles by clearing `database_record_id` + `operation` on both partner `mcp_tools` rows and deleting the orphaned `database_records` canonical row (cascading through any `custom_entitlements` row that referenced it).
+**SYNC mode:** for previously-confirmed pairs that are no longer detected (e.g., the publisher renamed one of the tools so the pattern no longer matches) or that the publisher un-confirms this run, omit the `entitlement` entry and omit `entitlement_name` + `operation` on both partner tool entries. `plugpass_sync_plugin` reconciles by clearing `entitlement_id` + `operation` on both partner `mcp_tools` rows and dropping the orphaned entitlement from the draft.
 
 ### Assemble the tool component list
 
@@ -291,31 +291,31 @@ For each tool on each enumerated server, emit a `tool` component:
 - `tool_name` — the name the server registers the tool under.
 - `visibility` — `model`, `app`, or `both`, as read from the registration. Always sent.
 - `ui_backed` — `true` or `false`, as read from the registration. Always sent.
-- `database_record_name` — set only when this tool is part of a confirmed pair (references the `database_record` entry in the same call by name); omit otherwise.
-- `operation` — set only when this tool is part of a confirmed pair (`add` for the tool that adds a database record, `remove` for the tool that removes a database record); omit otherwise. `database_record_name` and `operation` move together — either both present (paired) or both omitted (solo).
+- `entitlement_name` — set only when this tool is part of a confirmed pair (references the `entitlement` entry in the same call by name); omit otherwise.
+- `operation` — set only when this tool is part of a confirmed pair (`add` for the tool that adds a database record, `remove` for the tool that removes a database record); omit otherwise. `entitlement_name` and `operation` move together — either both present (paired) or both omitted (solo).
 - `plugpass_id` — SYNC mode: from the registration's `_meta.plugpass_component_id`, else the pre-check map, if either has one; omitted otherwise. Always absent in REGISTER mode.
 
 **All discovered `mcp_dependency` entries from step 3 are included in the payload regardless of Q2 outcome** — they're how Plugpass persists per-server `ownership` and tracks dependency identity. Entries for `not_owned` servers carry their ownership and never contribute tools. Entries for effectively-owned servers contribute tools only when they're in the enumerated set.
 
 ## Step 5: Draft suggested pitches
 
-Draft one suggested pitch per component going into the payload — skills, tools on enumerated servers, and database records. The drafts ride the `plugpass_sync_plugin` payload as `suggested_pitch` fields; they are suggestions only, pre-filling the dashboard's features page where the publisher reviews, edits, and confirms them. **Don't show the drafts to the publisher or ask for confirmation here** — the features page is the review surface.
+Draft one suggested pitch per component going into the payload — skills and tools on enumerated servers, paired tools included. The drafts ride the `plugpass_sync_plugin` payload as `suggested_pitch` fields; they are suggestions only, pre-filling the dashboard's features page where the publisher reviews, edits, and confirms them. **Don't show the drafts to the publisher or ask for confirmation here** — the features page is the review surface.
 
 **Always draft and send `suggested_pitch` for every component, on every run.** The server's reconcile rule makes this safe and keeps this skill stateless about pitch status: a publisher-confirmed pitch is never overwritten (the suggestion isn't even stored for it), while an unconfirmed component's suggestion gets refreshed — so a component whose body changed picks up a fresher draft automatically.
 
 Each pitch is the predicate completing the component's fixed sentence form (the same sentence end users see in the premium feature access messages and on the public plans page):
 
 - Skill: "The {name} skill ___."
-- Tool: "The {tool_name} tool ___."
-- Database record: "{title} ___." (the title carries the whole noun phrase — no "The", no type word — and is **plural**, so the predicate takes the plural verb form: "Brainstorm topics **track** the topics you have saved", never "tracks")
+- Solo tool: "The {tool_name} tool ___."
+- Paired tool: "{the pair's title} ___." (the title carries the whole noun phrase — no "The", no type word — and is **plural**, so the predicate takes the plural verb form: "Brainstorm topics **track** the topics you have saved", never "tracks"). Both sides of a pair draft against this same form: the approved pitch is the pair's.
 
 Drafting rules:
 
-- Source material: a skill's frontmatter `description` plus body (kept from Step 2); a tool's registered `description` and handler (read in Step 4); a database record's two partner-tool descriptions plus its publisher-chosen `title`.
-- Start with a lowercase present-tense verb that agrees with the sentence's subject — singular for skills/tools (e.g. "generates", "refines"), plural for database records (e.g. "track", "store").
+- Source material: a skill's frontmatter `description` plus body (kept from Step 2); a tool's registered `description` and handler (read in Step 4). For a paired tool, draft from its own registration and its partner's, plus the publisher-chosen `title`.
+- Start with a lowercase present-tense verb that agrees with the sentence's subject — singular for skills and solo tools (e.g. "generates", "refines"), plural for a pair's records (e.g. "track", "store").
 - One clause, roughly 5–15 words.
 - No trailing period (the rendering surfaces append it), and don't restate the component name.
-- Paired tools never carry their own `suggested_pitch` — the pair's pitch goes on its `database_record` entry (the server rejects a paired tool entry that carries one).
+- The `entitlement` entry carries no `suggested_pitch`. A paired tool's own suggestion pre-fills the pair's pitch, so draft one on each side as for any other tool.
 - A component you have no real material for can omit `suggested_pitch`; the publisher authors it from scratch on the dashboard.
 
 ## Step 6: Sync the plugin and all components in one call
@@ -343,11 +343,10 @@ Call the `plugpass_sync_plugin` tool (under any connector prefix) with the full 
       "plugpass_id": "{from the pre-check, omit if newly-discovered or in REGISTER mode}",
       "ownership": "{owned | not_owned, ONLY when Q1 just collected the answer for this server; omit when server-side ownership is already known}"
     },
-    { "type": "database_record",
+    { "type": "entitlement",
       "name": "{derived snake_case identifier}",
       "title": "{publisher-chosen sentence-case plural display label}",
-      "plugpass_id": "{from the pre-check if pre-confirmed, omit on first confirmation}",
-      "suggested_pitch": "{drafted pitch, omit if none}"
+      "plugpass_id": "{from the pre-check if pre-confirmed, omit on first confirmation}"
     },
     { "type": "tool",
       "server_name": "{server-key}",
@@ -355,9 +354,9 @@ Call the `plugpass_sync_plugin` tool (under any connector prefix) with the full 
       "visibility": "{model | app | both, from the registration}",
       "ui_backed": "{true | false, from the registration}",
       "plugpass_id": "{from _meta or the pre-check map, omit if absent}",
-      "database_record_name": "{matching database_record entry's name, omit for solo}",
+      "entitlement_name": "{matching entitlement entry's name, omit for solo}",
       "operation": "{add | remove, omit for solo}",
-      "suggested_pitch": "{drafted pitch — solo tools only, never on paired entries; omit if none}"
+      "suggested_pitch": "{drafted pitch, omit if none}"
     }
   ],
   "publisher_plugin_version": "{PUBLISHER_PLUGIN_VERSION}"

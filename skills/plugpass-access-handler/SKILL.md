@@ -9,9 +9,9 @@ USER_INPUT_TOOL = A tool that presents the user a question with selectable optio
 
 TRIGGER_RESULT = the tool result already in context that triggered this skill, when one did — the Publisher MCP tool result carrying `PLUGPASS_PUBLISHER=true`.
 
-Present each USER_INPUT_TOOL prompt exactly as specified, setting each option's description to an empty string. The names of the USER_INPUT_TOOL prompts (e.g. `ConnectChoice`) are used for guiding your logic flow only, and should not be communicated to the user.
+Present each USER_INPUT_TOOL prompt exactly as specified, setting each option's description to an empty string. The names of the prompts (e.g. `ConnectChoice`) are used for guiding your logic flow only, and should not be communicated to the user.
 
-Anything other than the `>` blocks and USER_INPUT_TOOL prompt copy should be interpreted as instructions for you (or the main agent) to follow. A `>` block is a message for the user. Replace each {VARIABLE} in the `>` blocks and USER_INPUT_TOOL prompt copy with its value; do not state a variable verbatim in its token form. Output the result as your own normal assistant message — never through a tool call — do not narrate, add a preamble or sign-off, wrap it in a quote block, or print the `>` characters themselves.
+The `>` blocks and USER_INPUT_TOOL prompt copy are messages for the user; everything else here is an instruction for you (or the main agent) to follow. Replace each {VARIABLE} in them with its value; never state a variable in its token form. Post each `>` block verbatim as your own message — nothing rephrased, summarized, or added before, within, or after it; no quote wrapping or added formatting; never the `>` characters themselves. Use whatever messaging method will be visible to the user (especially if a tool call will follow it in the same turn).
 
 Any variables defined by tool presence should be assessed purely from its presence in your tool list (if not loaded, attempt to load it via tool search); never attempt to call a tool if not present.
 
@@ -39,19 +39,31 @@ STANDING RULES (they govern every section below):
 
 ## If OPENAI_CLIENT=`codex-cli`
 
+Post the `ConnectOffer` prompt:
+
 > Sign up or log in to Plugpass to continue.
 >
-> Would you like me to open the signin page?
+> 1. Sign in
+> 2. Not now
 
-### If the user indicates yes
+### If user answers `Sign in` to `ConnectOffer`
 
 Run `codex mcp login plugpass-publisher`.
 
 ### Once the login succeeds
 
-> End and resume the session with `codex resume` to continue. Then ask me to try again.
+Then post the `ResumeConfirm` prompt in the same turn:
 
-Do not proceed with the invoking skill!
+> End and resume the session with `codex resume` to continue.
+>
+> Have you resumed?
+>
+> 1. Yes
+> 2. Never mind
+
+### If user answers `Yes` to `ResumeConfirm`
+
+Apply the Retry standing rule.
 
 ## If OPENAI_CLIENT=`desktop`
 
@@ -69,7 +81,7 @@ Do not proceed with the invoking skill!
 >
 > [Sign up](https://plugpass.ai/signup?connect=web&platform=anthropic)&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;[Log in](https://plugpass.ai/login?connect=web&platform=anthropic)
 
-Present the `ConnectConfirm` prompt with USER_INPUT_TOOL:
+Then present the `ConnectConfirm` prompt with USER_INPUT_TOOL in the same turn:
 
 - Prompt: Have you signed in?
 - Options:
@@ -80,7 +92,7 @@ Present the `ConnectConfirm` prompt with USER_INPUT_TOOL:
 
 > Press `cmd-R` (`ctrl-R` on Windows) to refresh the session to continue.
 
-Present the `RefreshConfirm` prompt with USER_INPUT_TOOL:
+Then present the `RefreshConfirm` prompt with USER_INPUT_TOOL in the same turn:
 
 - Prompt: Have you refreshed?
 - Options:
@@ -106,7 +118,7 @@ Present the `ConnectChoice` prompt with USER_INPUT_TOOL:
 AUTH_URL = the URL returned by `mcp__plugin_plugpass_plugpass-publisher__authenticate`, with `&mode=signup` appended.
 Open {AUTH_URL} with the OPEN_URL_TOOL.
 
-Present the `SignInConfirm` prompt with USER_INPUT_TOOL:
+Then present the `SignInConfirm` prompt with USER_INPUT_TOOL in the same turn:
 
 - Prompt: Have you signed up?
 - Options:
@@ -118,7 +130,7 @@ Present the `SignInConfirm` prompt with USER_INPUT_TOOL:
 AUTH_URL = the URL returned by `mcp__plugin_plugpass_plugpass-publisher__authenticate`, with `&mode=login` appended.
 Open {AUTH_URL} with the OPEN_URL_TOOL.
 
-Present the `SignInConfirm` prompt with USER_INPUT_TOOL:
+Then present the `SignInConfirm` prompt with USER_INPUT_TOOL in the same turn:
 
 - Prompt: Have you logged in?
 - Options:
@@ -159,7 +171,7 @@ The Publisher MCP refused the call: the installed plugin is below the minimum su
 
 > The installed Plugpass plugin version ({INSTALLED_VERSION}) is no longer supported.
 
-Present the `UpdateChoice` prompt with USER_INPUT_TOOL:
+Then present the `UpdateChoice` prompt with USER_INPUT_TOOL in the same turn:
 
 - Prompt: Update it now?
 - Options:
@@ -192,7 +204,7 @@ If the entry is present — a local install:
 
 > The installed Plugpass plugin version ({INSTALLED_VERSION}) is no longer supported.
 
-Present the `UpdateChoice` prompt with USER_INPUT_TOOL:
+Then present the `UpdateChoice` prompt with USER_INPUT_TOOL in the same turn:
 
 - Prompt: Update it now?
 - Options:
@@ -243,7 +255,7 @@ Do not proceed with the invoking skill in any of the cases above!
 >
 > Turn on auto-update for the Plugpass Marketplace to keep the plugin up to date with the latest features & fixes.
 
-Present the `AutoUpdateChoice` prompt with USER_INPUT_TOOL:
+Then present the `AutoUpdateChoice` prompt with USER_INPUT_TOOL in the same turn:
 
 - Prompt: Turn on auto-update?
 - Options:
