@@ -9,7 +9,7 @@ USER_INPUT_TOOL = A tool that presents the user a question with selectable optio
 
 TRIGGER_RESULT = the tool result already in context that triggered this skill, when one did — the Publisher MCP tool result carrying `PLUGPASS_PUBLISHER=true`.
 
-Present each USER_INPUT_TOOL prompt exactly as specified, setting each option's description to an empty string. The names of the prompts (e.g. `ConnectChoice`) are used for guiding your logic flow only, and should not be communicated to the user.
+Present each USER_INPUT_TOOL prompt exactly as specified, setting each option's description to an empty string. For a prompt posted as a `>` block, a reply of an option's number or label selects that option. The names of the prompts (e.g. `ConnectChoice`) are used for guiding your logic flow only, and should not be communicated to the user.
 
 The `>` blocks and USER_INPUT_TOOL prompt copy are messages for the user; everything else here is an instruction for you (or the main agent) to follow. Replace each {VARIABLE} in them with its value; never state a variable in its token form. Post each `>` block verbatim as your own message — nothing rephrased, summarized, or added before, within, or after it; no quote wrapping or added formatting; never the `>` characters themselves. Use whatever messaging method will be visible to the user (especially if a tool call will follow it in the same turn).
 
@@ -22,9 +22,9 @@ Any variables defined by tool presence should be assessed purely from its presen
   - If CLAUDE_PRODUCT=`code`:
     - OS = If your system instructions indicate the platform is `darwin`, then `mac`; if `linux`, then `linux`; if `win32`, then `windows`.
     - CODE_CLIENT = If (OS=`mac` || OS=`linux`), then Bash `echo "CLAUDE_CODE_ENTRYPOINT=$CLAUDE_CODE_ENTRYPOINT"`; if OS=`windows`, then PowerShell `Write-Output "CLAUDE_CODE_ENTRYPOINT=$env:CLAUDE_CODE_ENTRYPOINT"` (expected value: `cli` || `claude-desktop` || `remote`)
-    - If (CODE_CLIENT=`cli` || CODE_CLIENT=`claude-desktop`): OPEN_URL_TOOL = If OS=`mac`, then Bash `open "<url>"`; if OS=`linux`, then Bash `xdg-open "<url>"`; if OS=`windows`, then PowerShell `Start-Process "<url>"`. (OPEN_URL_TOOL is otherwise undefined — `remote` has no local browser to open.)
 - If PLATFORM=`openai`:
   - OPENAI_CLIENT = If your system instructions include `# Codex desktop context`, then `desktop`; otherwise `codex-cli`.
+- OPEN_URL_TOOL = A tool that opens a URL in a browser (e.g. Bash `open "<url>"`, Bash `xdg-open "<url>"`, PowerShell `Start-Process "<url>"`, etc.).
 
 STANDING RULES (they govern every section below):
 
@@ -50,11 +50,12 @@ Post the `ConnectOffer` prompt:
 
 Run `codex mcp login plugpass-publisher`.
 
-### Once the login succeeds
+### If login succeeds
+
+> End and resume the session with `codex resume` to continue.
 
 Then post the `ResumeConfirm` prompt in the same turn:
 
-> End and resume the session with `codex resume` to continue.
 >
 > Have you resumed?
 >
@@ -65,6 +66,10 @@ Then post the `ResumeConfirm` prompt in the same turn:
 
 Apply the Retry standing rule.
 
+### If login fails
+
+Inform the user and offer to try again or help them troubleshoot.
+
 ## If OPENAI_CLIENT=`desktop`
 
 > Connect Plugpass to continue:
@@ -73,7 +78,17 @@ Apply the Retry standing rule.
 > 2. Paste `codex mcp login plugpass-publisher` & press `Enter`
 > 3. Sign up or log in to Plugpass
 
-Do not proceed with the invoking skill!
+Then post the `ConnectConfirm` prompt in the same turn:
+
+>
+> Have you connected?
+>
+> 1. Yes
+> 2. Not now
+
+### If user answers `Yes` to `ConnectConfirm`
+
+Apply the Retry standing rule.
 
 ## If CLAUDE_PRODUCT=`cowork`
 
@@ -146,10 +161,18 @@ Apply the Retry standing rule.
 > Sign up or log in to Plugpass to continue.
 >
 > Enter `/mcp`, then connect `plugpass-publisher` to sign in.
->
-> Let me know once you've signed in.
 
-Do not proceed with the invoking skill!
+Then post the `ConnectConfirm` prompt in the same turn (not via USER_INPUT_TOOL):
+
+>
+> Have you signed in?
+>
+> 1. Yes
+> 2. Not now
+
+### If user answers `Yes` to `ConnectConfirm`
+
+Apply the Retry standing rule.
 
 ## If CODE_CLIENT=`remote`
 
@@ -182,25 +205,68 @@ Then present the `UpdateChoice` prompt with USER_INPUT_TOOL in the same turn:
 
 Run `claude plugin marketplace update plugpass-marketplace`.
 
-> Run `/reload-plugins`, then let me know once you've done so.
->
-> Plugpass recommends enabling auto-updates. Tell me if you want me to do that.
+> Run `/reload-plugins` to finish updating.
 
-If the user indicates they want you to enable auto-updates, then invoke the `update-config` skill to set `extraKnownMarketplaces.plugpass-marketplace` in `~/.claude/settings.json` to `{ "source": { "source": "github", "repo": "plugpass/plugpass-marketplace" }, "autoUpdate": true }`.
+Then post the `ReloadConfirm` prompt in the same turn (not via USER_INPUT_TOOL):
+
+>
+> Have you reloaded?
+>
+> 1. Yes
+> 2. Never mind
+
+### If user answers `Yes` to `ReloadConfirm`
+
+> Turn on auto-update for the Plugpass Marketplace to keep the plugin up to date with the latest features & fixes.
+
+Then present the `AutoUpdateChoice` prompt with USER_INPUT_TOOL in the same turn:
+
+- Prompt: Turn on auto-update?
+- Options:
+  - Turn on
+  - Not now
+
+### If user answers `Turn on` to `AutoUpdateChoice`
+
+Invoke the `update-config` skill to set `extraKnownMarketplaces.plugpass-marketplace` in `~/.claude/settings.json` to `{ "source": { "source": "github", "repo": "plugpass/plugpass-marketplace" }, "autoUpdate": true }`.
+
+### If user answers (`Turn on` || `Not now`) to `AutoUpdateChoice`
+
+Apply the Retry standing rule.
 
 ## If CODE_CLIENT=`claude-desktop`
 
 Read `~/.claude/settings.json`.
 
-If the `extraKnownMarketplaces.plugpass-marketplace` entry (or the file) is absent — an account install:
+### If the `extraKnownMarketplaces.plugpass-marketplace` entry (or the file) is absent
 
 > The installed Plugpass plugin version ({INSTALLED_VERSION}) is no longer supported.
 >
 > [View update instructions](https://plugpass.ai/update)
->
-> Once you've updated, press `cmd-R` (`ctrl-R` on Windows) to refresh the session and try again.
 
-If the entry is present — a local install:
+Then present the `UpdateConfirm` prompt with USER_INPUT_TOOL in the same turn:
+
+- Prompt: Have you updated?
+- Options:
+  - Yes
+  - Not now
+
+#### If user answers `Yes` to `UpdateConfirm`
+
+> Press `cmd-R` (`ctrl-R` on Windows) to refresh the session to finish updating.
+
+Then present the `ReloadConfirm` prompt with USER_INPUT_TOOL in the same turn:
+
+- Prompt: Have you refreshed?
+- Options:
+  - Yes
+  - Never mind
+
+#### If user answers `Yes` to `ReloadConfirm`
+
+Apply the Retry standing rule.
+
+### If the entry is present
 
 > The installed Plugpass plugin version ({INSTALLED_VERSION}) is no longer supported.
 
@@ -211,15 +277,37 @@ Then present the `UpdateChoice` prompt with USER_INPUT_TOOL in the same turn:
   - Update
   - Not now
 
-### If user answers `Update` to `UpdateChoice`
+#### If user answers `Update` to `UpdateChoice`
 
 Run `claude plugin marketplace update plugpass-marketplace`.
 
-> Press `cmd-R` (`ctrl-R` on Windows) to refresh the session, then let me know once you've done so.
->
-> Plugpass recommends enabling auto-updates. Tell me if you want me to do that.
+> Press `cmd-R` (`ctrl-R` on Windows) to refresh the session to finish updating.
 
-If the user indicates they want you to enable auto-updates, then invoke the `update-config` skill to set `extraKnownMarketplaces.plugpass-marketplace` in `~/.claude/settings.json` to `{ "source": { "source": "github", "repo": "plugpass/plugpass-marketplace" }, "autoUpdate": true }`.
+Then present the `ReloadConfirm` prompt with USER_INPUT_TOOL in the same turn:
+
+- Prompt: Have you refreshed?
+- Options:
+  - Yes
+  - Never mind
+
+#### If user answers `Yes` to `ReloadConfirm`
+
+> Turn on auto-update for the Plugpass Marketplace to keep the plugin up to date with the latest features & fixes.
+
+Then present the `AutoUpdateChoice` prompt with USER_INPUT_TOOL in the same turn:
+
+- Prompt: Turn on auto-update?
+- Options:
+  - Turn on
+  - Not now
+
+#### If user answers `Turn on` to `AutoUpdateChoice`
+
+Invoke the `update-config` skill to set `extraKnownMarketplaces.plugpass-marketplace` in `~/.claude/settings.json` to `{ "source": { "source": "github", "repo": "plugpass/plugpass-marketplace" }, "autoUpdate": true }`.
+
+#### If user answers (`Turn on` || `Not now`) to `AutoUpdateChoice`
+
+Apply the Retry standing rule.
 
 ## If CODE_CLIENT=`remote`
 
@@ -229,19 +317,43 @@ If the user indicates they want you to enable auto-updates, then invoke the `upd
 >
 > Once you've updated, start a new session and try again.
 
+Do not proceed with the invoking skill!
+
 ## If OPENAI_CLIENT=`codex-cli`
 
 > The installed Plugpass plugin version ({INSTALLED_VERSION}) is no longer supported.
 >
-> End and resume the session with `codex resume` to update the Plugpass plugin, then try again.
+> End and resume the session with `codex resume` to update the Plugpass plugin.
+
+Then post the `UpdateConfirm` prompt in the same turn:
+
+>
+> Have you updated?
+>
+> 1. Yes
+> 2. Not now
+
+### If user answers `Yes` to `UpdateConfirm`
+
+Apply the Retry standing rule.
 
 ## If OPENAI_CLIENT=`desktop`
 
 > The installed Plugpass plugin version ({INSTALLED_VERSION}) is no longer supported.
 >
-> Restart the Codex app to update the Plugpass plugin, then try again.
+> Restart the Codex app to update the Plugpass plugin.
 
-Do not proceed with the invoking skill in any of the cases above!
+Then post the `UpdateConfirm` prompt in the same turn:
+
+>
+> Have you updated?
+>
+> 1. Yes
+> 2. Not now
+
+### If user answers `Yes` to `UpdateConfirm`
+
+Apply the Retry standing rule.
 
 ---
 
@@ -270,7 +382,7 @@ Invoke the `update-config` skill to set `extraKnownMarketplaces.plugpass-marketp
 
 Do nothing further.
 
-### If user answers anything other than (`Turn on` or `Not now` to `AutoUpdateChoice`)
+### If user answers anything other than (`Turn on` || `Not now`) to `AutoUpdateChoice`
 
 Respond to the user's message as appropriate.
 
