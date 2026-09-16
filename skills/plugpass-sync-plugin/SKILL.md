@@ -26,7 +26,7 @@ The Plugpass Publisher MCP server (this plugin's `.mcp.json` `plugpass-publisher
 
 **Presenting copy.** A `>` block is finished copy; the `>` characters delimit it here and are never part of it. Reproduce the text exactly — substituting each `{VARIABLE}` with its value — and never print the `>` characters, restyle the wording, or wrap it in a quote block. The surrounding step says where the copy goes: where it says to tell the publisher something, post it as your own message with nothing of your own before or after it, by whatever messaging method will be visible to them (especially if a tool call will follow it in the same turn). Copy given inline in double quotes is delivered the same way, without the quote marks.
 
-- PUBLISHER_PLUGIN_VERSION = `0.0.7` (stamped by the release pipeline). Include it as `publisher_plugin_version` on every Publisher MCP tool call in this skill.
+- PUBLISHER_PLUGIN_VERSION = `0.0.8` (stamped by the release pipeline). Include it as `publisher_plugin_version` on every Publisher MCP tool call in this skill.
 - USER_INPUT_TOOL = A tool that presents the user a question with selectable options and returns their choice (e.g. `AskUserQuestion`, `ask_user_input_v0`, etc.) that can be used in the default session state (not limited to a certain mode, e.g. plan mode). Where a prompt below calls for USER_INPUT_TOOL and no such tool is available, ask the question in chat and wait for the reply.
 - PLATFORM = If your system instructions indicate an OpenAI product (Codex or ChatGPT), then `openai`; otherwise (an Anthropic / Claude product) `claude`.
 - OS = If your system instructions indicate the platform is `darwin`, then `mac`; if `linux`, then `linux`; if `win32`, then `windows`.
@@ -94,11 +94,13 @@ Otherwise, parse `mcpServers`. **Before doing anything else with the parsed entr
 
 These are platform-served hosts the publisher cannot monetize; they never surface in the step 4 elicitation and never appear as `mcp_dependency` components in the `plugpass_sync_plugin` payload. If filtering leaves zero remaining `mcpServers` entries, step 4 is skipped just as it would be for a plugin with no `.mcp.json`.
 
-For each remaining entry (after filtering), emit an `mcp_dependency` component:
+Each remaining entry (after filtering) is one of two kinds. An entry with a `url` field is a **remote server**. An entry without one — it carries a `command`, so the plugin runs the server as a process on the user's own machine — is a **local (stdio) server**, and `{local-servers}` is the list of those. Plugpass can't restrict the features a local server provides, so it is registered by name and nothing more: no question is asked about it and none of its tools are read.
 
-- `name` — the server key (the property name in `mcpServers`).
-- `domain` — the bare hostname extracted from the server's `url` field. Take the substring between `://` and the next `/`, then strip any trailing `:{port}`. Examples: `"url": "https://mcp.example.com/mcp"` → `mcp.example.com`; `"url": "http://localhost:9000/mcp"` → `localhost`. Required for `http` and `sse` transport entries (any entry with a `url` field). For stdio entries (`command` set, no `url`), omit the `domain` field.
-- `url` — the entry's `url` field verbatim (the same value `domain` was extracted from). Required alongside `domain`; omitted for stdio entries. The server cross-checks it against `domain` and enforces the owned-server URL shape below.
+Emit an `mcp_dependency` component for every entry:
+
+- `name` — the server key (the property name in `mcpServers`). The only field a local server carries.
+- `domain` — remote servers only: the bare hostname extracted from the server's `url` field. Take the substring between `://` and the next `/`, then strip any trailing `:{port}`. Examples: `"url": "https://mcp.example.com/mcp"` → `mcp.example.com`; `"url": "http://localhost:9000/mcp"` → `localhost`.
+- `url` — remote servers only: the entry's `url` field verbatim (the same value `domain` was extracted from). The server cross-checks it against `domain` and enforces the owned-server URL shape below.
 
 `mcp_dependency` entries have no source-file slot for plugpass-id (`.mcp.json` has no per-server metadata block). On SYNC runs `plugpass_sync_plugin` matches them by `(plugin_id, type, name)` — i.e., server_name.
 
@@ -116,14 +118,18 @@ In SYNC mode, call the `plugpass_get_plugin_data` tool (under any connector pref
 
 Capture the response. From the `components` array:
 
-- **`mcp_dependency` entries** carry per-server `ownership` (`unknown` / `owned` / `not_owned`) and `has_ungated_tools` (true when the server has at least one solo canonical tool that isn't already paid, OR when the server has no canonical tools at all yet). Build a `server_name → { plugpass_id, ownership, has_ungated_tools }` map — Q1 and Q2 below consume it.
+- **`mcp_dependency` entries** carry per-server `domain` (null for a server Plugpass has recorded as local), `ownership` (`unknown` / `owned` / `not_owned`) and `has_ungated_tools` (true when the server has at least one solo canonical tool that isn't already paid, OR when the server has no canonical tools at all yet). Build a `server_name → { plugpass_id, domain, ownership, has_ungated_tools }` map — Q1, Q2, and the local-server report below consume it.
 - **`tool` entries** carry the existing per-tool `entitlement` subfield + `operation`. Build a `(server_name, tool_name) → { plugpass_id, entitlement, operation }` map for tool enumeration's re-run identity match and paired-tool detection's pre-confirmation.
 
 **In REGISTER mode, skip the call** — there is no plugin id to query. Treat every server's effective state as empty: ownership `unknown`, `has_ungated_tools` true, no tool in any tier, no pre-confirmed pairs, and an empty plugpass-id map.
 
+### Local servers Plugpass hasn't recorded yet
+
+`{new-local-servers}` is every server in `{local-servers}` the pre-check has no `mcp_dependency` entry for under that name, plus any whose entry carries a non-null `domain` (Plugpass has it recorded as a remote server). In REGISTER mode that is all of `{local-servers}`. Step 10 reports them; nothing else in this step applies to a local server.
+
 ### Question 1 — ownership
 
-Asked for every server whose **effective** ownership is `unknown`: in REGISTER mode that's every entry from step 3; in SYNC mode only servers whose server-side `ownership` is `unknown` (or which don't exist server-side at all — newly-discovered). Servers already `owned` or `not_owned` server-side are NOT asked again — the existing value is preserved (omit the `ownership` field in their payload entry). If the set is empty, skip Q1 entirely.
+Asked for every **remote** server whose **effective** ownership is `unknown`: in REGISTER mode that's every remote entry from step 3; in SYNC mode only servers whose server-side `ownership` is `unknown` (or which don't exist server-side at all — newly-discovered). Servers already `owned` or `not_owned` server-side are NOT asked again — the existing value is preserved (omit the `ownership` field in their payload entry). If the set is empty, skip Q1 entirely.
 
 **Format by count:**
 
@@ -143,9 +149,41 @@ Asked for every server whose **effective** ownership is `unknown`: in REGISTER m
 
 Record each answered server's value for the `plugpass_sync_plugin` payload's `mcp_dependency.ownership` field (`owned` or `not_owned`).
 
+### For each owned server: locate the source
+
+Every server whose **effective** ownership is `owned` is read from its own source: the authentication check below reads it, tool enumeration reads it again, and Step 8 stamps each tool's plugpass id back into it. Per-server paths are stored in the plugin repo's gitignored `.plugpass/` directory (per-machine, never shared — each collaborator keeps their own):
+
+```
+.plugpass/mcp-server-paths.json
+```
+
+(relative to the plugin repo root) — a JSON object mapping `server-name → absolute path to the server's source directory`.
+
+`Read` it (a missing file is an empty map `{}`). For each owned server: if the map already has a path that still resolves (the directory exists), keep it — a prior run usually recorded it; the server's source living inside the plugin repo resolves it too. Otherwise — a newly-monetized server, or the source moved — elicit the **absolute** path with USER_INPUT_TOOL, one server at a time, then `Write` the merged map back (creating `.plugpass/` if absent). Absolute paths only, since this file is per-publisher and never shared (a relative path would be meaningless on a collaborator's machine). After writing, ensure the plugin repo's `.gitignore` has a `.plugpass/` line — append one if it's missing (skip when the plugin directory isn't in a git repo).
+
+Prompt: "I'm having trouble locating the source directory for the {server-name} MCP server. Please provide its absolute path."
+
+The path is **required**. If the publisher can't or won't provide one that resolves, stop: make no `plugpass_sync_plugin` call at all, tell them
+
+> I can't set up monetization on your {server-name} MCP server without its source. Tell me where that server's source directory is to continue.
+
+and end the skill.
+
+### For each owned server: check for its own authentication
+
+Read each owned server's source — its entry file and the request path it sets up — and judge whether the server authenticates its users itself — whether using it would require a user to sign in to it as well as to Plugpass. It does when the server verifies a per-user credential against anything other than Plugpass: its own OAuth authorization server or a third-party identity provider, its own login or session layer, or an API key each user supplies. The premium-access scaffolding Plugpass writes is not the server's own authentication — bearer validation against the Plugpass JWKS, a protected-resource-metadata document naming a Plugpass issuer, and the plugin's check-access tool are all Plugpass's. Neither is a credential the server itself holds to reach another service on the publisher's behalf, which no user signs in to.
+
+When a server has it, tell the publisher
+
+> Your {server-name} MCP server already has authentication set up. Unfortunately Plugpass doesn't yet support monetizing a plugin with an MCP server that provides its own authentication.
+>
+> Note that support for external authentication is planned, so stay tuned for updates.
+
+then stop: make no `plugpass_sync_plugin` call at all, and end the skill.
+
 ### Shared-hosting domain check
 
-Run immediately after Q1, before the URL shape check. For every server whose **effective** ownership is `owned`, skipping local-development hosts (`localhost`, `*.localhost`, `*.local`, or a private-range IP): its domain must not sit under a shared-hosting root.
+For every server whose **effective** ownership is `owned`, skipping local-development hosts (`localhost`, `*.localhost`, `*.local`, or a private-range IP): its domain must not sit under a shared-hosting root.
 
 **Shared-hosting roots:**
 
@@ -200,29 +238,9 @@ Servers marked `not_owned` in Q1 still get an `mcp_dependency` entry in the payl
 
 The **enumerated set** is every server checked in Q2 plus every effectively-owned server not asked because all its tools are already restricted. Steps below run over that set.
 
-### For each enumerated server: locate the source
-
-Tools are enumerated from the publisher's own MCP server source, so its location is resolved first — and Step 8 stamps each tool's plugpass id back into that same source. Per-server paths are stored in the plugin repo's gitignored `.plugpass/` directory (per-machine, never shared — each collaborator keeps their own):
-
-```
-.plugpass/mcp-server-paths.json
-```
-
-(relative to the plugin repo root) — a JSON object mapping `server-name → absolute path to the server's source directory`.
-
-`Read` it (a missing file is an empty map `{}`). For each enumerated server: if the map already has a path that still resolves (the directory exists), keep it — a prior run usually recorded it; the server's source living inside the plugin repo resolves it too. Otherwise — a newly-monetized server, or the source moved — elicit the **absolute** path with USER_INPUT_TOOL, one server at a time, then `Write` the merged map back (creating `.plugpass/` if absent). Absolute paths only, since this file is per-publisher and never shared (a relative path would be meaningless on a collaborator's machine). After writing, ensure the plugin repo's `.gitignore` has a `.plugpass/` line — append one if it's missing (skip when the plugin directory isn't in a git repo).
-
-Prompt: "I'm having trouble locating the source directory for the {server-name} MCP server. Please provide its absolute path."
-
-The path is **required**. If the publisher can't or won't provide one that resolves, stop: make no `plugpass_sync_plugin` call at all, tell them
-
-> I can't read the tools on your {server-name} MCP server without its source. Tell me where that server's source directory is to continue.
-
-and end the skill. Syncing the rest and leaving that server's tools out would silently un-register them.
-
 ### For each enumerated server: enumerate tools from its source
 
-Read the server's source and collect every tool it registers. Start from the entry file and follow its setup path, and `Grep` the source tree for the SDK's registration idiom to catch tools defined elsewhere — `registerTool` / `server.tool` / `add_tool`, a `@mcp.tool` decorator or `#[tool]` attribute, a tool struct or hash carrying a `name` field, a builder. Every SDK carries the tool's registered name, description, and metadata block together in one registration. A tool registered behind a condition (only when the client declares UI support, say) is still one of the server's tools — collect it.
+Read the server's source (located above) and collect every tool it registers. Start from the entry file and follow its setup path, and `Grep` the source tree for the SDK's registration idiom to catch tools defined elsewhere — `registerTool` / `server.tool` / `add_tool`, a `@mcp.tool` decorator or `#[tool]` attribute, a tool struct or hash carrying a `name` field, a builder. Every SDK carries the tool's registered name, description, and metadata block together in one registration. A tool registered behind a condition (only when the client declares UI support, say) is still one of the server's tools — collect it.
 
 For each tool, capture:
 
@@ -338,10 +356,10 @@ Call the `plugpass_sync_plugin` tool (under any connector prefix) with the full 
     { "type": "skill",          "name": "{name}", "plugpass_id": "{from frontmatter, omit if absent}", "suggested_pitch": "{drafted pitch, omit if none}" },
     { "type": "mcp_dependency",
       "name": "{server-key}",
-      "domain": "{hostname; omit for stdio}",
-      "url": "{full .mcp.json url, verbatim; omit for stdio}",
+      "domain": "{hostname; omit for a local server}",
+      "url": "{full .mcp.json url, verbatim; omit for a local server}",
       "plugpass_id": "{from the pre-check, omit if newly-discovered or in REGISTER mode}",
-      "ownership": "{owned | not_owned, ONLY when Q1 just collected the answer for this server; omit when server-side ownership is already known}"
+      "ownership": "{owned | not_owned, ONLY when Q1 just collected the answer for this server; omit when server-side ownership is already known, and always for a local server}"
     },
     { "type": "entitlement",
       "name": "{derived snake_case identifier}",
@@ -399,5 +417,13 @@ Tell the publisher what happened, by mode:
 
 - **REGISTER mode:** "The {plugin-name} plugin was successfully registered with Plugpass. Continue setup in the Plugpass dashboard in your browser."
 - **SYNC mode:** "The {plugin-name} plugin was successfully updated in Plugpass. Continue in the Plugpass dashboard to confirm the changes, assign any new features to plans, & publish the plugin updates."
+
+If `{new-local-servers}` is non-empty, follow that with this as its own paragraph — for exactly one server:
+
+> Plugpass doesn't yet support restricting features provided by local MCP servers, so the {server-name} MCP server's features can't be limited based on a user's plan.
+
+and for several, with `{server-names}` listing them as "a & b" or "a, b, & c":
+
+> Plugpass doesn't yet support restricting features provided by local MCP servers, so the {server-names} MCP servers' features can't be limited based on a user's plan.
 
 If the response carried `continuation_message`, include it verbatim as its own paragraph. Then end the skill.
