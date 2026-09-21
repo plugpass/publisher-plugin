@@ -135,7 +135,10 @@ class PlugpassTokenVerifier:
 
     def __init__(self, cfg: PlugpassConfig) -> None:
         self._cfg = cfg
-        self._client = PyJWKClient(cfg.jwks_url, lifespan=14_400)
+        # An explicit User-Agent: Plugpass's edge refuses urllib's default one.
+        self._client = PyJWKClient(
+            cfg.jwks_url, lifespan=14_400, headers={"User-Agent": "plugpass-resource-server"}
+        )
 
     def _decode(self, token: str) -> dict:
         signing_key = self._client.get_signing_key_from_jwt(token)
