@@ -7,7 +7,7 @@ The publisher's server becomes an **OAuth-protected resource server**: a Rack la
 1. **The server serves BOTH protocol eras from the one transport.** The gem classifies each request by its protocol version, answers `server/discover`, and parses the per-request `_meta` envelope onto `server_context.client_capabilities`. The client's UI capability rides that envelope — that is what the paywall-UI marker reads — and a host that gets only the legacy era never sends it. Nothing extra is wired for it: the gem does the era routing.
 2. **`enable_json_response: true` on the transport, always.** In JSON mode the whole JSON-RPC dispatch — including your tool blocks — runs synchronously on the request thread inside `transport.call(env)`, so the wrapping Rack layer regains control with the response uncommitted: thread-local identity works, and the layer can swap in a `401` when a tool discovered mid-call that the bearer is revoked. In the default SSE mode dispatch happens inside the streaming body *after* the middleware returned — both mechanisms silently die.
 3. **`dns_rebinding_protection: false`.** The gem's ≥ 0.23 default validates `Host` against loopback-only allowlists — dev on localhost works, then **every request to the deployed public host 403s**. Rebinding protection defends unauthenticated localhost servers; here every request requires a validated bearer, so disable it (or set `allowed_hosts` from env).
-4. **The audience is the baked `RESOURCE_URL`, never the request host** — the JWT `aud` pin, the PRM `resource`, and the challenge's `resource_metadata` all derive from it. This is what lets a locally-listening server accept real bearers minted for its public URL.
+4. **Every accepted audience comes from Plugpass, never from the request.** A bearer's `aud` must be the baked `RESOURCE_URL` or one of the retired URLs Plugpass reports for this server (the addresses it moved off, which old installs still call). The PRM `resource` and the challenge's `resource_metadata` name the URL the request was addressed to (`X-Forwarded-Host`, else `Host`) only when that URL is an accepted audience, else `RESOURCE_URL`. This is what lets a locally-listening server accept real bearers minted for its public URL, and what keeps a moved server working for installs of its old address.
 
 ```ruby
 # premium_feature_access_check.rb — written once per server. Standalone.
@@ -25,7 +25,8 @@ module PremiumFeatureAccessCheck
   ISSUER = "<plugpass_issuer>"
   JWKS_URL = "<plugpass_jwks_url>"
   ENTITLEMENT_API_ORIGIN = "<entitlement_api_origin>"
-  # This server's own public MCP URL — the JWT `aud` pin and the PRM `resource`.
+  # This server's own public MCP URL — its current bearer audience and the PRM's
+  # default `resource`.
   RESOURCE_URL = "<this server's RESOURCE_URL>"
   # Where the Plugpass paywall for MCP Apps widgets loads from (the `ui_paywall`
   # layer — only on a server whose directive names it).
@@ -45,7 +46,51 @@ module PremiumFeatureAccessCheck
   def self.paywall_script_url = PAYWALL_SCRIPT_URL
   def self.check_tool_name = CHECK_TOOL_NAME
   # RFC 9728 path-aware form: origin + /.well-known/oauth-protected-resource + /mcp.
-  def self.prm_url = "#{resource_url.delete_suffix(MCP_PATH)}/.well-known/oauth-protected-resource#{MCP_PATH}"
+  def self.prm_url(resource) = "#{resource.delete_suffix(MCP_PATH)}/.well-known/oauth-protected-resource#{MCP_PATH}"
+
+  # The URLs this server moved off, which Plugpass reports so old installs keep
+  # working. Fetched only when a bearer or a request names another address;
+  # cached 5 minutes (1 minute after a failed fetch, which accepts nothing extra).
+  RETIRED_TTL_SECONDS = 300
+  RETIRED_FAILURE_TTL_SECONDS = 60
+  @retired_mutex = Mutex.new
+  @retired = nil # [Set-like Array of URLs, expires_at (monotonic)]
+
+  def self.retired_audiences
+    @retired_mutex.synchronize do
+      now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      return @retired[0] if @retired && @retired[1] > now
+      urls = []
+      ttl = RETIRED_FAILURE_TTL_SECONDS
+      begin
+        uri = URI("#{entitlement_api_origin}/entitlement/retired-audiences")
+        uri.query = URI.encode_www_form(resource: resource_url)
+        res = Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == "https",
+                              open_timeout: 5, read_timeout: 5) { |http| http.get(uri.request_uri) }
+        retired = JSON.parse(res.body)["retired"] if res.code == "200"
+        if retired.is_a?(Array)
+          urls = retired.grep(String)
+          ttl = RETIRED_TTL_SECONDS
+        end
+      rescue StandardError
+        # unreachable: accept only RESOURCE_URL until the retry
+      end
+      @retired = [urls, now + ttl]
+      urls
+    end
+  end
+
+  # The URL a request was addressed to — X-Forwarded-Host (a proxy on an old
+  # address sets it), else its Host, on RESOURCE_URL's scheme and path — when
+  # that URL is an accepted audience; otherwise RESOURCE_URL.
+  def self.addressed_resource(env)
+    host = (env["HTTP_X_FORWARDED_HOST"] || env["HTTP_HOST"] || "").split(",").first.to_s.strip.downcase
+    current = URI(resource_url)
+    current_host = current.port == current.default_port ? current.host : "#{current.host}:#{current.port}"
+    return resource_url if host.empty? || host == current_host
+    candidate = "#{current.scheme}://#{host}#{current.path}"
+    retired_audiences.include?(candidate) ? candidate : resource_url
+  end
 
   # Core jwt 3.x has no EdDSA and rejects OKP JWKs — this custom algorithm
   # verifies Ed25519 through stdlib OpenSSL (Ruby >= 3.1), zero native deps.
@@ -75,17 +120,20 @@ module PremiumFeatureAccessCheck
     # Monotonic clock for timestamps; nil on any failure…
   end
 
-  # EdDSA-pinned, issuer exact, audience = the baked RESOURCE_URL, exp+sub
-  # required. Returns the user id (sub), or nil on any failure.
+  # EdDSA-pinned, issuer exact, exp+sub required, audience = the baked
+  # RESOURCE_URL or one of this server's retired URLs. Returns the user id
+  # (sub), or nil on any failure.
   def self.verify_bearer(token)
     kid = JWT::EncodedToken.new(token).header["kid"]
     key = key_for(kid)
     return nil unless key
     payload, = JWT.decode(token, key, true,
       algorithm: ED25519,                 # the INSTANCE — pins the alg, no downgrade
-      verify_aud: true, aud: resource_url,
+      verify_aud: false,                  # checked below: RESOURCE_URL or a retired URL
       verify_iss: true, iss: issuer,
       required_claims: %w[exp aud iss sub])
+    auds = Array(payload["aud"]).grep(String)
+    return nil unless auds.include?(resource_url) || auds.intersect?(retired_audiences)
     payload["sub"]
   rescue JWT::DecodeError
     nil
@@ -238,17 +286,18 @@ class PlugpassGate
   def initialize(app) = @app = app
 
   def call(env)
-    return prm_response if env["PATH_INFO"] == prm_path && env["REQUEST_METHOD"] == "GET"
+    return prm_response(env) if env["PATH_INFO"] == prm_path && env["REQUEST_METHOD"] == "GET"
     return [404, { "content-type" => "application/json" }, ['{"error": "not_found"}']] unless env["PATH_INFO"] == P::MCP_PATH
 
+    resource = P.addressed_resource(env)
     token = env["HTTP_AUTHORIZATION"] && env["HTTP_AUTHORIZATION"][/\ABearer (.+)\z/i, 1]
-    return challenge("Missing bearer token") unless token
+    return challenge(resource, "Missing bearer token") unless token
     sub = P.verify_bearer(token)
-    return challenge("Token invalid or expired") unless sub
+    return challenge(resource, "Token invalid or expired") unless sub
 
     Thread.current[:plugpass_identity] = { sub: sub, token: token }
     status, headers, body = @app.call(env)  # JSON mode: dispatch is synchronous, in-thread
-    return challenge("Access token no longer valid") if Thread.current[:plugpass_reauth_required]
+    return challenge(resource, "Access token no longer valid") if Thread.current[:plugpass_reauth_required]
     [status, headers, body]
   ensure
     Thread.current[:plugpass_identity] = nil
@@ -259,18 +308,19 @@ class PlugpassGate
 
   def prm_path = "/.well-known/oauth-protected-resource#{P::MCP_PATH}"
 
-  def prm_response
+  def prm_response(env)
     [200, { "content-type" => "application/json" }, [JSON.generate(
-      resource: P.resource_url,
+      resource: P.addressed_resource(env),
       authorization_servers: [P.issuer],
       bearer_methods_supported: ["header"]
     )]]
   end
 
-  # error="invalid_token" exactly — the signal MCP clients treat as "needs OAuth".
-  def challenge(description)
-    header = "Bearer realm=\"#{P.resource_url}\", error=\"invalid_token\", " \
-             "error_description=\"#{description}\", resource_metadata=\"#{P.prm_url}\""
+  # The challenge for the addressed resource. error="invalid_token" exactly — the
+  # signal MCP clients treat as "needs OAuth".
+  def challenge(resource, description)
+    header = "Bearer realm=\"#{resource}\", error=\"invalid_token\", " \
+             "error_description=\"#{description}\", resource_metadata=\"#{P.prm_url(resource)}\""
     [401, { "content-type" => "application/json", "www-authenticate" => header },
      [JSON.generate(error: "invalid_token", error_description: description)]]
   end
@@ -282,7 +332,7 @@ server = MCP::Server.new(name: "<server name>", version: "<version>", tools: [
 transport = MCP::Server::Transports::StreamableHTTPTransport.new(
   server,
   enable_json_response: true,     # required: lets a revoked-bearer tool swap in a 401
-  dns_rebinding_protection: false # required: the audience is the baked RESOURCE_URL, not the host
+  dns_rebinding_protection: false # required: accepted audiences come from Plugpass, not the Host
 )
 server.transport = transport
 Rackup::Handler.get("puma").run(PlugpassGate.new(transport),

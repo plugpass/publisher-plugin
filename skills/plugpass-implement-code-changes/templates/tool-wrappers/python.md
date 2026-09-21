@@ -6,11 +6,14 @@ The publisher's server becomes an **OAuth-protected resource server** using the 
 
 1. **The server serves BOTH protocol eras from the one app.** The SDK's session manager routes each request by its `MCP-Protocol-Version` header: 2026-07-28 to the modern, envelope-based leg (which owns `server/discover`), the handshake versions to their own. The client's UI capability rides the modern envelope — that is what the paywall-UI marker reads — and a host that gets only the legacy era never sends it. Nothing extra is wired for it: the SDK line does the era routing.
 2. **`stateless_http=True, json_response=True` on the app, always.** In JSON mode BOTH legs write the HTTP response only after the tool handler finished, so an outer ASGI middleware can replace it with a `401` when a tool discovers mid-call that the bearer is revoked (`reauth_required` from the Entitlement API). In SSE mode the `200` headers hit the wire before the tool runs — the swap is impossible. Stateless also makes per-request auth context reliable.
-3. **The audience is the baked `RESOURCE_URL`, never the request host** — it is the JWT `aud` pin, the `AuthSettings.resource_server_url` (which becomes both the PRM route path and the PRM `resource`), and the challenge's `resource_metadata` base. This is what lets a locally-listening server accept real bearers minted for its public URL.
+3. **Every accepted audience comes from Plugpass, never from the request.** A bearer's `aud` must be the baked `RESOURCE_URL` (also the `AuthSettings.resource_server_url`, which drives the PRM route path) or one of the retired URLs Plugpass reports for this server (the addresses it moved off, which old installs still call). The PRM `resource` and the challenge's `resource_metadata` name the URL the request was addressed to (`X-Forwarded-Host`, else `Host`) only when that URL is an accepted audience, else `RESOURCE_URL`. This is what lets a locally-listening server accept real bearers minted for its public URL, and what keeps a moved server working for installs of its old address.
 
 ```python
 # premium_feature_access_check.py — written once per server. Standalone.
+import json
 import os
+import re
+import time
 from dataclasses import dataclass
 
 import anyio
@@ -26,7 +29,8 @@ PLUGIN_ID = "<the plugin's Plugpass id>"
 ISSUER = "<plugpass_issuer>"
 JWKS_URL = "<plugpass_jwks_url>"
 ENTITLEMENT_API_ORIGIN = "<entitlement_api_origin>"
-# This server's own public MCP URL — the JWT `aud` pin and the PRM `resource`.
+# This server's own public MCP URL — its current bearer audience and the PRM's
+# default `resource`.
 RESOURCE_URL = "<this server's RESOURCE_URL>"
 # Where the Plugpass paywall for MCP Apps widgets loads from (the `ui_paywall`
 # layer — only on a server whose directive names it).
@@ -50,9 +54,15 @@ class PlugpassConfig:
 
     @property
     def prm_url(self) -> str:
-        # RFC 9728 path-aware form: origin + /.well-known/oauth-protected-resource + /mcp
-        origin = self.resource_url.removesuffix(MCP_PATH)
-        return f"{origin}/.well-known/oauth-protected-resource{MCP_PATH}"
+        return prm_url(self.resource_url)
+
+
+PRM_PATH = f"/.well-known/oauth-protected-resource{MCP_PATH}"
+
+
+def prm_url(resource: str) -> str:
+    # RFC 9728 path-aware form: origin + /.well-known/oauth-protected-resource + /mcp
+    return f"{resource.removesuffix(MCP_PATH)}{PRM_PATH}"
 
 
 def plugpass_config() -> PlugpassConfig:
@@ -67,11 +77,61 @@ def plugpass_config() -> PlugpassConfig:
     )
 
 
+# The URLs this server moved off, which Plugpass reports so old installs keep
+# working. Fetched only when a bearer or a request names another address;
+# cached 5 minutes (1 minute after a failed fetch, which accepts nothing extra).
+RETIRED_TTL_S = 300
+RETIRED_FAILURE_TTL_S = 60
+_retired: tuple[frozenset[str], float] | None = None
+_retired_lock = anyio.Lock()
+
+
+async def retired_audiences(cfg: PlugpassConfig) -> frozenset[str]:
+    global _retired
+    if _retired is not None and _retired[1] > time.monotonic():
+        return _retired[0]
+    async with _retired_lock:
+        if _retired is not None and _retired[1] > time.monotonic():
+            return _retired[0]
+        urls: frozenset[str] = frozenset()
+        ttl = RETIRED_FAILURE_TTL_S
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                res = await client.get(
+                    f"{cfg.entitlement_api_origin}/entitlement/retired-audiences",
+                    params={"resource": cfg.resource_url},
+                )
+            retired = res.json().get("retired") if res.status_code == 200 else None
+            if isinstance(retired, list):
+                urls = frozenset(u for u in retired if isinstance(u, str))
+                ttl = RETIRED_TTL_S
+        except Exception:
+            pass  # unreachable: accept only RESOURCE_URL until the retry
+        _retired = (urls, time.monotonic() + ttl)
+        return urls
+
+
+async def addressed_resource(cfg: PlugpassConfig, scope) -> str:
+    """The URL a request was addressed to — `X-Forwarded-Host` (a proxy on an
+    old address sets it), else its own host, on RESOURCE_URL's scheme and path —
+    when that URL is an accepted audience; otherwise RESOURCE_URL."""
+    headers = dict(scope.get("headers") or [])
+    raw = headers.get(b"x-forwarded-host") or headers.get(b"host") or b""
+    host = raw.decode("latin-1").split(",")[0].strip().lower()
+    scheme, rest = cfg.resource_url.split("://", 1)
+    current_host, _, path = rest.partition("/")
+    if not host or host == current_host.lower():
+        return cfg.resource_url
+    candidate = f"{scheme}://{host}/{path}"
+    return candidate if candidate in await retired_audiences(cfg) else cfg.resource_url
+
+
 class PlugpassTokenVerifier:
     """mcp.server.auth.provider.TokenVerifier — local JWKS validation, no
-    Plugpass round-trip. EdDSA-pinned, issuer exact, audience = the baked
-    RESOURCE_URL, exp required. PyJWKClient caches the key set (lifespan=4h)
-    and refetches once on an unknown kid (key rotation)."""
+    Plugpass round-trip. EdDSA-pinned, issuer exact, exp required, audience =
+    the baked RESOURCE_URL or one of this server's retired URLs. PyJWKClient
+    caches the key set (lifespan=4h) and refetches once on an unknown kid (key
+    rotation)."""
 
     def __init__(self, cfg: PlugpassConfig) -> None:
         self._cfg = cfg
@@ -83,9 +143,10 @@ class PlugpassTokenVerifier:
             token,
             signing_key.key,
             algorithms=["EdDSA"],
-            audience=self._cfg.resource_url,
             issuer=self._cfg.issuer,
-            options={"require": ["exp", "aud", "iss"]},
+            # The audience is checked below, against RESOURCE_URL and the
+            # retired set.
+            options={"require": ["exp", "aud", "iss"], "verify_aud": False},
         )
 
     async def verify_token(self, token: str) -> AccessToken | None:
@@ -94,6 +155,12 @@ class PlugpassTokenVerifier:
             payload = await anyio.to_thread.run_sync(self._decode, token)
         except Exception:
             return None  # any failure → the SDK's 401 challenge (fail closed)
+        aud = payload.get("aud")
+        auds = [aud] if isinstance(aud, str) else [a for a in aud or [] if isinstance(a, str)]
+        if self._cfg.resource_url not in auds:
+            retired = await retired_audiences(self._cfg)
+            if not any(a in retired for a in auds):
+                return None
         sub = payload.get("sub")
         if not isinstance(sub, str) or not sub:
             return None
@@ -270,6 +337,57 @@ def widget_callable(tool_meta: dict[str, Any]) -> bool:
 UNAVAILABLE_CHECK_GRANT = "<the unavailable grant text from TOOLS.md>"
 
 
+class AddressedResourceMiddleware:
+    """Pure ASGI, outermost. For a request addressed to one of this server's
+    retired URLs, the PRM document and every 401 challenge name that URL
+    instead of RESOURCE_URL (see addressed_resource)."""
+
+    def __init__(self, app, cfg: PlugpassConfig) -> None:
+        self.app, self.cfg = app, cfg
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] != "http":
+            return await self.app(scope, receive, send)
+        resource = await addressed_resource(self.cfg, scope)
+        if resource == self.cfg.resource_url:
+            return await self.app(scope, receive, send)
+        is_prm = scope.get("path") == PRM_PATH
+        start: dict | None = None
+        chunks: list[bytes] = []
+
+        async def wrapped_send(message):
+            nonlocal start
+            if message["type"] == "http.response.start":
+                headers = []
+                for k, v in message["headers"]:
+                    if k.lower() == b"www-authenticate":
+                        v = re.sub(
+                            rb'resource_metadata="[^"]*"',
+                            f'resource_metadata="{prm_url(resource)}"'.encode(),
+                            v,
+                        )
+                    headers.append((k, v))
+                message = {**message, "headers": headers}
+                if is_prm and message["status"] == 200:
+                    start = message  # rewritten below, once the body is known
+                    return
+            elif start is not None and message["type"] == "http.response.body":
+                chunks.append(message.get("body", b""))
+                if message.get("more_body"):
+                    return
+                doc = json.loads(b"".join(chunks))
+                doc["resource"] = resource
+                body = json.dumps(doc).encode()
+                headers = [(k, v) for k, v in start["headers"] if k.lower() != b"content-length"]
+                headers.append((b"content-length", str(len(body)).encode()))
+                await send({**start, "headers": headers})
+                await send({"type": "http.response.body", "body": body})
+                return
+            await send(message)
+
+        await self.app(scope, receive, wrapped_send)
+
+
 class ReauthTo401Middleware:
     """Pure ASGI. When a tool set `plugpass_reauth_required` in the request
     scope state (the Entitlement API reported the bearer revoked), replace the
@@ -306,7 +424,7 @@ class ReauthTo401Middleware:
         await self.app(scope, receive, wrapped_send)
 ```
 
-**Server entry** (`server.py`) — the SDK serves the PRM document and the challenge itself; the only custom ASGI piece is the reauth middleware:
+**Server entry** (`server.py`) — the SDK serves the PRM document and the challenge itself; the custom ASGI pieces are the reauth middleware and, outermost, the addressed-resource middleware:
 
 ```python
 import uvicorn
@@ -319,10 +437,10 @@ mcp = MCPServer(
     token_verifier=PlugpassTokenVerifier(cfg),
     auth=AuthSettings(
         issuer_url=cfg.issuer,                 # → PRM authorization_servers
-        resource_server_url=cfg.resource_url,  # MUST include /mcp — drives the PRM path AND its `resource`
+        resource_server_url=cfg.resource_url,  # MUST include /mcp — drives the PRM path AND its default `resource`
         required_scopes=None,
-        # The verifier pins `aud` to the same RESOURCE_URL itself, so the SDK's
-        # own audience check would be a second copy of one rule.
+        # The verifier checks `aud` itself (RESOURCE_URL or a retired URL), so
+        # the SDK's own audience check must stay off.
         validate_token_resource=False,
     ),
 )
@@ -336,6 +454,7 @@ app = mcp.streamable_http_app(
     host=host,
 )
 app.add_middleware(ReauthTo401Middleware, resource_metadata_url=cfg.prm_url)
+app.add_middleware(AddressedResourceMiddleware, cfg=cfg)  # added last = outermost
 uvicorn.run(app, host=host, port=port)
 # NOT mcp.run(...) — it rebuilds the app internally and would drop the middleware.
 ```

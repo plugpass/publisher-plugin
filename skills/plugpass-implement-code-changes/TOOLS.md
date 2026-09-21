@@ -16,11 +16,11 @@ Be **idempotent**, and rewrite only when something changed: an artifact's gating
 
 ## Step 1: Determine each server's work and locate its source
 
-Work over the orchestration's **server set** (SKILL.md Step 3): every server with tool work, plus the **check host** (the server named by `connector.server_key`) when the connector is publisher-hosted and anything is still gated. Use the absolute path from the resolved map for each — the orchestration already resolved (and, where needed, elicited) every path before this procedure began, and dropped any server it couldn't locate. If a path unexpectedly fails to resolve mid-run, don't edit that server — leave its tasks open and surface it to the publisher in the closing summary.
+Work over the orchestration's **server set** (SKILL.md Step 3): every server with tool work, plus the **check host** (the server named by `connector.server_key`) when the connector is publisher-hosted and anything is still gated, plus every server whose `owned_servers` entry has `resource_url_changed` `true`. Use the absolute path from the resolved map for each — the orchestration already resolved (and, where needed, elicited) every path before this procedure began, and dropped any server it couldn't locate. If a path unexpectedly fails to resolve mid-run, don't edit that server — leave its tasks open and surface it to the publisher in the closing summary.
 
 Per server, the pieces to ensure are exactly the layers its `owned_servers` entry's `scaffolding.layers` directive names (each independently idempotent; a layer the directive omits is neither written nor verified):
 
-- `resource_server` — **the resource-server layer** (written when `server_scaffolding_template_stale` is `true` or the layer is missing, verified otherwise) — Step 3.
+- `resource_server` — **the resource-server layer** (written when `server_scaffolding_template_stale` is `true` or the layer is missing, verified otherwise — a server with `resource_url_changed` `true` re-bakes its `RESOURCE_URL` there) — Step 3.
 - `check_proxy` — **the check proxy tool** (the check host; the same write-or-verify rule) — Step 4.
 - `tool_wrappers` — **per-tool wrappers** (each of the server's `tool` components: written for `added` / `changed` and for `unchanged` + `template_stale`, stripped for `removed`, verified otherwise) — Step 5.
 - `ui_paywall` — **the in-widget paywall** (a server that renders MCP Apps widgets — one with a UI-backed tool; the same write-or-verify rule as the resource-server layer) — Step 6.
@@ -46,35 +46,37 @@ Every scaffolded module carries these as fixed constants:
 | `ISSUER` | `plugpass_issuer` | The JWT `iss` pin, and the PRM document's `authorization_servers` entry |
 | `JWKS_URL` | `plugpass_jwks_url` | Where the public key set is fetched from |
 | `ENTITLEMENT_API_ORIGIN` | `entitlement_api_origin` | The origin the proxy + paid wrappers POST `{origin}/entitlement/*` against |
-| `RESOURCE_URL` | this server's own connector-shape URL (below) | The server's public MCP URL — the JWT `aud` pin and the PRM document's `resource` |
+| `RESOURCE_URL` | this server's own connector-shape URL (below) | The server's public MCP URL — its current bearer audience and the PRM document's default `resource` |
 | `PAYWALL_SCRIPT_URL` | `paywall_script_url` | Where the in-widget paywall script loads from — the `ui_paywall` layer's constant, present on a server whose directive names that layer |
 | `CHECK_TOOL_NAME` | `check_tool_name`, on the check host only — **null/none on every other server** | The check tool a denial names as the paywall's read-only status probe (below). A server that hosts no check tool names none, and its denials carry no probe |
 
-`RESOURCE_URL` is per server: the check host's is `connector.url`; any other server's is its `owned_servers` entry's `url` (matched by `server_name`). `ISSUER` and `JWKS_URL` are per plugin — the plugin's own pages-host origin (its authorization server) and that host's key-set document — so a run whose `connector_change_since_last_implement` is `changed` with only `issuer` differing from `previous_connector` re-bakes them on every server in the set (the idempotent read-then-change) and nothing else moves. Bake every value verbatim from the response; never derive the audience or the issuer from the incoming request.
+`RESOURCE_URL` is per server: the check host's is `connector.url`; any other server's is its `owned_servers` entry's `url` (matched by `server_name`). `ISSUER` and `JWKS_URL` are per plugin — the plugin's own subdomain origin (its authorization server) and that host's key-set document — so a run whose `connector_change_since_last_implement` is `changed` with only `issuer` differing from `previous_connector` re-bakes them on every server in the set (the idempotent read-then-change) and nothing else moves. Bake every value verbatim from the response; never accept an audience or issuer taken from the incoming request.
 
 ## Step 3: The resource-server layer (`resource_server`, once per server)
 
-Written once per server, standalone (no platform-package dependency), following the language template's structure. Write it — from the language template, as an idempotent read-then-change against the current response values — when `server_scaffolding_template_stale` is `true` or the layer is missing. Otherwise **verify** it without re-rendering the template: the challenge, the PRM route, and the local bearer validation are present, and the four runtime constants are baked with the current response values — a differing constant is re-baked in place (the issuer-drift and domain-change cases), and a missing behavior is written. Three behaviors:
+Written once per server, standalone (no platform-package dependency), following the language template's structure. Write it — from the language template, as an idempotent read-then-change against the current response values — when `server_scaffolding_template_stale` is `true` or the layer is missing. Otherwise **verify** it without re-rendering the template: the challenge, the PRM route, the local bearer validation, and the retired-URL fetch are present, and the four runtime constants are baked with the current response values — a differing constant is re-baked in place (the issuer-drift, domain-change, and moved-server cases), and a missing behavior is written. Four behaviors:
 
 1. **The challenge.** Any request to the MCP endpoint (`/mcp`) without a valid bearer — missing, malformed, bad signature, wrong issuer/audience, or expired — is answered `401` with a JSON body `{ "error": "invalid_token", "error_description": "…" }` and the header:
 
    ```
-   WWW-Authenticate: Bearer realm="{RESOURCE_URL}", error="invalid_token", error_description="{reason}", resource_metadata="{PRM document URL}"
+   WWW-Authenticate: Bearer realm="{addressed resource}", error="invalid_token", error_description="{reason}", resource_metadata="{PRM document URL}"
    ```
 
-   `error="invalid_token"` exactly — it is the signal MCP clients (Claude Code, claude.ai) treat as "needs OAuth"; other error codes read as a broken server. The PRM document URL is the server's origin + `/.well-known/oauth-protected-resource/mcp`.
+   `error="invalid_token"` exactly — it is the signal MCP clients (Claude Code, claude.ai) treat as "needs OAuth"; other error codes read as a broken server. The PRM document URL is the addressed resource's origin + `/.well-known/oauth-protected-resource/mcp`. The **addressed resource** is the request's `X-Forwarded-Host` (its first value), else its `Host`, on `RESOURCE_URL`'s scheme and path — when that URL is `RESOURCE_URL` or one of the server's retired URLs (behavior 4); otherwise `RESOURCE_URL`.
 
 2. **The protected-resource-metadata document** (RFC 9728, path-aware): served unauthenticated at `/.well-known/oauth-protected-resource/mcp`, body:
 
    ```json
    {
-     "resource": "{RESOURCE_URL}",
+     "resource": "{addressed resource}",
      "authorization_servers": ["{ISSUER}"],
      "bearer_methods_supported": ["header"]
    }
    ```
 
-3. **Local bearer validation**, on every MCP request: verify the JWT against the JWKS fetched from `JWKS_URL` — algorithm pinned to **`EdDSA` only** (no downgrade), `iss` exact-match to `ISSUER`, `aud` exact-match to `RESOURCE_URL`, `exp` enforced — then extract `sub`. Cache the fetched key set for up to **4 hours** (refreshing more often is fine — the templates use each ecosystem's native cache), re-fetching once, rate-limited, when a token's key id isn't in the cached set (Plugpass key rotation). Keep the raw bearer alongside `sub` in the request context so paid wrappers and the proxy can forward it.
+3. **Local bearer validation**, on every MCP request: verify the JWT against the JWKS fetched from `JWKS_URL` — algorithm pinned to **`EdDSA` only** (no downgrade), `iss` exact-match to `ISSUER`, `aud` containing `RESOURCE_URL` or one of the server's retired URLs, `exp` enforced — then extract `sub`. Cache the fetched key set for up to **4 hours** (refreshing more often is fine — the templates use each ecosystem's native cache), re-fetching once, rate-limited, when a token's key id isn't in the cached set (Plugpass key rotation). Keep the raw bearer alongside `sub` in the request context so paid wrappers and the proxy can forward it.
+
+4. **The retired URLs** — the addresses the server moved off, which old installs still call: `GET {ENTITLEMENT_API_ORIGIN}/entitlement/retired-audiences?resource={RESOURCE_URL}` answers `{ "retired": ["…"] }`. Fetch it only when a bearer's `aud` lacks `RESOURCE_URL` or the addressed host differs from `RESOURCE_URL`'s; cache it 5 minutes, and 1 minute after a failed fetch, which accepts nothing but `RESOURCE_URL`.
 
 The layer never checks revocation locally — Plugpass reads revocation at the Entitlement API and answers `reauth_required`, which the proxy/wrappers convert into the same `401` challenge (below), triggering the client's re-auth.
 

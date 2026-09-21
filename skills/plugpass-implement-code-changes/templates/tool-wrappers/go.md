@@ -8,7 +8,7 @@ The publisher's server becomes an **OAuth-protected resource server** using the 
 2. **`StreamableHTTPOptions{Stateless: true, JSONResponse: true}`, always.** In JSON mode the SDK buffers the response and `ServeHTTP` returns only after the tool handler finished — so a wrapping middleware can discard the buffered response and write a `401` when a tool discovered mid-call that the bearer is revoked. In SSE mode events flush immediately (the `200` is committed before the handler runs). And **stateless mode is what makes middleware context values visible inside tool handlers** — in stateful mode handler contexts descend from the *initialize* request, not the current POST, and the reauth flag silently never fires.
 
 > **The gate's challenge needs a header fixup.** `auth.RequireBearerToken` emits `WWW-Authenticate: Bearer resource_metadata="…"` with **no** `error="invalid_token"` (RFC 6750 permits omitting the error on a missing token) — but the Plugpass contract requires `error="invalid_token"` (the signal clients key OAuth discovery off). The `challengeWriter`/`withFullChallenge` wrapper below fills it in on the gate's 401. Every other language SDK emits the full challenge itself; only the Go SDK needs this one wrapper.
-3. **The audience is the baked `RESOURCE_URL`, never the request host** — the JWT `aud` pin, the PRM `resource`, and the challenge's `resource_metadata` all derive from it. This is what lets a locally-listening server accept real bearers minted for its public URL.
+3. **Every accepted audience comes from Plugpass, never from the request.** A bearer's `aud` must be the baked `RESOURCE_URL` or one of the retired URLs Plugpass reports for this server (the addresses it moved off, which old installs still call). The PRM `resource` and the challenge's `resource_metadata` name the URL the request was addressed to (`X-Forwarded-Host`, else `Host`) only when that URL is an accepted audience, else `RESOURCE_URL`. This is what lets a locally-listening server accept real bearers minted for its public URL, and what keeps a moved server working for installs of its old address.
 
 ```go
 // premium_feature_access_check.go — written once per server. Standalone.
@@ -17,13 +17,16 @@ package main
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"net/url"
 	"os"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/MicahParks/keyfunc/v3"
 	"github.com/golang-jwt/jwt/v5"
@@ -38,7 +41,8 @@ const (
 	issuer               = "<plugpass_issuer>"
 	jwksURL              = "<plugpass_jwks_url>"
 	entitlementAPIOrigin = "<entitlement_api_origin>"
-	// This server's own public MCP URL — the JWT aud pin and the PRM resource.
+	// This server's own public MCP URL — its current bearer audience and the
+	// PRM's default resource.
 	resourceURL = "<this server's RESOURCE_URL>"
 	// Where the Plugpass paywall for MCP Apps widgets loads from (the ui_paywall
 	// layer — only on a server whose directive names it).
@@ -69,9 +73,72 @@ func loadPlugpassConfig() plugpassConfig {
 }
 
 // RFC 9728 path-aware PRM URL: origin + /.well-known/oauth-protected-resource + /mcp.
-func prmURL(cfg plugpassConfig) string {
-	u, _ := url.Parse(cfg.resourceURL)
+func prmURL(resource string) string {
+	u, _ := url.Parse(resource)
 	return u.Scheme + "://" + u.Host + "/.well-known/oauth-protected-resource" + mcpPath
+}
+
+// The URLs this server moved off, which Plugpass reports so old installs keep
+// working. Fetched only when a bearer or a request names another address;
+// cached 5 minutes (1 minute after a failed fetch, which accepts nothing extra).
+var (
+	retiredMu      sync.Mutex
+	retiredURLs    = map[string]bool{}
+	retiredExpires time.Time
+	retiredClient  = &http.Client{Timeout: 5 * time.Second}
+)
+
+func retiredAudiences(ctx context.Context, cfg plugpassConfig) map[string]bool {
+	retiredMu.Lock()
+	defer retiredMu.Unlock()
+	if time.Now().Before(retiredExpires) {
+		return retiredURLs
+	}
+	urls, ttl := map[string]bool{}, time.Minute
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		cfg.entitlementAPIOrigin+"/entitlement/retired-audiences?resource="+url.QueryEscape(cfg.resourceURL), nil)
+	if err == nil {
+		if res, err := retiredClient.Do(req); err == nil {
+			var body struct {
+				Retired []string `json:"retired"`
+			}
+			if res.StatusCode == http.StatusOK && json.NewDecoder(res.Body).Decode(&body) == nil {
+				for _, u := range body.Retired {
+					urls[u] = true
+				}
+				ttl = 5 * time.Minute
+			}
+			res.Body.Close()
+		}
+	}
+	retiredURLs, retiredExpires = urls, time.Now().Add(ttl)
+	return retiredURLs
+}
+
+// The URL a request was addressed to — X-Forwarded-Host (a proxy on an old
+// address sets it), else its own host, on RESOURCE_URL's scheme and path — when
+// that URL is an accepted audience; otherwise RESOURCE_URL.
+func addressedResource(ctx context.Context, cfg plugpassConfig, r *http.Request) string {
+	host := r.Host
+	if fwd := r.Header.Get("X-Forwarded-Host"); fwd != "" {
+		host, _, _ = strings.Cut(fwd, ",")
+	}
+	host = strings.ToLower(strings.TrimSpace(host))
+	current, _ := url.Parse(cfg.resourceURL)
+	if host == "" || host == current.Host {
+		return cfg.resourceURL
+	}
+	candidate := current.Scheme + "://" + host + current.Path
+	if retiredAudiences(ctx, cfg)[candidate] {
+		return candidate
+	}
+	return cfg.resourceURL
+}
+
+// The full 401 challenge for a resource.
+func challenge(resource, description string) string {
+	return fmt.Sprintf("Bearer realm=%q, error=%q, error_description=%q, resource_metadata=%q",
+		resource, "invalid_token", description, prmURL(resource))
 }
 
 // Lazy per-URL keyfunc singleton. keyfunc.NewDefault refreshes hourly in the
@@ -96,10 +163,11 @@ func jwksKeyfunc(jwksURL string) (jwt.Keyfunc, error) {
 	return kf.Keyfunc, nil
 }
 
-// The auth.TokenVerifier the bearer gate runs: EdDSA-pinned, issuer exact,
-// audience = the baked RESOURCE_URL, exp required; extracts sub. Every token
-// failure MUST wrap auth.ErrInvalidToken — anything else becomes a 500 with
-// no WWW-Authenticate challenge, silently breaking client OAuth discovery.
+// The auth.TokenVerifier the bearer gate runs: EdDSA-pinned, issuer exact, exp
+// required, audience = the baked RESOURCE_URL or one of this server's retired
+// URLs; extracts sub. Every token failure MUST wrap auth.ErrInvalidToken —
+// anything else becomes a 500 with no WWW-Authenticate challenge, silently
+// breaking client OAuth discovery.
 func verifyBearer(cfg plugpassConfig) auth.TokenVerifier {
 	return func(ctx context.Context, token string, _ *http.Request) (*auth.TokenInfo, error) {
 		kf, err := jwksKeyfunc(cfg.jwksURL)
@@ -109,11 +177,20 @@ func verifyBearer(cfg plugpassConfig) auth.TokenVerifier {
 		tok, err := jwt.Parse(token, kf,
 			jwt.WithValidMethods([]string{"EdDSA"}),
 			jwt.WithIssuer(cfg.issuer),
-			jwt.WithAudience(cfg.resourceURL),
 			jwt.WithExpirationRequired(),
 		)
 		if err != nil || !tok.Valid {
 			return nil, fmt.Errorf("%w: %v", auth.ErrInvalidToken, err)
+		}
+		auds, err := tok.Claims.GetAudience()
+		if err != nil || len(auds) == 0 {
+			return nil, fmt.Errorf("%w: missing aud", auth.ErrInvalidToken)
+		}
+		if !slices.Contains(auds, cfg.resourceURL) {
+			retired := retiredAudiences(ctx, cfg)
+			if !slices.ContainsFunc(auds, func(a string) bool { return retired[a] }) {
+				return nil, fmt.Errorf("%w: audience not accepted", auth.ErrInvalidToken)
+			}
 		}
 		sub, err := tok.Claims.GetSubject()
 		if err != nil || sub == "" {
@@ -160,28 +237,32 @@ func toolHints(readOnly, destructive, idempotent, openWorld bool) *mcp.ToolAnnot
 }
 
 // challengeWriter fills in the auth gate's 401 WWW-Authenticate header with
-// error="invalid_token" — the exact signal MCP clients key OAuth discovery off.
-// auth.RequireBearerToken emits only `resource_metadata=…` (RFC 6750 permits
-// omitting the error on a missing token), so add the full challenge when the
-// header lacks an `error=`; a header that already carries one (reauthTo401's) is
-// left as-is.
+// error="invalid_token" — the exact signal MCP clients key OAuth discovery off —
+// for the addressed resource. auth.RequireBearerToken emits only
+// `resource_metadata=…` (RFC 6750 permits omitting the error on a missing
+// token), so write the full challenge when the header lacks an `error=`; a
+// header that already carries one (reauthTo401's) is left as-is.
 type challengeWriter struct {
 	http.ResponseWriter
-	cfg plugpassConfig
+	resource string
 }
 
 func (c *challengeWriter) WriteHeader(status int) {
 	if status == http.StatusUnauthorized && !strings.Contains(c.Header().Get("WWW-Authenticate"), "error=") {
-		c.Header().Set("WWW-Authenticate",
-			fmt.Sprintf("Bearer realm=%q, error=%q, error_description=%q, resource_metadata=%q",
-				c.cfg.resourceURL, "invalid_token", "Authentication required", prmURL(cfg)))
+		c.Header().Set("WWW-Authenticate", challenge(c.resource, "Authentication required"))
 	}
 	c.ResponseWriter.WriteHeader(status)
 }
 
+type resourceKey struct{}
+
+// Outermost: resolves the addressed resource once, for every challenge the
+// request can draw.
 func withFullChallenge(cfg plugpassConfig, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		next.ServeHTTP(&challengeWriter{ResponseWriter: w, cfg: cfg}, r)
+		resource := addressedResource(r.Context(), cfg, r)
+		r = r.WithContext(context.WithValue(r.Context(), resourceKey{}, resource))
+		next.ServeHTTP(&challengeWriter{ResponseWriter: w, resource: resource}, r)
 	})
 }
 
@@ -195,9 +276,8 @@ func reauthTo401(cfg plugpassConfig, next http.Handler) http.Handler {
 		bw := newBufferingResponseWriter() // captures Header/WriteHeader/Write; no-op Flush
 		next.ServeHTTP(bw, r)              // returns only after the SDK delivered the full JSON body
 		if sig.v.Load() {
-			w.Header().Set("WWW-Authenticate",
-				fmt.Sprintf("Bearer realm=%q, error=%q, error_description=%q, resource_metadata=%q",
-					cfg.resourceURL, "invalid_token", "Access token no longer valid", prmURL(cfg)))
+			resource, _ := r.Context().Value(resourceKey{}).(string)
+			w.Header().Set("WWW-Authenticate", challenge(cmp.Or(resource, cfg.resourceURL), "Access token no longer valid"))
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
 			_, _ = w.Write([]byte(`{"error": "invalid_token", "error_description": "Access token no longer valid"}`))
@@ -331,16 +411,17 @@ func main() {
 		&mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true}, // required: lets a revoked-bearer tool swap in a 401
 	)
 	requireAuth := auth.RequireBearerToken(verifyBearer(cfg), &auth.RequireBearerTokenOptions{
-		ResourceMetadataURL: prmURL(cfg),
+		ResourceMetadataURL: prmURL(cfg.resourceURL), // withFullChallenge rewrites it per request
 	})
 
 	mux := http.NewServeMux()
-	mux.Handle("/.well-known/oauth-protected-resource"+mcpPath, auth.ProtectedResourceMetadataHandler(
-		&oauthex.ProtectedResourceMetadata{
-			Resource:               cfg.resourceURL,
+	mux.HandleFunc("/.well-known/oauth-protected-resource"+mcpPath, func(w http.ResponseWriter, r *http.Request) {
+		auth.ProtectedResourceMetadataHandler(&oauthex.ProtectedResourceMetadata{
+			Resource:               addressedResource(r.Context(), cfg, r),
 			AuthorizationServers:   []string{cfg.issuer},
 			BearerMethodsSupported: []string{"header"},
-		}))
+		}).ServeHTTP(w, r)
+	})
 	mux.Handle(mcpPath, withFullChallenge(cfg, requireAuth(reauthTo401(cfg, mcpHandler))))
 	log.Fatal(http.ListenAndServe(":"+cmp.Or(os.Getenv("PORT"), "8080"), mux))
 }

@@ -6,11 +6,11 @@ The publisher's server becomes an **OAuth-protected resource server**: an axum m
 
 1. **The server serves BOTH protocol eras from the one service.** rmcp routes each request by its negotiated version, answers `server/discover` (a defaulted `ServerHandler` method), and parses the per-request `_meta` envelope into a `RequestMetaObject` whose `client_capabilities()` the marker rule reads. The client's UI capability rides that envelope, and a host that gets only the legacy era never sends it. Nothing extra is wired for it: rmcp does the era routing.
 2. **`.with_legacy_session_mode(false).with_json_response(true)` on the transport config, always — as a pair.** 2026-07-28 requests are always served statelessly (SEP-2567 removes sessions); `legacy_session_mode: false` puts the 2025-era leg on the same stateless path, and `json_response` then buffers BOTH, so the gate middleware holds the complete response and can swap in a `401` when a tool discovered mid-call that the bearer is revoked. `json_response` has **no effect in a session-mode legacy exchange** (SSE streams the `200` before the tool runs) — dropping either flag silently kills the reauth mechanism. Leave `stateless_protocol_metadata_required` at its `false` default, or 2025-era clients are refused.
-3. **The audience is the baked `RESOURCE_URL`, never the request host** — the JWT `aud` pin, the PRM `resource`, and the challenge's `resource_metadata` all derive from it. This is what lets a locally-listening server accept real bearers minted for its public URL.
+3. **Every accepted audience comes from Plugpass, never from the request.** A bearer's `aud` must be the baked `RESOURCE_URL` or one of the retired URLs Plugpass reports for this server (the addresses it moved off, which old installs still call). The PRM `resource` and the challenge's `resource_metadata` name the URL the request was addressed to (`X-Forwarded-Host`, else `Host`) only when that URL is an accepted audience, else `RESOURCE_URL`. This is what lets a locally-listening server accept real bearers minted for its public URL, and what keeps a moved server working for installs of its old address.
 
 ```rust
 // premium_feature_access_check.rs — written once per server. Standalone.
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -25,19 +25,20 @@ const PLUGIN_ID: &str = "<the plugin's Plugpass id>";
 const ISSUER: &str = "<plugpass_issuer>";
 const JWKS_URL: &str = "<plugpass_jwks_url>";
 const ENTITLEMENT_API_ORIGIN: &str = "<entitlement_api_origin>";
-// This server's own public MCP URL — the JWT `aud` pin and the PRM `resource`.
+// This server's own public MCP URL — its current bearer audience and the PRM's
+// default `resource`.
 const RESOURCE_URL: &str = "<this server's RESOURCE_URL>";
 // Where the Plugpass paywall for MCP Apps widgets loads from (the `ui_paywall`
 // layer — only on a server whose directive names it).
 const PAYWALL_SCRIPT_URL: &str = "<paywall_script_url>";
 
-#[derive(Clone)]
 // This server's own check tool, named on a denial so the paywall can ask it
 // whether the user became entitled. None on a server that hosts no check tool
 // (the check proxy is registered on the plugin's check host only), in which case
 // a denial carries no probe and the paywall says less, never something untrue.
 const CHECK_TOOL_NAME: Option<&str> = Some("<check_tool_name, or None off the check host>");
 
+#[derive(Clone)]
 pub struct PlugpassConfig {
     pub plugin_id: String,
     pub issuer: String,
@@ -61,8 +62,8 @@ pub fn plugpass_config() -> PlugpassConfig {
 }
 
 // RFC 9728 path-aware PRM URL: origin + /.well-known/oauth-protected-resource + /mcp.
-pub fn prm_url(cfg: &PlugpassConfig) -> String {
-    let origin = cfg.resource_url.trim_end_matches(MCP_PATH);
+pub fn prm_url(resource: &str) -> String {
+    let origin = resource.trim_end_matches(MCP_PATH);
     format!("{origin}/.well-known/oauth-protected-resource{MCP_PATH}")
 }
 
@@ -92,16 +93,84 @@ async fn decoding_key_for(jwks_url: &str, kid: &str) -> Option<DecodingKey> {
        find(kid) → DecodingKey::from_jwk(jwk).ok() (handles OKP/Ed25519)… */
 }
 
-// EdDSA-pinned, issuer exact, audience = the baked RESOURCE_URL, exp+sub
-// required. Returns the user id, or None on any failure.
+// The URLs this server moved off, which Plugpass reports so old installs keep
+// working. Fetched only when a bearer or a request names another address;
+// cached 5 minutes (1 minute after a failed fetch, which accepts nothing extra).
+static RETIRED: Mutex<Option<(HashSet<String>, Instant)>> = Mutex::new(None);
+const RETIRED_TTL: Duration = Duration::from_secs(300);
+const RETIRED_FAILURE_TTL: Duration = Duration::from_secs(60);
+
+pub async fn retired_audiences(cfg: &PlugpassConfig) -> HashSet<String> {
+    if let Some((urls, expires)) = RETIRED.lock().unwrap().as_ref() {
+        if Instant::now() < *expires {
+            return urls.clone();
+        }
+    }
+    #[derive(serde::Deserialize)]
+    struct Body { retired: Vec<String> }
+    let fetched = async {
+        let url = reqwest::Url::parse_with_params(
+            &format!("{}/entitlement/retired-audiences", cfg.entitlement_api_origin),
+            &[("resource", cfg.resource_url.as_str())],
+        ).ok()?;
+        let res = http_client().get(url).send().await.ok()?;
+        if !res.status().is_success() { return None; }
+        res.json::<Body>().await.ok()
+    }.await;
+    let (urls, ttl) = match fetched {
+        Some(body) => (body.retired.into_iter().collect::<HashSet<_>>(), RETIRED_TTL),
+        None => (HashSet::new(), RETIRED_FAILURE_TTL),
+    };
+    *RETIRED.lock().unwrap() = Some((urls.clone(), Instant::now() + ttl));
+    urls
+}
+
+// The URL a request was addressed to — `X-Forwarded-Host` (a proxy on an old
+// address sets it), else its `Host`, on RESOURCE_URL's scheme and path — when
+// that URL is an accepted audience; otherwise RESOURCE_URL.
+pub async fn addressed_resource(cfg: &PlugpassConfig, headers: &http::HeaderMap) -> String {
+    let raw = headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get(http::header::HOST))
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let host = raw.split(',').next().unwrap_or("").trim().to_ascii_lowercase();
+    let Ok(current) = reqwest::Url::parse(&cfg.resource_url) else {
+        return cfg.resource_url.clone();
+    };
+    let current_host = match current.port() {
+        Some(port) => format!("{}:{port}", current.host_str().unwrap_or("")),
+        None => current.host_str().unwrap_or("").to_string(),
+    };
+    if host.is_empty() || host == current_host {
+        return cfg.resource_url.clone();
+    }
+    let candidate = format!("{}://{host}{}", current.scheme(), current.path());
+    if retired_audiences(cfg).await.contains(&candidate) { candidate } else { cfg.resource_url.clone() }
+}
+
+// EdDSA-pinned, issuer exact, exp+sub required, audience = the baked
+// RESOURCE_URL or one of this server's retired URLs. Returns the user id, or
+// None on any failure.
 pub async fn verify_bearer(token: &str, cfg: &PlugpassConfig) -> Option<String> {
     let header = decode_header(token).ok()?;
     let key = decoding_key_for(&cfg.jwks_url, header.kid.as_deref()?).await?;
     let mut validation = Validation::new(Algorithm::EdDSA);
     validation.set_issuer(&[&cfg.issuer]);
-    validation.set_audience(&[&cfg.resource_url]);
+    validation.validate_aud = false; // checked below: RESOURCE_URL or a retired URL
     validation.set_required_spec_claims(&["exp", "aud", "iss", "sub"]);
     let data = decode::<serde_json::Map<String, serde_json::Value>>(token, &key, &validation).ok()?;
+    let auds: Vec<&str> = match data.claims.get("aud")? {
+        serde_json::Value::String(aud) => vec![aud.as_str()],
+        serde_json::Value::Array(auds) => auds.iter().filter_map(|a| a.as_str()).collect(),
+        _ => return None,
+    };
+    if !auds.contains(&cfg.resource_url.as_str()) {
+        let retired = retired_audiences(cfg).await;
+        if !auds.iter().any(|aud| retired.contains(*aud)) {
+            return None;
+        }
+    }
     data.claims.get("sub")?.as_str().map(str::to_owned)
 }
 ```
@@ -233,44 +302,46 @@ let protected = Router::new()
     .layer(middleware::from_fn_with_state(cfg.clone(), bearer_gate));
 let app = Router::new()
     .route("/.well-known/oauth-protected-resource/mcp", get(prm_document))
+    .with_state(cfg.clone())
     .merge(protected);
 axum::serve(tokio::net::TcpListener::bind(("0.0.0.0", port)).await?, app).await?;
 ```
 
 ```rust
-// The PRM document (unauthenticated) and the gate.
-async fn prm_document(State(cfg): State<PlugpassConfig>) -> Json<serde_json::Value> {
+// The PRM document (unauthenticated) for the addressed resource, and the gate.
+async fn prm_document(State(cfg): State<PlugpassConfig>, headers: http::HeaderMap) -> Json<serde_json::Value> {
     Json(serde_json::json!({
-        "resource": cfg.resource_url,
+        "resource": addressed_resource(&cfg, &headers).await,
         "authorization_servers": [cfg.issuer],
         "bearer_methods_supported": ["header"],
     }))
 }
 
-fn challenge_401(cfg: &PlugpassConfig, description: &str) -> Response {
+fn challenge_401(resource: &str, description: &str) -> Response {
     (
         StatusCode::UNAUTHORIZED,
         [(header::WWW_AUTHENTICATE, format!(
-            "Bearer realm=\"{}\", error=\"invalid_token\", error_description=\"{description}\", resource_metadata=\"{}\"",
-            cfg.resource_url, prm_url(cfg)
+            "Bearer realm=\"{resource}\", error=\"invalid_token\", error_description=\"{description}\", resource_metadata=\"{}\"",
+            prm_url(resource)
         ))],
         Json(serde_json::json!({ "error": "invalid_token", "error_description": description })),
     ).into_response()
 }
 
 async fn bearer_gate(State(cfg): State<PlugpassConfig>, mut request: Request, next: Next) -> Response {
+    let resource = addressed_resource(&cfg, request.headers()).await;
     let Some(token) = bearer_from(request.headers()) else {
-        return challenge_401(&cfg, "Missing bearer token");
+        return challenge_401(&resource, "Missing bearer token");
     };
     let Some(sub) = verify_bearer(&token, &cfg).await else {
-        return challenge_401(&cfg, "Token invalid or expired");
+        return challenge_401(&resource, "Token invalid or expired");
     };
     let signal = ReauthSignal(Arc::new(AtomicBool::new(false)));
     request.extensions_mut().insert(Identity { sub, bearer: token });
     request.extensions_mut().insert(signal.clone());
     let response = next.run(request).await; // stateless+json: resolves only after the tool finished
     if signal.0.load(Ordering::Relaxed) {
-        return challenge_401(&cfg, "Access token no longer valid");
+        return challenge_401(&resource, "Access token no longer valid");
     }
     response
 }

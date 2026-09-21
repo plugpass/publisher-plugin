@@ -8,7 +8,7 @@ The publisher's server becomes an **OAuth-protected resource server**: a servlet
 
 1. **Use `HttpServletStatelessServerTransport`** (not the streamable provider). It answers `tools/call` with a plain `application/json` body, synchronously on the request thread, no `startAsync`, no sessions — so the auth filter's buffering wrapper holds the complete response after `chain.doFilter` returns and can swap in a `401` when a tool discovered mid-call that the bearer is revoked. (The streamable provider answers tools/call over SSE; a buffering filter still works there only because of deferred-`complete()` servlet semantics, with mid-stream-notification caveats — stay stateless unless the publisher's tools need sampling/elicitation.) GET returns 405 — spec-legal for streamable-HTTP servers.
 2. **Verify Ed25519 with the JDK (`Signature.getInstance("Ed25519")`), not Nimbus's `Ed25519Verifier`** — the Nimbus verifier still requires the optional Google Tink dependency, and its stock `DefaultJWSVerifierFactory` has no EdDSA support at all. Nimbus handles JWKS fetching/caching/selection and claims verification; the signature check is ~10 lines of JDK crypto.
-3. **The audience is the baked `RESOURCE_URL`, never the request host** — the JWT `aud` pin, the PRM `resource`, and the challenge's `resource_metadata` all derive from it. This is what lets a locally-listening server accept real bearers minted for its public URL.
+3. **Every accepted audience comes from Plugpass, never from the request.** A bearer's `aud` must be the baked `RESOURCE_URL` or one of the retired URLs Plugpass reports for this server (the addresses it moved off, which old installs still call). The PRM `resource` and the challenge's `resource_metadata` name the URL the request was addressed to (`X-Forwarded-Host`, else `Host`) only when that URL is an accepted audience, else `RESOURCE_URL`. This is what lets a locally-listening server accept real bearers minted for its public URL, and what keeps a moved server working for installs of its old address.
 
 ```java
 // PremiumFeatureAccessCheck.java — written once per server. Standalone.
@@ -20,7 +20,8 @@ public final class PremiumFeatureAccessCheck {
   private static final String ISSUER = "<plugpass_issuer>";
   private static final String JWKS_URL = "<plugpass_jwks_url>";
   private static final String ENTITLEMENT_API_ORIGIN = "<entitlement_api_origin>";
-  // This server's own public MCP URL — the JWT aud pin and the PRM resource.
+  // This server's own public MCP URL — its current bearer audience and the PRM's
+  // default resource.
   private static final String RESOURCE_URL = "<this server's RESOURCE_URL>";
   // Where the Plugpass paywall for MCP Apps widgets loads from (the `ui_paywall`
   // layer — only on a server whose directive names it).
@@ -40,9 +41,56 @@ public final class PremiumFeatureAccessCheck {
   public static String checkToolName() { return CHECK_TOOL_NAME; }
 
   // RFC 9728 path-aware PRM URL: origin + /.well-known/oauth-protected-resource + /mcp.
-  public static String prmUrl() {
-    String origin = resourceUrl().substring(0, resourceUrl().length() - MCP_PATH.length());
+  public static String prmUrl(String resource) {
+    String origin = resource.substring(0, resource.length() - MCP_PATH.length());
     return origin + "/.well-known/oauth-protected-resource" + MCP_PATH;
+  }
+
+  // The URLs this server moved off, which Plugpass reports so old installs keep
+  // working. Fetched only when a bearer or a request names another address;
+  // cached 5 minutes (1 minute after a failed fetch, which accepts nothing extra).
+  private static final HttpClient RETIRED_HTTP =
+      HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
+  private static Set<String> retired = Set.of();
+  private static long retiredExpiresAt = System.nanoTime();
+
+  public static synchronized Set<String> retiredAudiences() {
+    long now = System.nanoTime();
+    if (now - retiredExpiresAt < 0) return retired;
+    Set<String> urls = Set.of();
+    Duration ttl = Duration.ofMinutes(1);
+    try {
+      HttpRequest request = HttpRequest.newBuilder(URI.create(entitlementApiOrigin()
+              + "/entitlement/retired-audiences?resource="
+              + URLEncoder.encode(resourceUrl(), StandardCharsets.UTF_8)))
+          .timeout(Duration.ofSeconds(5)).GET().build();
+      HttpResponse<String> response = RETIRED_HTTP.send(request, HttpResponse.BodyHandlers.ofString());
+      if (response.statusCode() == 200
+          && JSONObjectUtils.parse(response.body()).get("retired") instanceof List<?> list) {
+        urls = list.stream().filter(String.class::isInstance).map(String.class::cast)
+            .collect(Collectors.toUnmodifiableSet());
+        ttl = Duration.ofMinutes(5);
+      }
+    } catch (Exception e) {
+      // unreachable: accept only RESOURCE_URL until the retry
+    }
+    retired = urls;
+    retiredExpiresAt = now + ttl.toNanos();
+    return retired;
+  }
+
+  // The URL a request was addressed to — X-Forwarded-Host (a proxy on an old
+  // address sets it), else its Host, on RESOURCE_URL's scheme and path — when
+  // that URL is an accepted audience; otherwise RESOURCE_URL.
+  public static String addressedResource(HttpServletRequest req) {
+    String forwarded = req.getHeader("X-Forwarded-Host");
+    String raw = forwarded != null ? forwarded.split(",")[0] : req.getHeader("Host");
+    String host = raw == null ? "" : raw.trim().toLowerCase(Locale.ROOT);
+    URI current = URI.create(resourceUrl());
+    String currentHost = current.getPort() == -1 ? current.getHost() : current.getHost() + ":" + current.getPort();
+    if (host.isEmpty() || host.equals(currentHost)) return resourceUrl();
+    String candidate = current.getScheme() + "://" + host + current.getPath();
+    return retiredAudiences().contains(candidate) ? candidate : resourceUrl();
   }
 
   // Remote JWKS: 4h cache, rate-limited refetch (an unknown kid re-fetches
@@ -57,9 +105,10 @@ public final class PremiumFeatureAccessCheck {
       .build();
 
   /**
-   * EdDSA-pinned, issuer exact, audience = the baked RESOURCE_URL, exp + sub
-   * required. Nimbus selects the OKP key by kid; the JDK verifies Ed25519
-   * (raw x wrapped in the fixed 12-byte SPKI prefix). Returns sub, or null.
+   * EdDSA-pinned, issuer exact, exp + sub required, audience = the baked
+   * RESOURCE_URL or one of this server's retired URLs. Nimbus selects the OKP
+   * key by kid; the JDK verifies Ed25519 (raw x wrapped in the fixed 12-byte
+   * SPKI prefix). Returns sub, or null.
    */
   public static String verifyBearer(String token) {
     try {
@@ -79,15 +128,20 @@ public final class PremiumFeatureAccessCheck {
       sig.update(jwt.getSigningInput());
       if (!sig.verify(jwt.getSignature().decode())) return null;
 
-      // Claims: iss exact, aud contains RESOURCE_URL, exp + sub required
-      // (60s default clock skew).
+      // Claims: iss exact, aud contains RESOURCE_URL (or, only when it does not,
+      // one of the retired URLs), exp + sub required (60s default clock skew).
+      JWTClaimsSet claims = jwt.getJWTClaimsSet();
+      Set<String> accepted = claims.getAudience().contains(resourceUrl())
+          ? Set.of(resourceUrl())
+          : Stream.concat(Stream.of(resourceUrl()), retiredAudiences().stream())
+              .collect(Collectors.toUnmodifiableSet());
       new DefaultJWTClaimsVerifier<SecurityContext>(
-          Set.of(resourceUrl()),
+          accepted,
           new JWTClaimsSet.Builder().issuer(issuer()).build(),
           Set.of("sub", "exp"),
           null
-      ).verify(jwt.getJWTClaimsSet(), null);
-      return jwt.getJWTClaimsSet().getSubject();
+      ).verify(claims, null);
+      return claims.getSubject();
     } catch (Exception e) {
       return null;
     }
@@ -208,11 +262,12 @@ public final class BearerAuthFilter extends HttpFilter {
   @Override
   protected void doFilter(HttpServletRequest req, HttpServletResponse res, FilterChain chain)
       throws IOException, ServletException {
+    String resource = PremiumFeatureAccessCheck.addressedResource(req);
     String header = req.getHeader("Authorization");
     String token = header != null && header.regionMatches(true, 0, "Bearer ", 0, 7) ? header.substring(7).trim() : null;
-    if (token == null) { challenge(res, "Missing bearer token"); return; }
+    if (token == null) { challenge(res, resource, "Missing bearer token"); return; }
     String sub = PremiumFeatureAccessCheck.verifyBearer(token);
-    if (sub == null) { challenge(res, "Token invalid or expired"); return; }
+    if (sub == null) { challenge(res, resource, "Token invalid or expired"); return; }
 
     var auth = new PremiumFeatureAccessCheck.PlugpassAuth(sub, token, new AtomicBoolean(false));
     req.setAttribute(PremiumFeatureAccessCheck.AUTH_ATTRIBUTE, auth);
@@ -220,18 +275,19 @@ public final class BearerAuthFilter extends HttpFilter {
     BufferingResponseWrapper buffer = new BufferingResponseWrapper(res); // overrides getWriter/getOutputStream only
     chain.doFilter(req, buffer);                                        // stateless transport: fully synchronous
     if (auth.reauthRequired().get() && !res.isCommitted()) {
-      challenge(res, "Access token no longer valid");                   // → the client re-authorizes and retries
+      challenge(res, resource, "Access token no longer valid");         // → the client re-authorizes and retries
       return;
     }
     buffer.replayTo(res); // status/headers passed through; body copied verbatim
   }
 
-  // error="invalid_token" exactly — the signal MCP clients treat as "needs OAuth".
-  private static void challenge(HttpServletResponse res, String description) throws IOException {
+  // The challenge for the addressed resource. error="invalid_token" exactly — the
+  // signal MCP clients treat as "needs OAuth".
+  private static void challenge(HttpServletResponse res, String resource, String description) throws IOException {
     res.setStatus(401);
-    res.setHeader("WWW-Authenticate", "Bearer realm=\"" + PremiumFeatureAccessCheck.resourceUrl()
+    res.setHeader("WWW-Authenticate", "Bearer realm=\"" + resource
         + "\", error=\"invalid_token\", error_description=\"" + description
-        + "\", resource_metadata=\"" + PremiumFeatureAccessCheck.prmUrl() + "\"");
+        + "\", resource_metadata=\"" + PremiumFeatureAccessCheck.prmUrl(resource) + "\"");
     res.setContentType("application/json");
     res.getWriter().write("{\"error\": \"invalid_token\", \"error_description\": \"" + description + "\"}");
   }
@@ -267,7 +323,7 @@ jetty.start();
 jetty.join();
 ```
 
-`PrmServlet` is a trivial `doGet` writing `{"resource": resourceUrl(), "authorization_servers": [issuer()], "bearer_methods_supported": ["header"]}` as `application/json` — unauthenticated.
+`PrmServlet` is a trivial `doGet` writing `{"resource": addressedResource(req), "authorization_servers": [issuer()], "bearer_methods_supported": ["header"]}` as `application/json` — unauthenticated.
 
 **Per-request identity inside a tool**: stateless handlers receive the transport context directly — `BiFunction<McpTransportContext, CallToolRequest, CallToolResult>`; read `var auth = (PlugpassAuth) ctx.get(PremiumFeatureAccessCheck.AUTH_ATTRIBUTE)`. On reauth: `auth.reauthRequired().set(true)`.
 

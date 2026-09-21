@@ -6,7 +6,7 @@ The publisher's server becomes an **OAuth-protected resource server**: every `/m
 
 1. **The server serves BOTH protocol eras from the one `/mcp` route.** A 2026-07-28 request goes to `createMcpHandler` (which owns `server/discover` and the per-request `_meta` envelope); a 2025-era request, identified by `isLegacyRequest`, goes to a `WebStandardStreamableHTTPServerTransport`. The client's UI capability rides the modern envelope — that is what the paywall-UI marker reads — and a host that gets only the legacy era never sends it. Never collapse this to one leg.
 2. **Both legs BUFFER their response** — `responseMode: 'json'` on the modern handler, `enableJsonResponse: true` on the legacy transport. The HTTP response then materializes only *after* every tool handler finished, which is what lets the route swap in a `401` when a tool discovered mid-call that the bearer is revoked (`reauth_required` from the Entitlement API). Streaming commits the `200` before the tool runs and the swap is impossible. Cost: request-scoped progress notifications are dropped — fine for tool servers. (The SDK's own `legacy: 'stateless'` fallback streams, which is why the legacy leg is constructed by hand instead.)
-3. **The audience is the baked `RESOURCE_URL`, never the request host.** The PRM `resource`, the JWT `aud` pin, and the challenge's `resource_metadata` all derive from it. This is what makes a locally-listening server accept real bearers minted for its public URL (the local test loop), and it can't drift behind proxies.
+3. **Every accepted audience comes from Plugpass, never from the request.** A bearer's `aud` must be the baked `RESOURCE_URL` or one of the retired URLs Plugpass reports for this server (the addresses it moved off, which old installs still call). The PRM `resource` and the challenge's `resource_metadata` name the URL the request was addressed to (`X-Forwarded-Host`, else `Host`) only when that URL is an accepted audience, else `RESOURCE_URL`. This is what makes a locally-listening server accept real bearers minted for its public URL (the local test loop), and what keeps a moved server working for installs of its old address.
 
 ```ts
 // premium-feature-access-check.ts — written once per server. Standalone.
@@ -18,7 +18,8 @@ const PLUGIN_ID = '<the plugin's Plugpass id>';
 const ISSUER = '<plugpass_issuer>';
 const JWKS_URL = '<plugpass_jwks_url>';
 const ENTITLEMENT_API_ORIGIN = '<entitlement_api_origin>';
-// This server's own public MCP URL — the JWT `aud` pin and the PRM `resource`.
+// This server's own public MCP URL — its current bearer audience and the PRM's
+// default `resource`.
 const RESOURCE_URL = '<this server's RESOURCE_URL>';
 // Where the Plugpass paywall for MCP Apps widgets loads from (the `ui_paywall`
 // layer — only on a server whose directive names it).
@@ -52,25 +53,76 @@ export function plugpassConfig(): PlugpassConfig {
 }
 
 export const prmPath = '/.well-known/oauth-protected-resource/mcp';
-export const prmUrl = (cfg: PlugpassConfig) => new URL(prmPath, cfg.resourceUrl).toString();
+export const prmUrl = (resource: string) => new URL(prmPath, resource).toString();
 
-// RFC 9728 protected-resource-metadata document (serve unauthenticated at prmPath).
-export function prmDocument(cfg: PlugpassConfig) {
+// The URLs this server moved off, which Plugpass reports so old installs keep
+// working. Fetched only when a bearer or a request names another address;
+// cached 5 minutes (1 minute after a failed fetch, which accepts nothing extra).
+const RETIRED_TTL_MS = 5 * 60 * 1000;
+const RETIRED_FAILURE_TTL_MS = 60 * 1000;
+let retired: { urls: ReadonlySet<string>; expiresAt: number } | null = null;
+let retiredFetch: Promise<ReadonlySet<string>> | null = null;
+
+export async function retiredAudiences(cfg: PlugpassConfig): Promise<ReadonlySet<string>> {
+  if (retired && retired.expiresAt > Date.now()) return retired.urls;
+  retiredFetch ??= (async () => {
+    let urls: ReadonlySet<string> = new Set();
+    let ttl = RETIRED_FAILURE_TTL_MS;
+    try {
+      const res = await fetch(
+        `${cfg.entitlementApiOrigin}/entitlement/retired-audiences?resource=${encodeURIComponent(cfg.resourceUrl)}`,
+        { signal: AbortSignal.timeout(5000) },
+      );
+      if (res.ok) {
+        const body = (await res.json()) as { retired?: unknown };
+        if (Array.isArray(body.retired)) {
+          urls = new Set(body.retired.filter((u): u is string => typeof u === 'string'));
+          ttl = RETIRED_TTL_MS;
+        }
+      }
+    } catch {
+      // Unreachable: accept only RESOURCE_URL until the retry.
+    }
+    retired = { urls, expiresAt: Date.now() + ttl };
+    return urls;
+  })().finally(() => {
+    retiredFetch = null;
+  });
+  return retiredFetch;
+}
+
+// The URL a request was addressed to — `X-Forwarded-Host` (a proxy on an old
+// address sets it), else its own host, on RESOURCE_URL's scheme and path — when
+// that URL is an accepted audience; otherwise RESOURCE_URL.
+export async function addressedResource(cfg: PlugpassConfig, request: Request): Promise<string> {
+  const current = new URL(cfg.resourceUrl);
+  const host = (request.headers.get('x-forwarded-host')?.split(',')[0] ?? new URL(request.url).host)
+    .trim()
+    .toLowerCase();
+  if (host === '' || host === current.host) return cfg.resourceUrl;
+  const candidate = `${current.protocol}//${host}${current.pathname}`;
+  return (await retiredAudiences(cfg)).has(candidate) ? candidate : cfg.resourceUrl;
+}
+
+// RFC 9728 protected-resource-metadata document (serve unauthenticated at
+// prmPath) for the addressed resource.
+export function prmDocument(cfg: PlugpassConfig, resource: string) {
   return {
-    resource: cfg.resourceUrl,
+    resource,
     authorization_servers: [cfg.issuer],
     bearer_methods_supported: ['header'] as const,
   };
 }
 
-// The 401 challenge. error="invalid_token" exactly — it's the signal MCP
-// clients treat as "needs OAuth"; other codes read as a broken server.
-export function unauthorized(cfg: PlugpassConfig, description: string): Response {
+// The 401 challenge for the addressed resource. error="invalid_token" exactly —
+// it's the signal MCP clients treat as "needs OAuth"; other codes read as a
+// broken server.
+export function unauthorized(resource: string, description: string): Response {
   return new Response(JSON.stringify({ error: 'invalid_token', error_description: description }), {
     status: 401,
     headers: {
       'content-type': 'application/json',
-      'www-authenticate': `Bearer realm="${cfg.resourceUrl}", error="invalid_token", error_description="${description}", resource_metadata="${prmUrl(cfg)}"`,
+      'www-authenticate': `Bearer realm="${resource}", error="invalid_token", error_description="${description}", resource_metadata="${prmUrl(resource)}"`,
     },
   });
 }
@@ -91,14 +143,19 @@ function getJwks(jwksUrl: string): JWTVerifyGetKey {
   return jwks;
 }
 
-// EdDSA-pinned (no alg-confusion downgrade), issuer exact, audience = the baked
-// RESOURCE_URL, exp enforced by jose. Returns the user id; throws on any failure.
+// EdDSA-pinned (no alg-confusion downgrade), issuer exact, exp enforced by jose,
+// audience = the baked RESOURCE_URL or one of this server's retired URLs.
+// Returns the user id; throws on any failure.
 export async function verifyBearer(token: string, cfg: PlugpassConfig): Promise<{ sub: string }> {
   const { payload } = await jwtVerify(token, getJwks(cfg.jwksUrl), {
     issuer: cfg.issuer,
-    audience: cfg.resourceUrl,
     algorithms: ['EdDSA'],
   });
+  const auds = typeof payload.aud === 'string' ? [payload.aud] : (payload.aud ?? []);
+  if (!auds.includes(cfg.resourceUrl)) {
+    const retiredUrls = await retiredAudiences(cfg);
+    if (!auds.some((aud) => retiredUrls.has(aud))) throw new Error('Audience not accepted');
+  }
   if (typeof payload.sub !== 'string' || !payload.sub) throw new Error('Missing sub claim');
   return { sub: payload.sub };
 }
@@ -314,19 +371,23 @@ function buildServer(cfg: PlugpassConfig, reauth: ReauthSignal): McpServer {
   return server;
 }
 
-app.get(prmPath, (c) => c.json(prmDocument(plugpassConfig())));
+app.get(prmPath, async (c) => {
+  const cfg = plugpassConfig();
+  return c.json(prmDocument(cfg, await addressedResource(cfg, c.req.raw)));
+});
 
 app.all('/mcp', async (c) => {
   const cfg = plugpassConfig();
+  const resource = await addressedResource(cfg, c.req.raw);
   // The gate: every method requires a valid bearer.
   const header = c.req.header('authorization');
-  if (!header?.toLowerCase().startsWith('bearer ')) return unauthorized(cfg, 'Missing bearer token');
+  if (!header?.toLowerCase().startsWith('bearer ')) return unauthorized(resource, 'Missing bearer token');
   const token = header.slice(7).trim();
   let sub: string;
   try {
     ({ sub } = await verifyBearer(token, cfg));
   } catch {
-    return unauthorized(cfg, 'Token invalid or expired');
+    return unauthorized(resource, 'Token invalid or expired');
   }
   // The verified identity every tool reads as `ctx.http.authInfo`.
   const authInfo: AuthInfo = { token, clientId: sub, scopes: [], extra: { sub } };
@@ -343,7 +404,7 @@ app.all('/mcp', async (c) => {
     await server.connect(transport);
     try {
       const res = await transport.handleRequest(c.req.raw, { authInfo });
-      if (reauth.triggered) return unauthorized(cfg, 'Token no longer valid; re-authenticate');
+      if (reauth.triggered) return unauthorized(resource, 'Token no longer valid; re-authenticate');
       return res;
     } finally {
       await transport.close();
@@ -358,7 +419,7 @@ app.all('/mcp', async (c) => {
   });
   try {
     const res = await handler.fetch(c.req.raw, { authInfo });
-    if (reauth.triggered) return unauthorized(cfg, 'Token no longer valid; re-authenticate');
+    if (reauth.triggered) return unauthorized(resource, 'Token no longer valid; re-authenticate');
     return res;
   } finally {
     await handler.close();
@@ -366,7 +427,7 @@ app.all('/mcp', async (c) => {
 });
 ```
 
-**Server composition — node/express (or bare `node:http`).** Same gate as middleware (set the challenge via `res.set('WWW-Authenticate', …).status(401).json(…)`, stash `req.auth`), then hand the web-standard `Request` to the identical two-leg body above through `getRequestListener` (`@hono/node-server`), so the reauth swap happens **before** anything is written to `res`:
+**Server composition — node/express (or bare `node:http`).** Same gate as middleware (set the challenge for `addressedResource` via `res.set('WWW-Authenticate', …).status(401).json(…)`, stash `req.auth`), then hand the web-standard `Request` to the identical two-leg body above through `getRequestListener` (`@hono/node-server`), so the reauth swap happens **before** anything is written to `res`:
 
 ```ts
 import { getRequestListener } from '@hono/node-server';
