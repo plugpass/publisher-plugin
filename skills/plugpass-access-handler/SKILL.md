@@ -2,16 +2,16 @@
 name: plugpass-access-handler
 description: Use this skill 1) when you are instructed to invoke it directly, 2) whenever any tool result includes PLUGPASS_PUBLISHER=true && UPDATE=recommended, or PLUGPASS_PUBLISHER=true && UPDATE=required.
 user-invocable: false
-allowed-tools: mcp__plugin_plugpass_plugpass-publisher__authenticate, AskUserQuestion, Bash(open:*), Bash(xdg-open:*), Bash(echo:*), Bash(claude:*), Bash(codex:*), PowerShell(Start-Process:*), PowerShell(Write-Output:*), Read, Skill(update-config)
+allowed-tools: mcp__plugin_plugpass_plugpass-publisher__authenticate, Bash(open:*), Bash(xdg-open:*), Bash(echo:*), Bash(claude:*), Bash(codex:*), PowerShell(Start-Process:*), PowerShell(Write-Output:*), Read, Skill(update-config)
 ---
 
 USER_INPUT_TOOL = A tool that presents the user a question with selectable options and returns their choice (e.g. `AskUserQuestion`, `ask_user_input_v0`, etc.) that can be used in the default session state (not limited to a certain mode, e.g. plan mode).
 
 TRIGGER_RESULT = the tool result already in context that triggered this skill, when one did — the Publisher MCP tool result carrying `PLUGPASS_PUBLISHER=true`.
 
-Present each USER_INPUT_TOOL prompt exactly as specified, setting each option's description to an empty string. For a prompt posted as a `>` block, a reply of an option's number or label selects that option. The names of the prompts (e.g. `ConnectChoice`) are used for guiding your logic flow only, and should not be communicated to the user.
+Every prompt below is a `>` block ending in numbered options; a reply of an option's number or label selects that option. Never use USER_INPUT_TOOL. The names of the prompts (e.g. `ConnectChoice`) are used for guiding your logic flow only, and should not be communicated to the user.
 
-The `>` blocks and USER_INPUT_TOOL prompt copy are messages for the user; everything else here is an instruction for you (or the main agent) to follow. Replace each {VARIABLE} in them with its value; never state a variable in its token form. Post each `>` block verbatim as your own message — nothing rephrased, summarized, or added before, within, or after it; no quote wrapping or added formatting; never the `>` characters themselves. Use whatever messaging method will be visible to the user (especially if a tool call will follow it in the same turn).
+The `>` blocks are messages for the user; everything else here is an instruction for you (or the main agent) to follow. Replace each {VARIABLE} in them with its value; never state a variable in its token form. Post each `>` block verbatim as your own message — nothing rephrased, summarized, or added before, within, or after it; no quote wrapping or added formatting; never the `>` characters themselves. Post them as ordinary reply text after the turn's last tool call, and end the turn there: never call a tool after posting them in the same turn.
 
 Any variables defined by tool presence should be assessed purely from its presence in your tool list (if not loaded, attempt to load it via tool search); never attempt to call a tool if not present.
 
@@ -96,37 +96,39 @@ Apply the Retry standing rule.
 
 ## If CODE_CLIENT=`cli`
 
-Present the `ConnectChoice` prompt with USER_INPUT_TOOL:
+Post the `ConnectChoice` prompt:
 
-- Prompt: Sign up or log in to Plugpass to continue.
-- Options:
-  - Sign up
-  - Log in
-  - Not now
+> Sign up or log in to Plugpass to continue.
+>
+> 1. Sign up
+> 2. Log in
+> 3. Not now
 
 ### If user answers `Sign up` to `ConnectChoice`
 
 AUTH_URL = the URL returned by `mcp__plugin_plugpass_plugpass-publisher__authenticate`, with `&mode=signup` appended.
 Open {AUTH_URL} with the OPEN_URL_TOOL.
 
-Then present the `SignInConfirm` prompt with USER_INPUT_TOOL in the same turn:
+Then post the `SignInConfirm` prompt in the same turn:
 
-- Prompt: Have you signed up?
-- Options:
-  - Yes
-  - Never mind
+>
+> Have you signed up?
+>
+> 1. Yes
+> 2. Never mind
 
 ### If user answers `Log in` to `ConnectChoice`
 
 AUTH_URL = the URL returned by `mcp__plugin_plugpass_plugpass-publisher__authenticate`, with `&mode=login` appended.
 Open {AUTH_URL} with the OPEN_URL_TOOL.
 
-Then present the `SignInConfirm` prompt with USER_INPUT_TOOL in the same turn:
+Then post the `SignInConfirm` prompt in the same turn:
 
-- Prompt: Have you logged in?
-- Options:
-  - Yes
-  - Never mind
+>
+> Have you logged in?
+>
+> 1. Yes
+> 2. Never mind
 
 ### If user answers `Yes` to `SignInConfirm`
 
@@ -138,7 +140,7 @@ Apply the Retry standing rule.
 >
 > Enter `/mcp`, then connect `plugpass-publisher` to sign in.
 
-Then post the `ConnectConfirm` prompt in the same turn (not via USER_INPUT_TOOL):
+Then post the `ConnectConfirm` prompt in the same turn:
 
 >
 > Have you signed in?
@@ -170,12 +172,13 @@ The Publisher MCP refused the call: the installed plugin is below the minimum su
 
 > The installed Plugpass plugin version ({INSTALLED_VERSION}) is no longer supported.
 
-Then present the `UpdateChoice` prompt with USER_INPUT_TOOL in the same turn:
+Then post the `UpdateChoice` prompt in the same turn:
 
-- Prompt: Update it now?
-- Options:
-  - Update
-  - Not now
+>
+> Update it now?
+>
+> 1. Update
+> 2. Not now
 
 ### If user answers `Update` to `UpdateChoice`
 
@@ -183,7 +186,7 @@ Run `claude plugin marketplace update plugpass-marketplace`.
 
 > Run `/reload-plugins` to finish updating.
 
-Then post the `ReloadConfirm` prompt in the same turn (not via USER_INPUT_TOOL):
+Then post the `ReloadConfirm` prompt in the same turn:
 
 >
 > Have you reloaded?
@@ -195,12 +198,13 @@ Then post the `ReloadConfirm` prompt in the same turn (not via USER_INPUT_TOOL):
 
 > Turn on auto-update for the Plugpass Marketplace to keep the plugin up to date with the latest features & fixes.
 
-Then present the `AutoUpdateChoice` prompt with USER_INPUT_TOOL in the same turn:
+Then post the `AutoUpdateChoice` prompt in the same turn:
 
-- Prompt: Turn on auto-update?
-- Options:
-  - Turn on
-  - Not now
+>
+> Turn on auto-update?
+>
+> 1. Turn on
+> 2. Not now
 
 ### If user answers `Turn on` to `AutoUpdateChoice`
 
@@ -220,23 +224,25 @@ Read `~/.claude/settings.json`.
 >
 > [View update instructions](https://plugpass.ai/update)
 
-Then present the `UpdateConfirm` prompt with USER_INPUT_TOOL in the same turn:
+Then post the `UpdateConfirm` prompt in the same turn:
 
-- Prompt: Have you updated?
-- Options:
-  - Yes
-  - Not now
+>
+> Have you updated?
+>
+> 1. Yes
+> 2. Not now
 
 #### If user answers `Yes` to `UpdateConfirm`
 
 > Press `cmd-R` (`ctrl-R` on Windows) to refresh the session to finish updating.
 
-Then present the `ReloadConfirm` prompt with USER_INPUT_TOOL in the same turn:
+Then post the `ReloadConfirm` prompt in the same turn:
 
-- Prompt: Have you refreshed?
-- Options:
-  - Yes
-  - Never mind
+>
+> Have you refreshed?
+>
+> 1. Yes
+> 2. Never mind
 
 #### If user answers `Yes` to `ReloadConfirm`
 
@@ -246,12 +252,13 @@ Apply the Retry standing rule.
 
 > The installed Plugpass plugin version ({INSTALLED_VERSION}) is no longer supported.
 
-Then present the `UpdateChoice` prompt with USER_INPUT_TOOL in the same turn:
+Then post the `UpdateChoice` prompt in the same turn:
 
-- Prompt: Update it now?
-- Options:
-  - Update
-  - Not now
+>
+> Update it now?
+>
+> 1. Update
+> 2. Not now
 
 #### If user answers `Update` to `UpdateChoice`
 
@@ -259,23 +266,25 @@ Run `claude plugin marketplace update plugpass-marketplace`.
 
 > Press `cmd-R` (`ctrl-R` on Windows) to refresh the session to finish updating.
 
-Then present the `ReloadConfirm` prompt with USER_INPUT_TOOL in the same turn:
+Then post the `ReloadConfirm` prompt in the same turn:
 
-- Prompt: Have you refreshed?
-- Options:
-  - Yes
-  - Never mind
+>
+> Have you refreshed?
+>
+> 1. Yes
+> 2. Never mind
 
 #### If user answers `Yes` to `ReloadConfirm`
 
 > Turn on auto-update for the Plugpass Marketplace to keep the plugin up to date with the latest features & fixes.
 
-Then present the `AutoUpdateChoice` prompt with USER_INPUT_TOOL in the same turn:
+Then post the `AutoUpdateChoice` prompt in the same turn:
 
-- Prompt: Turn on auto-update?
-- Options:
-  - Turn on
-  - Not now
+>
+> Turn on auto-update?
+>
+> 1. Turn on
+> 2. Not now
 
 #### If user answers `Turn on` to `AutoUpdateChoice`
 
@@ -343,12 +352,13 @@ Apply the Retry standing rule.
 >
 > Turn on auto-update for the Plugpass Marketplace to keep the plugin up to date with the latest features & fixes.
 
-Then present the `AutoUpdateChoice` prompt with USER_INPUT_TOOL in the same turn:
+Then post the `AutoUpdateChoice` prompt in the same turn:
 
-- Prompt: Turn on auto-update?
-- Options:
-  - Turn on
-  - Not now
+>
+> Turn on auto-update?
+>
+> 1. Turn on
+> 2. Not now
 
 ### If user answers `Turn on` to `AutoUpdateChoice`
 
