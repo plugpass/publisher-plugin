@@ -21,7 +21,7 @@ Any variables defined by tool presence should be assessed purely from its presen
 - NOT_CONNECTED = a `{CheckToolName}` tool is present in your tool list (under any connector prefix) ? `false` : `true`
 - PLATFORM = If your system instructions indicate an OpenAI product (Codex or ChatGPT), then `openai`; otherwise (an Anthropic / Claude product) `claude`.
 - If PLATFORM=`claude`:
-  - CLAUDE_PRODUCT = If your system instructions indicate your environment is Cowork, then `cowork`; if they indicate your environment is Claude Code, then `code`; otherwise `chat`.
+  - CLAUDE_PRODUCT = If your system instructions indicate your environment is Claude Code, then `code`; otherwise `claude`.
   - If CLAUDE_PRODUCT=`code`:
     - OS = If your system instructions indicate the platform is `darwin`, then `mac`; if `linux`, then `linux`; if `win32`, then `windows`.
     - CODE_CLIENT = If (OS=`mac` || OS=`linux`), then Bash `echo "CLAUDE_CODE_ENTRYPOINT=$CLAUDE_CODE_ENTRYPOINT"`; if OS=`windows`, then PowerShell `Write-Output "CLAUDE_CODE_ENTRYPOINT=$env:CLAUDE_CODE_ENTRYPOINT"` (expected value: `cli` || `claude-desktop` || `remote`)
@@ -99,7 +99,7 @@ Then post the `ConnectConfirm` prompt in the same turn:
 
 Apply the Retry standing rule.
 
-## If (CLAUDE_PRODUCT=`chat` || CLAUDE_PRODUCT=`cowork`)
+## If CLAUDE_PRODUCT=`claude`
 
 > Sign up or log in to {PluginDisplayName} to use this feature.
 >
@@ -325,9 +325,9 @@ Respond to the user's message as appropriate.
 
 ## If CODE_CLIENT=`claude-desktop`
 
-Read `~/.claude/settings.json`. If it contains an `extraKnownMarketplaces.{MarketplaceCliName}` entry, follow the `If CODE_CLIENT=cli` section's instructions; if the entry or file is absent, follow the `If (CLAUDE_PRODUCT=chat || CLAUDE_PRODUCT=cowork || CODE_CLIENT=remote)` section's instructions.
+Read `~/.claude/settings.json`. If it contains an `extraKnownMarketplaces.{MarketplaceCliName}` entry, follow the `If CODE_CLIENT=cli` section's instructions; if the entry or file is absent, follow the `If (CLAUDE_PRODUCT=claude || CODE_CLIENT=remote)` section's instructions.
 
-## If (CLAUDE_PRODUCT=`chat` || CLAUDE_PRODUCT=`cowork` || CODE_CLIENT=`remote`)
+## If (CLAUDE_PRODUCT=`claude` || CODE_CLIENT=`remote`)
 
 > The {PluginDisplayName} plugin is out of date.
 >

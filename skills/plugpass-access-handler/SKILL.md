@@ -18,7 +18,7 @@ Any variables defined by tool presence should be assessed purely from its presen
 - NOT_CONNECTED = a `plugpass_sync_plugin` tool is present in your tool list (under any connector prefix) ? `false` : `true`
 - PLATFORM = If your system instructions indicate an OpenAI product (Codex or ChatGPT), then `openai`; otherwise (an Anthropic / Claude product) `claude`.
 - If PLATFORM=`claude`:
-  - CLAUDE_PRODUCT = If your system instructions indicate your environment is Cowork, then `cowork`; if they indicate your environment is Claude Code, then `code`; otherwise `chat`.
+  - CLAUDE_PRODUCT = If your system instructions indicate your environment is Claude Code, then `code`; otherwise `claude`.
   - If CLAUDE_PRODUCT=`code`:
     - OS = If your system instructions indicate the platform is `darwin`, then `mac`; if `linux`, then `linux`; if `win32`, then `windows`.
     - CODE_CLIENT = If (OS=`mac` || OS=`linux`), then Bash `echo "CLAUDE_CODE_ENTRYPOINT=$CLAUDE_CODE_ENTRYPOINT"`; if OS=`windows`, then PowerShell `Write-Output "CLAUDE_CODE_ENTRYPOINT=$env:CLAUDE_CODE_ENTRYPOINT"` (expected value: `cli` || `claude-desktop` || `remote`)
@@ -91,34 +91,6 @@ Then post the `ConnectConfirm` prompt in the same turn:
 > 2. Not now
 
 ### If user answers `Yes` to `ConnectConfirm`
-
-Apply the Retry standing rule.
-
-## If CLAUDE_PRODUCT=`cowork`
-
-> Sign up or log in to Plugpass to continue.
->
-> [Sign up](https://plugpass.ai/signup?connect=web&platform=anthropic)&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;[Log in](https://plugpass.ai/login?connect=web&platform=anthropic)
-
-Then present the `ConnectConfirm` prompt with USER_INPUT_TOOL in the same turn:
-
-- Prompt: Have you signed in?
-- Options:
-  - Yes
-  - Not now
-
-### If user answers `Yes` to `ConnectConfirm`
-
-> Press `cmd-R` (`ctrl-R` on Windows) to refresh the session to continue.
-
-Then present the `RefreshConfirm` prompt with USER_INPUT_TOOL in the same turn:
-
-- Prompt: Have you refreshed?
-- Options:
-  - Yes
-  - Cancel setup
-
-### If user answers `Yes` to `RefreshConfirm`
 
 Apply the Retry standing rule.
 

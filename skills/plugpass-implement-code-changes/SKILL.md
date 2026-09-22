@@ -25,7 +25,7 @@ Unlike `plugpass-sync-plugin`, this skill has **no mode-check** — by the time 
 
 **Presenting copy.** A `>` block is finished copy; the `>` characters delimit it here and are never part of it. Reproduce the text exactly — substituting each `{VARIABLE}` with its value — and never print the `>` characters, restyle the wording, or wrap it in a quote block. The surrounding step says where the copy goes: where it says to tell the publisher something, post it as your own message with nothing of your own before or after it, by whatever messaging method will be visible to them (especially if a tool call will follow it in the same turn). Copy given inline in double quotes is delivered the same way, without the quote marks.
 
-- PUBLISHER_PLUGIN_VERSION = `0.0.11` (stamped by the release pipeline). Include it as `publisher_plugin_version` on every Publisher MCP tool call in this skill.
+- PUBLISHER_PLUGIN_VERSION = `0.0.12` (stamped by the release pipeline). Include it as `publisher_plugin_version` on every Publisher MCP tool call in this skill.
 - USER_INPUT_TOOL = A tool that presents the user a question with selectable options and returns their choice (e.g. `AskUserQuestion`, `ask_user_input_v0`, etc.) that can be used in the default session state (not limited to a certain mode, e.g. plan mode). Where a prompt below calls for USER_INPUT_TOOL and no such tool is available, ask the question in chat and wait for the reply.
 - PLATFORM = If your system instructions indicate an OpenAI product (Codex or ChatGPT), then `openai`; otherwise (an Anthropic / Claude product) `claude`.
 - SKILL_PREFIX = If PLATFORM=`openai`, then `$`; otherwise `/`. (How the publisher types a skill invocation in their client — every typed command below renders through it.)
@@ -187,7 +187,7 @@ Tell the publisher, interpolating that entry's fields:
 
 > This plugin supports the {products_label}, and they need a {manifest_label} (`{path}`) that this repo doesn't have.
 >
-> Two ways forward: create the manifest, or deselect the {products_label} on the plugin's Distribution page (https://plugpass.ai/dashboard/plugin/{plugin_slug}/distribution).
+> Two ways forward: create the manifest, or deselect the {products_label} on the plugin's Install page (https://plugpass.ai/dashboard/plugin/{plugin_slug}/install).
 
 Then ask with USER_INPUT_TOOL "Want help creating it?", offering "Create it now" and "I'll take care of it later".
 
