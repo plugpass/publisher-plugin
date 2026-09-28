@@ -25,7 +25,7 @@ Unlike `plugpass-sync-plugin`, this skill has **no mode-check** — by the time 
 
 **Presenting copy.** A `>` block is finished copy; the `>` characters delimit it here and are never part of it. Reproduce the text exactly — substituting each `{VARIABLE}` with its value — and never print the `>` characters, restyle the wording, or wrap it in a quote block. The surrounding step says where the copy goes: where it says to tell the publisher something, post it as your own message with nothing of your own before or after it, by whatever messaging method will be visible to them (especially if a tool call will follow it in the same turn). Copy given inline in double quotes is delivered the same way, without the quote marks.
 
-- PUBLISHER_PLUGIN_VERSION = `0.0.13` (stamped by the release pipeline). Include it as `publisher_plugin_version` on every Publisher MCP tool call in this skill.
+- PUBLISHER_PLUGIN_VERSION = `0.0.14` (stamped by the release pipeline). Include it as `publisher_plugin_version` on every Publisher MCP tool call in this skill.
 - USER_INPUT_TOOL = A tool that presents the user a question with selectable options and returns their choice (e.g. `AskUserQuestion`, `ask_user_input_v0`, etc.) that can be used in the default session state (not limited to a certain mode, e.g. plan mode). Where a prompt below calls for USER_INPUT_TOOL and no such tool is available, ask the question in chat and wait for the reply.
 - PLATFORM = If your system instructions indicate an OpenAI product (Codex or ChatGPT), then `openai`; otherwise (an Anthropic / Claude product) `claude`.
 - SKILL_PREFIX = If PLATFORM=`openai`, then `$`; otherwise `/`. (How the publisher types a skill invocation in their client — every typed command below renders through it.)
@@ -167,17 +167,26 @@ Report **only successes** — a half-done or partially-blocked run still records
 
 Run this **only when the implementation is fully complete** — every targeted component successfully implemented, nothing failed or left pending.
 
-If anything is incomplete (a component with no local file, any component you couldn't bring to its end state, or a `{missing-manifests}` entry still missing), do **not** open the URL or post the message below. Surface what's blocking and work through it with the publisher until every component is implemented; this handoff fires only once a run reaches full completion (possibly a later re-run, after they've resolved the blocker).
+If anything is incomplete (a component with no local file, any component you couldn't bring to its end state, or a `{missing-manifests}` entry still missing), do **not** post the message below. Surface what's blocking and work through it with the publisher until every component is implemented; this handoff fires only once a run reaches full completion (possibly a later re-run, after they've resolved the blocker).
 
-Once everything is implemented, open https://plugpass.ai/dashboard/plugin/{plugin_slug}/publish with the OPEN_URL_TOOL, then give the publisher this closing message verbatim (don't add a deploy checklist — the publish page owns it):
+- PUBLISH_URL = `https://plugpass.ai/dashboard/plugin/{plugin_slug}/publish`
+- MCP_TOOL_CHANGES = The server set (Step 3) is non-empty and `last_published_plugin_version` (Step 2) is not null.
 
-> The monetization changes have been implemented.
+Once everything is implemented, give the publisher this closing message verbatim, including the third paragraph only when MCP_TOOL_CHANGES (don't add a deploy checklist — the publish page owns it):
+
+> All code changes have been implemented, but they aren't live to your users yet.
 >
-> I'd recommend reviewing them now, but you should **wait to merge/deploy them** until after you've published the monetization changes in Plugpass.
+> You can either [publish]({PUBLISH_URL}) to make your changes live to your users, or test them first.
 >
-> Next, return to your browser to publish your changes in Plugpass.
+> If you've added new premium feature limits to your MCP tools, you won't be able to test them until you've deployed your MCP server changes. Once you deploy them, you'll be able to test your MCP tools' new premium feature limits in test mode, but rest assured that they won't be enforced for real users until you publish your changes in Plugpass.
+>
+> Would you like to test the new user experience for your plugin users?
 
-Then end the skill.
+Then ask with USER_INPUT_TOOL, offering "Yes", "Yes, but deploy my MCP tool changes first" (only when MCP_TOOL_CHANGES), and "No":
+
+- **Yes** — invoke the `plugpass-test-plugin` skill, and end this skill when it returns.
+- **Yes, but deploy my MCP tool changes first** — deploy each server in the server set with its repo's own deploy command (ask the publisher for it when none is evident), then invoke the `plugpass-test-plugin` skill, and end this skill when it returns.
+- **No** — open PUBLISH_URL with the OPEN_URL_TOOL, then end the skill.
 
 ## Missing manifest instructions
 
