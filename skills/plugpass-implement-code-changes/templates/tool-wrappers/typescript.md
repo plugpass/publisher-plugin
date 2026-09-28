@@ -1,12 +1,13 @@
 # TypeScript scaffolding template
 
-The publisher's server becomes an **OAuth-protected resource server**: every `/mcp` request carries `Authorization: Bearer …`, validated locally against Plugpass's JWKS with `jose`; requests without a valid bearer get the `401` + `WWW-Authenticate` challenge; the RFC 9728 PRM document serves at `/.well-known/oauth-protected-resource/mcp`. Emitted as standalone source in the publisher's repo (no platform-package dependency). Version pins: `@modelcontextprotocol/server` **^2.0.0** (the v2 line — it is what implements protocol 2026-07-28; the 1.x `@modelcontextprotocol/sdk` line does not, and a server on it serves the legacy era only), `jose` ^6.2.3 (Node ≥ 20 or Workers), `hono` ^4.7.0 for Hono servers, `zod` v4.
+The publisher's server becomes an **OAuth-protected resource server**: a `/mcp` request's `Authorization: Bearer …` is validated locally against Plugpass's JWKS with `jose`; once the plugin is published, requests without a valid bearer get the `401` + `WWW-Authenticate` challenge; the same transport at `/mcp/test` challenges from the first deploy; the RFC 9728 PRM documents serve at `/.well-known/oauth-protected-resource/mcp` and `/.well-known/oauth-protected-resource/mcp/test`. Emitted as standalone source in the publisher's repo (no platform-package dependency). Version pins: `@modelcontextprotocol/server` **^2.0.0** (the v2 line — it is what implements protocol 2026-07-28; the 1.x `@modelcontextprotocol/sdk` line does not, and a server on it serves the legacy era only), `jose` ^6.2.3 (Node ≥ 20 or Workers), `hono` ^4.7.0 for Hono servers, `zod` v4.
 
-**Three structural decisions carry the whole design — never undo them:**
+**Four structural decisions carry the whole design — never undo them:**
 
 1. **The server serves BOTH protocol eras from the one `/mcp` route.** A 2026-07-28 request goes to `createMcpHandler` (which owns `server/discover` and the per-request `_meta` envelope); a 2025-era request, identified by `isLegacyRequest`, goes to a `WebStandardStreamableHTTPServerTransport`. The client's UI capability rides the modern envelope — that is what the paywall-UI marker reads — and a host that gets only the legacy era never sends it. Never collapse this to one leg.
 2. **Both legs BUFFER their response** — `responseMode: 'json'` on the modern handler, `enableJsonResponse: true` on the legacy transport. The HTTP response then materializes only *after* every tool handler finished, which is what lets the route swap in a `401` when a tool discovered mid-call that the bearer is revoked (`reauth_required` from the Entitlement API). Streaming commits the `200` before the tool runs and the swap is impossible. Cost: request-scoped progress notifications are dropped — fine for tool servers. (The SDK's own `legacy: 'stateless'` fallback streams, which is why the legacy leg is constructed by hand instead.)
-3. **Every accepted audience comes from Plugpass, never from the request.** A bearer's `aud` must be the baked `RESOURCE_URL` or one of the retired URLs Plugpass reports for this server (the addresses it moved off, which old installs still call). The PRM `resource` and the challenge's `resource_metadata` name the URL the request was addressed to (`X-Forwarded-Host`, else `Host`) only when that URL is an accepted audience, else `RESOURCE_URL`. This is what makes a locally-listening server accept real bearers minted for its public URL (the local test loop), and what keeps a moved server working for installs of its old address.
+3. **Every accepted audience comes from Plugpass, never from the request.** A bearer's `aud` must be the path's own resource — the baked `RESOURCE_URL` at `/mcp`, `{RESOURCE_URL}/test` at `/mcp/test` — or one of the retired URLs Plugpass reports for this server (the addresses it moved off, which old installs still call) in the same form. The two never cross. The PRM `resource` and the challenge's `resource_metadata` name the URL the request was addressed to (`X-Forwarded-Host`, else `Host`) only when that URL is an accepted audience, else `RESOURCE_URL` — with the `/test` suffix at the test path. This is what makes a locally-listening server accept real bearers minted for its public URL (the local test loop), and what keeps a moved server working for installs of its old address.
+4. **The `/mcp` gate is armed by publish, and only by publish.** `enforced()` answers whether the plugin has a published version — fetched from Plugpass before the first request is handled, cached five minutes and refreshed in the background, keyed by `RESOURCE_URL` and nothing else, final once `true`, strict while there is no answer. Off, `/mcp` challenges nobody: a valid bearer is handled as when on, a missing (or malformed, or expired) bearer means no identity, and every tool states what it does with none. The test path never consults it.
 
 ```ts
 // premium-feature-access-check.ts — written once per server. Standalone.
@@ -52,8 +53,15 @@ export function plugpassConfig(): PlugpassConfig {
   };
 }
 
+// The test path: the same transport, strictly gated from the first deploy, for
+// a resource of its own — `{RESOURCE_URL}/test` — that Plugpass mints only to
+// the plugin's test users.
+export const TEST_PATH_SUFFIX = '/test';
 export const prmPath = '/.well-known/oauth-protected-resource/mcp';
-export const prmUrl = (resource: string) => new URL(prmPath, resource).toString();
+export const testPrmPath = `${prmPath}${TEST_PATH_SUFFIX}`;
+// The PRM document URL for a resource: the test document for a test resource.
+export const prmUrl = (resource: string) =>
+  new URL(resource.endsWith(TEST_PATH_SUFFIX) ? testPrmPath : prmPath, resource).toString();
 
 // The URLs this server moved off, which Plugpass reports so old installs keep
 // working. Fetched only when a bearer or a request names another address;
@@ -91,21 +99,81 @@ export async function retiredAudiences(cfg: PlugpassConfig): Promise<ReadonlySet
   return retiredFetch;
 }
 
+// The enforcement state — whether the plugin is published, the one input that
+// turns the /mcp gate on. Fetched before the first request a process serves is
+// handled (one shared in-flight request), cached 5 minutes and refreshed in
+// the background after that; keyed by RESOURCE_URL and by nothing in any
+// request. `true` is final for the process. A failed fetch keeps the last
+// answer; with no answer yet the gate is strict, and the fetch is retried
+// after 1 minute.
+const ENFORCEMENT_TTL_MS = 5 * 60 * 1000;
+const ENFORCEMENT_RETRY_MS = 60 * 1000;
+let enforcement: { enforced: boolean; expiresAt: number } | null = null;
+let enforcementAttemptAt = 0;
+let enforcementFetch: Promise<void> | null = null;
+
+function refreshEnforcement(cfg: PlugpassConfig): Promise<void> {
+  // One attempt at a time; an attempt older than the retry interval is
+  // abandoned rather than waited on.
+  if (enforcementFetch !== null && Date.now() < enforcementAttemptAt) return enforcementFetch;
+  if (Date.now() < enforcementAttemptAt) return Promise.resolve();
+  enforcementAttemptAt = Date.now() + ENFORCEMENT_RETRY_MS;
+  const attempt = (async () => {
+    try {
+      const res = await fetch(
+        `${cfg.entitlementApiOrigin}/entitlement/enforcement?resource=${encodeURIComponent(cfg.resourceUrl)}`,
+        { signal: AbortSignal.timeout(5000) },
+      );
+      if (res.ok) {
+        const body = (await res.json()) as { enforced?: unknown };
+        if (typeof body.enforced === 'boolean') {
+          enforcement = { enforced: body.enforced, expiresAt: Date.now() + ENFORCEMENT_TTL_MS };
+        }
+      }
+    } catch {
+      // Unreachable: the last answer stands (strict while there is none) until the retry.
+    }
+  })().finally(() => {
+    if (enforcementFetch === attempt) enforcementFetch = null;
+  });
+  enforcementFetch = attempt;
+  return attempt;
+}
+
+export async function enforced(cfg: PlugpassConfig): Promise<boolean> {
+  const answer = enforcement;
+  if (answer !== null && answer.enforced) return true; // final
+  if (answer === null) {
+    // No answer yet: learn it before handling the request; strict until it arrives.
+    await refreshEnforcement(cfg);
+    return enforcement === null ? true : enforcement.enforced;
+  }
+  // Off: serve the cached answer, refreshing a stale one in the background.
+  if (Date.now() >= answer.expiresAt) void refreshEnforcement(cfg);
+  return answer.enforced;
+}
+
 // The URL a request was addressed to — `X-Forwarded-Host` (a proxy on an old
 // address sets it), else its own host, on RESOURCE_URL's scheme and path — when
-// that URL is an accepted audience; otherwise RESOURCE_URL.
-export async function addressedResource(cfg: PlugpassConfig, request: Request): Promise<string> {
+// that URL is an accepted audience; otherwise RESOURCE_URL. At the test path,
+// the same with the `/test` suffix.
+export async function addressedResource(
+  cfg: PlugpassConfig,
+  request: Request,
+  test = false,
+): Promise<string> {
+  const suffix = test ? TEST_PATH_SUFFIX : '';
   const current = new URL(cfg.resourceUrl);
   const host = (request.headers.get('x-forwarded-host')?.split(',')[0] ?? new URL(request.url).host)
     .trim()
     .toLowerCase();
-  if (host === '' || host === current.host) return cfg.resourceUrl;
+  if (host === '' || host === current.host) return cfg.resourceUrl + suffix;
   const candidate = `${current.protocol}//${host}${current.pathname}`;
-  return (await retiredAudiences(cfg)).has(candidate) ? candidate : cfg.resourceUrl;
+  return ((await retiredAudiences(cfg)).has(candidate) ? candidate : cfg.resourceUrl) + suffix;
 }
 
 // RFC 9728 protected-resource-metadata document (serve unauthenticated at
-// prmPath) for the addressed resource.
+// prmPath, and at testPrmPath for the test resource) for the addressed resource.
 export function prmDocument(cfg: PlugpassConfig, resource: string) {
   return {
     resource,
@@ -144,17 +212,26 @@ function getJwks(jwksUrl: string): JWTVerifyGetKey {
 }
 
 // EdDSA-pinned (no alg-confusion downgrade), issuer exact, exp enforced by jose,
-// audience = the baked RESOURCE_URL or one of this server's retired URLs.
-// Returns the user id; throws on any failure.
-export async function verifyBearer(token: string, cfg: PlugpassConfig): Promise<{ sub: string }> {
+// audience = the path's own resource — the baked RESOURCE_URL, or its `/test`
+// form at the test path — or one of this server's retired URLs in the same
+// form. A canonical token is refused at the test path and a test token at the
+// canonical path. Returns the user id; throws on any failure.
+export async function verifyBearer(
+  token: string,
+  cfg: PlugpassConfig,
+  test = false,
+): Promise<{ sub: string }> {
   const { payload } = await jwtVerify(token, getJwks(cfg.jwksUrl), {
     issuer: cfg.issuer,
     algorithms: ['EdDSA'],
   });
+  const suffix = test ? TEST_PATH_SUFFIX : '';
   const auds = typeof payload.aud === 'string' ? [payload.aud] : (payload.aud ?? []);
-  if (!auds.includes(cfg.resourceUrl)) {
+  if (!auds.includes(cfg.resourceUrl + suffix)) {
     const retiredUrls = await retiredAudiences(cfg);
-    if (!auds.some((aud) => retiredUrls.has(aud))) throw new Error('Audience not accepted');
+    const retiredForm = (aud: string) =>
+      aud.endsWith(suffix) && retiredUrls.has(aud.slice(0, aud.length - suffix.length));
+    if (!auds.some(retiredForm)) throw new Error('Audience not accepted');
   }
   if (typeof payload.sub !== 'string' || !payload.sub) throw new Error('Missing sub claim');
   return { sub: payload.sub };
@@ -162,7 +239,9 @@ export async function verifyBearer(token: string, cfg: PlugpassConfig): Promise<
 
 // The AuthInfo the route builds from a verified bearer and passes to the handler;
 // `sub` (the end user's id) rides `extra`. These readers keep the tools free of
-// casts: `subFrom` returns the verified user id, `bearerFrom` the raw token.
+// casts: `subFrom` returns the verified user id, `bearerFrom` the raw token —
+// and both are empty on a request that carries no identity (the /mcp gate off,
+// before the plugin is published), which every tool handles explicitly.
 export function subFrom(authInfo: AuthInfo | undefined): string {
   const sub = authInfo?.extra?.sub;
   return typeof sub === 'string' ? sub : '';
@@ -346,14 +425,15 @@ export function widgetCallable(toolMeta: ToolMeta): boolean {
 }
 
 // The check proxy's unavailable grant — Plugpass could not answer, so the check
-// grants and the paid skill runs. A wrapped tool needs no equivalent: it just
-// runs its body.
+// grants and the paid skill runs; and its answer to a request with no identity
+// (the /mcp gate off), composed here without reaching Plugpass. A wrapped tool
+// needs no equivalent: it just runs its body.
 export function unavailableCheckGrant(): CallToolResult {
   return { content: [{ type: 'text', text: '<the unavailable grant text from TOOLS.md>' }] };
 }
 ```
 
-**Server composition — the both-eras route.** One `/mcp` route, one gate, two legs. A fresh `McpServer` per request (stateless), registering every tool with this request's `ReauthSignal`:
+**Server composition — the both-eras route.** One handler mounted at `/mcp` and `/mcp/test`, one gate, two legs. A fresh `McpServer` per request (stateless), registering every tool with this request's `ReauthSignal`:
 
 ```ts
 import {
@@ -375,27 +455,44 @@ app.get(prmPath, async (c) => {
   const cfg = plugpassConfig();
   return c.json(prmDocument(cfg, await addressedResource(cfg, c.req.raw)));
 });
-
-app.all('/mcp', async (c) => {
+app.get(testPrmPath, async (c) => {
   const cfg = plugpassConfig();
-  const resource = await addressedResource(cfg, c.req.raw);
-  // The gate: every method requires a valid bearer.
-  const header = c.req.header('authorization');
-  if (!header?.toLowerCase().startsWith('bearer ')) return unauthorized(resource, 'Missing bearer token');
-  const token = header.slice(7).trim();
-  let sub: string;
-  try {
-    ({ sub } = await verifyBearer(token, cfg));
-  } catch {
-    return unauthorized(resource, 'Token invalid or expired');
+  return c.json(prmDocument(cfg, await addressedResource(cfg, c.req.raw, true)));
+});
+
+app.all('/mcp', (c) => handleMcp(c.req.raw, false));
+app.all(`/mcp${TEST_PATH_SUFFIX}`, (c) => handleMcp(c.req.raw, true));
+
+async function handleMcp(request: Request, test: boolean): Promise<Response> {
+  const cfg = plugpassConfig();
+  const resource = await addressedResource(cfg, request, test);
+  // The gate: the test path is strict from the first deploy; /mcp challenges
+  // only while the plugin is published. Off, a request with no valid bearer is
+  // handled with no identity — never challenged.
+  const strict = test || (await enforced(cfg));
+  const header = request.headers.get('authorization');
+  let authInfo: AuthInfo | undefined;
+  if (header?.toLowerCase().startsWith('bearer ')) {
+    const token = header.slice(7).trim();
+    try {
+      const { sub } = await verifyBearer(token, cfg, test);
+      // The verified identity every tool reads as `ctx.http.authInfo`.
+      authInfo = { token, clientId: sub, scopes: [], extra: { sub } };
+    } catch {
+      if (strict) return unauthorized(resource, 'Token invalid or expired');
+      // Off: a malformed or expired bearer is no bearer.
+    }
+  } else if (strict) {
+    return unauthorized(resource, 'Missing bearer token');
   }
-  // The verified identity every tool reads as `ctx.http.authInfo`.
-  const authInfo: AuthInfo = { token, clientId: sub, scopes: [], extra: { sub } };
   const reauth: ReauthSignal = { triggered: false };
+  // The verified identity, when there is one, rides each leg's request options
+  // to the tool's `ctx.http.authInfo`; with none the tools see no authInfo.
+  const requestOptions = authInfo === undefined ? {} : { authInfo };
 
   // 2025-era requests: a buffered streamable transport. (The modern handler owns
   // `server/discover` and the per-request envelope, so it must not see these.)
-  if (await isLegacyRequest(c.req.raw)) {
+  if (await isLegacyRequest(request)) {
     const server = buildServer(cfg, reauth);
     const transport = new WebStandardStreamableHTTPServerTransport({
       sessionIdGenerator: undefined, // stateless
@@ -403,7 +500,7 @@ app.all('/mcp', async (c) => {
     });
     await server.connect(transport);
     try {
-      const res = await transport.handleRequest(c.req.raw, { authInfo });
+      const res = await transport.handleRequest(request, requestOptions);
       if (reauth.triggered) return unauthorized(resource, 'Token no longer valid; re-authenticate');
       return res;
     } finally {
@@ -418,24 +515,26 @@ app.all('/mcp', async (c) => {
     responseMode: 'json',
   });
   try {
-    const res = await handler.fetch(c.req.raw, { authInfo });
+    const res = await handler.fetch(request, requestOptions);
     if (reauth.triggered) return unauthorized(resource, 'Token no longer valid; re-authenticate');
     return res;
   } finally {
     await handler.close();
   }
-});
+}
 ```
 
-**Server composition — node/express (or bare `node:http`).** Same gate as middleware (set the challenge for `addressedResource` via `res.set('WWW-Authenticate', …).status(401).json(…)`, stash `req.auth`), then hand the web-standard `Request` to the identical two-leg body above through `getRequestListener` (`@hono/node-server`), so the reauth swap happens **before** anything is written to `res`:
+**Server composition — node/express (or bare `node:http`).** Hand each path's web-standard `Request` to the identical `handleMcp` above through `getRequestListener` (`@hono/node-server`) — the gate, both legs, and the reauth swap then run **before** anything is written to `res`:
 
 ```ts
 import { getRequestListener } from '@hono/node-server';
 
-app.all('/mcp', requireAuthExpress, async (req, res) => {
-  const listener = getRequestListener((webReq) => handleMcp(webReq, req.auth)); // the body above
-  await listener(req, res);
-});
+for (const [path, test] of [['/mcp', false], [`/mcp${TEST_PATH_SUFFIX}`, true]] as const) {
+  app.all(path, async (req, res) => {
+    const listener = getRequestListener((webReq) => handleMcp(webReq, test)); // the body above
+    await listener(req, res);
+  });
+}
 ```
 
 **The check proxy tool (check host only).** A pure pipe — never parse or reformat `result_text` — plus the paywall's read-only probe:
@@ -469,7 +568,9 @@ export function registerCheckPremiumAccess(server: McpServer, cfg: PlugpassConfi
     },
     async (args, ctx) => {
       const bearer = bearerFrom(ctx.http?.authInfo);
-      if (!bearer) return unavailableCheckGrant(); // unreachable behind the gate
+      // No identity — the /mcp gate off, before the plugin is published: the
+      // one answer the proxy composes itself, without reaching Plugpass.
+      if (!bearer) return unavailableCheckGrant();
       // The paywall's read-only probe: asks whether this user is entitled NOW,
       // consuming nothing (check_remaining, never check_premium_access), and
       // answers in a code that is not a check result — no PLUGPASS_PLUGIN, no
@@ -535,31 +636,40 @@ server.registerTool(
   async (args, ctx) => {
     const bearer = bearerFrom(ctx.http?.authInfo);
     const sub = subFrom(ctx.http?.authInfo);
-    const r: EntitlementResult = bearer
-      ? await entitlement(bearer, { plugin_id: cfg.pluginId, feature_id: PAID_TOOL_FEATURE_ID }, 'track_usage', cfg)
-      : { status: 'unavailable' };
-    if (r.status === 'reauth_required') { reauth.triggered = true; return { content: [{ type: 'text', text: 'Re-authentication required.' }] }; }
-    // The denial names this call (the tool's name and its actual arguments); the
-    // renderer reads the tool's own registered `_meta` (its widget, who may call
-    // it) and the request's envelope: never a baked per-tool constant.
-    if (r.status === 'non_authorized') {
-      return nonAuthorizedToolResponse(
-        r,
-        { name: 'paid_tool', arguments: args },
-        PAID_TOOL_META,
-        ctx.mcpReq.envelope,
-        cfg,
-        PAID_TOOL_FEATURE_ID,
-      );
+    // No bearer is the /mcp gate off (the plugin unpublished): the tool runs as
+    // it did before Plugpass, with no entitlement call. With one, consume.
+    if (bearer !== undefined) {
+      const r = await entitlement(bearer, { plugin_id: cfg.pluginId, feature_id: PAID_TOOL_FEATURE_ID }, 'track_usage', cfg);
+      if (r.status === 'reauth_required') { reauth.triggered = true; return { content: [{ type: 'text', text: 'Re-authentication required.' }] }; }
+      // The denial names this call (the tool's name and its actual arguments); the
+      // renderer reads the tool's own registered `_meta` (its widget, who may call
+      // it) and the request's envelope: never a baked per-tool constant.
+      if (r.status === 'non_authorized') {
+        return nonAuthorizedToolResponse(
+          r,
+          { name: 'paid_tool', arguments: args },
+          PAID_TOOL_META,
+          ctx.mcpReq.envelope,
+          cfg,
+          PAID_TOOL_FEATURE_ID,
+        );
+      }
+      // `ok` runs the body; `unavailable` consumed nothing and grants.
     }
-    /* …existing tool body — keyed / scoped to `sub`; `unavailable` consumed nothing and grants… */
+    /* …existing tool body — keyed / scoped to `sub` (empty with no bearer)… */
   },
 );
 ```
 
 **Paired-tool add side** (`operation: add`): same shape, and `feature_id: '<the tool's own plugpass_id>'` exactly as for a solo tool (its `tool_` prefix carries the feature type) — every gated artifact bakes its own component's id, and the `entitlement` subfield is identity, never a `feature_id`. Always **`check_remaining`**, passing the user's current count from the publisher's own store (scoped to `sub`) as `current_count` — see TOOLS.md → Reading the user's current count.
 
-**Identity tool** (the paired remove side, or any per-user free tool): no Entitlement API call at all — read `subFrom(ctx.http?.authInfo)` and scope the body to it. Zero Plugpass round-trips.
+**Identity tool** (the paired remove side, or any per-user free tool): no Entitlement API call at all — read `subFrom(ctx.http?.authInfo)` and scope the body to it; with no identity (the /mcp gate off), answer that nobody is signed in and touch no record. Zero Plugpass round-trips.
+
+```ts
+const sub = subFrom(ctx.http?.authInfo);
+if (sub === '') return { content: [{ type: 'text', text: 'No user is signed in.' }] };
+/* …existing tool body, scoped to `sub`… */
+```
 
 **The in-widget paywall (`ui_paywall`, servers that render widgets).** The helper below, in `premium-feature-access-check.ts`, is applied to every resource the server reads out whose MIME type is `text/html;profile=mcp-app`: the paywall script tag goes first in `<head>`, and the script's origin joins the resource's `resourceDomains`. The widget HTML itself is never edited.
 
@@ -608,4 +718,4 @@ server.registerResource(
 );
 ```
 
-**Placement guidance.** Adapt to the publisher's structure: a Hono/Workers server follows the reference shape above; an express or bare-`node:http` server uses the `getRequestListener` variant. Whatever the layout, the invariants are: the gate covers every `/mcp` method; the PRM route is unauthenticated; **both protocol legs are present and both buffer** (`responseMode: 'json'` and `enableJsonResponse: true`); the reauth check sits between the leg resolving and the response being returned; wrapped tools keep `_meta.plugpass_component_id` and lose any `outputSchema`; on a server whose directive names `ui_paywall`, every `text/html;profile=mcp-app` resource read passes through `withPaywall`.
+**Placement guidance.** Adapt to the publisher's structure: a Hono/Workers server follows the reference shape above; an express or bare-`node:http` server uses the `getRequestListener` variant. Whatever the layout, the invariants are: the handler is mounted at `/mcp` and `/mcp/test`, its gate covers every method — strict at the test path, armed by publish at `/mcp` through `enforced()`, and never challenging while off; both PRM routes are unauthenticated; **both protocol legs are present and both buffer** (`responseMode: 'json'` and `enableJsonResponse: true`); the reauth check sits between the leg resolving and the response being returned; wrapped tools keep `_meta.plugpass_component_id` and lose any `outputSchema`; on a server whose directive names `ui_paywall`, every `text/html;profile=mcp-app` resource read passes through `withPaywall`.

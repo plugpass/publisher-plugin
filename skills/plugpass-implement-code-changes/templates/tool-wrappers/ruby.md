@@ -1,13 +1,14 @@
 # Ruby scaffolding template
 
-The publisher's server becomes an **OAuth-protected resource server**: a Rack layer in front of the official `mcp` gem's `StreamableHTTPTransport` gates `/mcp` (validating the bearer against Plugpass's JWKS), serves the RFC 9728 PRM document, and carries per-request identity on a thread-local. Standalone source, no platform package. Version pins: `gem "mcp", "~> 1.5"` (**pin it — the gem ships breaking security defaults across minor versions; 1.2+ is the floor for protocol 2026-07-28, and below it the server serves the legacy era only**), `gem "jwt", "~> 3.2"`, `puma`, `rack`, `rackup`. Ruby ≥ 3.1 (stdlib OpenSSL verifies Ed25519 — **no `ed25519`/`rbnacl` native gems**).
+The publisher's server becomes an **OAuth-protected resource server**: a Rack layer in front of the official `mcp` gem's `StreamableHTTPTransport` gates `/mcp` and `/mcp/test` (validating the bearer against Plugpass's JWKS — `/mcp/test` strict from the first deploy, `/mcp` once the plugin is published), serves the RFC 9728 PRM documents for both, and carries per-request identity on a thread-local. Standalone source, no platform package. Version pins: `gem "mcp", "~> 1.5"` (**pin it — the gem ships breaking security defaults across minor versions; 1.2+ is the floor for protocol 2026-07-28, and below it the server serves the legacy era only**), `gem "jwt", "~> 3.2"`, `puma`, `rack`, `rackup`. Ruby ≥ 3.1 (stdlib OpenSSL verifies Ed25519 — **no `ed25519`/`rbnacl` native gems**).
 
-**Four structural decisions carry the whole design — never undo them:**
+**Five structural decisions carry the whole design — never undo them:**
 
 1. **The server serves BOTH protocol eras from the one transport.** The gem classifies each request by its protocol version, answers `server/discover`, and parses the per-request `_meta` envelope onto `server_context.client_capabilities`. The client's UI capability rides that envelope — that is what the paywall-UI marker reads — and a host that gets only the legacy era never sends it. Nothing extra is wired for it: the gem does the era routing.
 2. **`enable_json_response: true` on the transport, always.** In JSON mode the whole JSON-RPC dispatch — including your tool blocks — runs synchronously on the request thread inside `transport.call(env)`, so the wrapping Rack layer regains control with the response uncommitted: thread-local identity works, and the layer can swap in a `401` when a tool discovered mid-call that the bearer is revoked. In the default SSE mode dispatch happens inside the streaming body *after* the middleware returned — both mechanisms silently die.
 3. **`dns_rebinding_protection: false`.** The gem's ≥ 0.23 default validates `Host` against loopback-only allowlists — dev on localhost works, then **every request to the deployed public host 403s**. Rebinding protection defends unauthenticated localhost servers; here every request requires a validated bearer, so disable it (or set `allowed_hosts` from env).
-4. **Every accepted audience comes from Plugpass, never from the request.** A bearer's `aud` must be the baked `RESOURCE_URL` or one of the retired URLs Plugpass reports for this server (the addresses it moved off, which old installs still call). The PRM `resource` and the challenge's `resource_metadata` name the URL the request was addressed to (`X-Forwarded-Host`, else `Host`) only when that URL is an accepted audience, else `RESOURCE_URL`. This is what lets a locally-listening server accept real bearers minted for its public URL, and what keeps a moved server working for installs of its old address.
+4. **Every accepted audience comes from Plugpass, never from the request.** A bearer's `aud` must be the path's own resource — the baked `RESOURCE_URL` at `/mcp`, `{RESOURCE_URL}/test` at `/mcp/test` — or one of the retired URLs Plugpass reports for this server (the addresses it moved off, which old installs still call) in the same form. The two never cross. The PRM `resource` and the challenge's `resource_metadata` name the URL the request was addressed to (`X-Forwarded-Host`, else `Host`) only when that URL is an accepted audience, else `RESOURCE_URL` — with the `/test` suffix at the test path. This is what lets a locally-listening server accept real bearers minted for its public URL, and what keeps a moved server working for installs of its old address.
+5. **The `/mcp` gate is armed by publish, and only by publish.** `enforced?` answers whether the plugin has a published version — fetched from Plugpass before the first request is handled, cached five minutes and refreshed in the background, keyed by `RESOURCE_URL` and nothing else, final once `true`, strict while there is no answer. Off, `/mcp` challenges nobody: a valid bearer is handled as when on, a missing (or malformed, or expired) bearer means a `nil` identity, and every tool states what it does with none. The test path never consults it.
 
 ```ruby
 # premium_feature_access_check.rb — written once per server. Standalone.
@@ -19,6 +20,11 @@ require "openssl"
 
 module PremiumFeatureAccessCheck
   MCP_PATH = "/mcp"
+  # The test path: the same transport, strictly gated from the first deploy, for
+  # a resource of its own — `{RESOURCE_URL}/test` — that Plugpass mints only to
+  # the plugin's test users.
+  TEST_PATH_SUFFIX = "/test"
+  TEST_MCP_PATH = "#{MCP_PATH}#{TEST_PATH_SUFFIX}"
 
   # Plugpass endpoints for this server.
   PLUGIN_ID = "<the plugin's Plugpass id>"
@@ -45,8 +51,12 @@ module PremiumFeatureAccessCheck
   def self.resource_url = RESOURCE_URL
   def self.paywall_script_url = PAYWALL_SCRIPT_URL
   def self.check_tool_name = CHECK_TOOL_NAME
-  # RFC 9728 path-aware form: origin + /.well-known/oauth-protected-resource + /mcp.
-  def self.prm_url(resource) = "#{resource.delete_suffix(MCP_PATH)}/.well-known/oauth-protected-resource#{MCP_PATH}"
+  # RFC 9728 path-aware form: origin + /.well-known/oauth-protected-resource +
+  # the resource's path — the test document for a test resource.
+  def self.prm_url(resource)
+    path = resource.end_with?(TEST_MCP_PATH) ? TEST_MCP_PATH : MCP_PATH
+    "#{resource.delete_suffix(path)}/.well-known/oauth-protected-resource#{path}"
+  end
 
   # The URLs this server moved off, which Plugpass reports so old installs keep
   # working. Fetched only when a bearer or a request names another address;
@@ -80,16 +90,63 @@ module PremiumFeatureAccessCheck
     end
   end
 
+  # The enforcement state — whether the plugin is published, the one input that
+  # turns the /mcp gate on. Fetched before the first request a process serves is
+  # handled (one attempt at a time under the mutex; a concurrent caller waits and
+  # takes its answer), cached 5 minutes and refreshed in the background after
+  # that; keyed by RESOURCE_URL and by nothing in any request. true is final for
+  # the process. A failed fetch keeps the last answer; with no answer yet the
+  # gate is strict, and the fetch is retried after 1 minute.
+  ENFORCEMENT_TTL_SECONDS = 300
+  ENFORCEMENT_RETRY_SECONDS = 60
+  @enforcement_mutex = Mutex.new
+  @enforcement = nil # [enforced, expires_at (monotonic)]
+  @enforcement_attempt_at = 0.0
+
+  def self.refresh_enforcement
+    @enforcement_mutex.synchronize do
+      now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+      return if now < @enforcement_attempt_at
+      @enforcement_attempt_at = now + ENFORCEMENT_RETRY_SECONDS
+      begin
+        uri = URI("#{entitlement_api_origin}/entitlement/enforcement")
+        uri.query = URI.encode_www_form(resource: resource_url)
+        res = Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == "https",
+                              open_timeout: 5, read_timeout: 5) { |http| http.get(uri.request_uri) }
+        answer = JSON.parse(res.body)["enforced"] if res.code == "200"
+        @enforcement = [answer, now + ENFORCEMENT_TTL_SECONDS] if [true, false].include?(answer)
+      rescue StandardError
+        # unreachable: the last answer stands (strict while there is none) until the retry
+      end
+    end
+  end
+
+  def self.enforced?
+    answer = @enforcement
+    return true if answer && answer[0] # final
+    if answer.nil?
+      # No answer yet: learn it before handling the request; strict until it arrives.
+      refresh_enforcement
+      return @enforcement.nil? || @enforcement[0]
+    end
+    now = Process.clock_gettime(Process::CLOCK_MONOTONIC)
+    # Off and stale: refresh in the background, the cached answer serving meanwhile.
+    Thread.new { refresh_enforcement } if now >= answer[1] && now >= @enforcement_attempt_at
+    false
+  end
+
   # The URL a request was addressed to — X-Forwarded-Host (a proxy on an old
   # address sets it), else its Host, on RESOURCE_URL's scheme and path — when
-  # that URL is an accepted audience; otherwise RESOURCE_URL.
-  def self.addressed_resource(env)
+  # that URL is an accepted audience; otherwise RESOURCE_URL. At the test path,
+  # the same with the /test suffix.
+  def self.addressed_resource(env, test: false)
+    suffix = test ? TEST_PATH_SUFFIX : ""
     host = (env["HTTP_X_FORWARDED_HOST"] || env["HTTP_HOST"] || "").split(",").first.to_s.strip.downcase
     current = URI(resource_url)
     current_host = current.port == current.default_port ? current.host : "#{current.host}:#{current.port}"
-    return resource_url if host.empty? || host == current_host
+    return resource_url + suffix if host.empty? || host == current_host
     candidate = "#{current.scheme}://#{host}#{current.path}"
-    retired_audiences.include?(candidate) ? candidate : resource_url
+    (retired_audiences.include?(candidate) ? candidate : resource_url) + suffix
   end
 
   # Core jwt 3.x has no EdDSA and rejects OKP JWKs — this custom algorithm
@@ -120,10 +177,13 @@ module PremiumFeatureAccessCheck
     # Monotonic clock for timestamps; nil on any failure…
   end
 
-  # EdDSA-pinned, issuer exact, exp+sub required, audience = the baked
-  # RESOURCE_URL or one of this server's retired URLs. Returns the user id
-  # (sub), or nil on any failure.
-  def self.verify_bearer(token)
+  # EdDSA-pinned, issuer exact, exp+sub required, audience = the path's own
+  # resource (the baked RESOURCE_URL, or its /test form at the test path) or one
+  # of this server's retired URLs in the same form — a canonical token is
+  # refused at the test path and a test token at the canonical path. Returns the
+  # user id (sub), or nil on any failure.
+  def self.verify_bearer(token, test: false)
+    suffix = test ? TEST_PATH_SUFFIX : ""
     kid = JWT::EncodedToken.new(token).header["kid"]
     key = key_for(kid)
     return nil unless key
@@ -133,14 +193,19 @@ module PremiumFeatureAccessCheck
       verify_iss: true, iss: issuer,
       required_claims: %w[exp aud iss sub])
     auds = Array(payload["aud"]).grep(String)
-    return nil unless auds.include?(resource_url) || auds.intersect?(retired_audiences)
+    unless auds.include?(resource_url + suffix)
+      retired = retired_audiences
+      return nil unless auds.any? { |aud| aud.end_with?(suffix) && retired.include?(aud.delete_suffix(suffix)) }
+    end
     payload["sub"]
   rescue JWT::DecodeError
     nil
   end
 
   # Per-request identity + the reauth flag, thread-local (one puma thread per
-  # request; the gate resets both in ensure).
+  # request; the gate resets both in ensure). The identity is nil on a request
+  # with none (the /mcp gate off, before the plugin is published), which every
+  # tool handles explicitly.
   def self.identity = Thread.current[:plugpass_identity]
   def self.reauth_required! = Thread.current[:plugpass_reauth_required] = true
 
@@ -268,13 +333,14 @@ module PremiumFeatureAccessCheck
   end
 
   # The check proxy's unavailable grant — Plugpass could not answer, so the
-  # check grants and the paid skill runs. A wrapped tool needs no equivalent: it
-  # just runs its body.
+  # check grants and the paid skill runs; and its answer to a request with no
+  # identity (the /mcp gate off), composed here without reaching Plugpass. A
+  # wrapped tool needs no equivalent: it just runs its body.
   UNAVAILABLE_CHECK_GRANT = "<the unavailable grant text from TOOLS.md>"
 end
 ```
 
-**Server entry** (`server.rb`) — the gate wraps the gem's Rack transport; PRM public, everything on `/mcp` bearer-gated:
+**Server entry** (`server.rb`) — the gate wraps the gem's Rack transport: both PRM documents public, `/mcp/test` strict, `/mcp` armed by publish:
 
 ```ruby
 require "mcp"
@@ -285,18 +351,32 @@ class PlugpassGate
 
   def initialize(app) = @app = app
 
+  PRM_PATH = "/.well-known/oauth-protected-resource#{P::MCP_PATH}"
+  TEST_PRM_PATH = "#{PRM_PATH}#{P::TEST_PATH_SUFFIX}"
+
   def call(env)
-    return prm_response(env) if env["PATH_INFO"] == prm_path && env["REQUEST_METHOD"] == "GET"
-    return [404, { "content-type" => "application/json" }, ['{"error": "not_found"}']] unless env["PATH_INFO"] == P::MCP_PATH
+    path = env["PATH_INFO"]
+    if [PRM_PATH, TEST_PRM_PATH].include?(path) && env["REQUEST_METHOD"] == "GET"
+      return prm_response(env, test: path == TEST_PRM_PATH)
+    end
+    return [404, { "content-type" => "application/json" }, ['{"error": "not_found"}']] unless [P::MCP_PATH, P::TEST_MCP_PATH].include?(path)
 
-    resource = P.addressed_resource(env)
+    # The gate: the test path is strict from the first deploy; /mcp challenges
+    # only while the plugin is published. Off, a request with no valid bearer is
+    # handled with no identity — never challenged.
+    test = path == P::TEST_MCP_PATH
+    resource = P.addressed_resource(env, test: test)
+    strict = test || P.enforced?
     token = env["HTTP_AUTHORIZATION"] && env["HTTP_AUTHORIZATION"][/\ABearer (.+)\z/i, 1]
-    return challenge(resource, "Missing bearer token") unless token
-    sub = P.verify_bearer(token)
-    return challenge(resource, "Token invalid or expired") unless sub
+    sub = token && P.verify_bearer(token, test: test)
+    if sub.nil? && strict
+      return challenge(resource, token ? "Token invalid or expired" : "Missing bearer token")
+    end
 
-    Thread.current[:plugpass_identity] = { sub: sub, token: token }
-    status, headers, body = @app.call(env)  # JSON mode: dispatch is synchronous, in-thread
+    # Off, a malformed or expired bearer is no bearer: the identity stays nil.
+    Thread.current[:plugpass_identity] = { sub: sub, token: token } if sub
+    # The transport dispatches on its own path; the test path is the same transport.
+    status, headers, body = @app.call(test ? env.merge("PATH_INFO" => P::MCP_PATH) : env) # JSON mode: dispatch is synchronous, in-thread
     return challenge(resource, "Access token no longer valid") if Thread.current[:plugpass_reauth_required]
     [status, headers, body]
   ensure
@@ -306,11 +386,9 @@ class PlugpassGate
 
   private
 
-  def prm_path = "/.well-known/oauth-protected-resource#{P::MCP_PATH}"
-
-  def prm_response(env)
+  def prm_response(env, test:)
     [200, { "content-type" => "application/json" }, [JSON.generate(
-      resource: P.addressed_resource(env),
+      resource: P.addressed_resource(env, test: test),
       authorization_servers: [P.issuer],
       bearer_methods_supported: ["header"]
     )]]
@@ -373,6 +451,9 @@ CheckPremiumAccess = MCP::Tool.define(
   # No output_schema.
 ) do |plugin_id:, feature_id:, plugin_version: nil, status_code: false, **|
   identity = PremiumFeatureAccessCheck.identity
+  # No identity — the /mcp gate off, before the plugin is published: the one
+  # answer the proxy composes itself, without reaching Plugpass.
+  next MCP::Tool::Response.new([{ type: "text", text: PremiumFeatureAccessCheck::UNAVAILABLE_CHECK_GRANT }]) if identity.nil?
   # The paywall's read-only probe: asks whether this user is entitled NOW,
   # consuming nothing (check_remaining, never check_premium_access), and answers
   # in a code that is not a check result — no PLUGPASS_PLUGIN, no USE_AUTHORIZED
@@ -410,11 +491,17 @@ CheckPremiumAccess = MCP::Tool.define(
 end
 ```
 
-**Solo paid tool wrapper** (consume-on-invocation; no `auth_token` parameter on this path): the block takes `|server_context:, **args|` (the request's `_meta` rides on `server_context`; `args` is the call as sent, symbol-keyed), read `PremiumFeatureAccessCheck.identity` (`[:sub]` scopes the body, `[:token]` is the bearer to forward), call `entitlement(token, { plugin_id:, feature_id: "<plugpass_id>" }, "track_usage")`, and branch: `ok` → run the body; `non_authorized` → `non_authorized_tool_response(result, { name: "<tool name>", arguments: args }, PAID_TOOL_META, server_context, PAID_TOOL_FEATURE_ID)` (the renderer reads the tool's own registered meta — its widget, who may call it — and the request, never a baked per-tool constant); `reauth_required` → `reauth_required!` + placeholder; `unavailable` → run the body (it consumed nothing and grants). Keep the tool's meta on `Tool.define`, hoisted to a frozen constant both the registration and the marker rule read — `PAID_TOOL_FEATURE_ID = "<plugpass_id>"` + `PAID_TOOL_META = { plugpass_component_id: PAID_TOOL_FEATURE_ID }.freeze` (a UI-backed tool's also carries its `ui: { resourceUri: …, visibility: … }`), passed as `meta: PAID_TOOL_META` — and never declare an `output_schema` on a wrapped tool (the gem validates `structuredContent` against it, which paywall/reauth text responses would fail). Re-derive the tool's `annotations:`: metering makes it neither read-only nor idempotent, whatever it was before the wrap — `read_only_hint: false, idempotent_hint: false`, the other two keeping the tool's own values; see TOOLS.md § Tool annotations.
+**Solo paid tool wrapper** (consume-on-invocation; no `auth_token` parameter on this path): the block takes `|server_context:, **args|` (the request's `_meta` rides on `server_context`; `args` is the call as sent, symbol-keyed), read `PremiumFeatureAccessCheck.identity` — `nil` (no bearer: the /mcp gate off, the plugin unpublished) runs the body with no entitlement call, as the tool ran before Plugpass; with one, `[:sub]` scopes the body and `[:token]` is the bearer to forward — call `entitlement(token, { plugin_id:, feature_id: "<plugpass_id>" }, "track_usage")`, and branch: `ok` → run the body; `non_authorized` → `non_authorized_tool_response(result, { name: "<tool name>", arguments: args }, PAID_TOOL_META, server_context, PAID_TOOL_FEATURE_ID)` (the renderer reads the tool's own registered meta — its widget, who may call it — and the request, never a baked per-tool constant); `reauth_required` → `reauth_required!` + placeholder; `unavailable` → run the body (it consumed nothing and grants). Keep the tool's meta on `Tool.define`, hoisted to a frozen constant both the registration and the marker rule read — `PAID_TOOL_FEATURE_ID = "<plugpass_id>"` + `PAID_TOOL_META = { plugpass_component_id: PAID_TOOL_FEATURE_ID }.freeze` (a UI-backed tool's also carries its `ui: { resourceUri: …, visibility: … }`), passed as `meta: PAID_TOOL_META` — and never declare an `output_schema` on a wrapped tool (the gem validates `structuredContent` against it, which paywall/reauth text responses would fail). Re-derive the tool's `annotations:`: metering makes it neither read-only nor idempotent, whatever it was before the wrap — `read_only_hint: false, idempotent_hint: false`, the other two keeping the tool's own values; see TOOLS.md § Tool annotations.
 
 **Paired-tool add side** (`operation: add`): same shape, and `feature_id` is the tool's OWN `plugpass_id` (its `tool_` prefix carries the feature type) exactly as for a solo tool — every gated artifact bakes its own component's id, and the `entitlement` subfield is identity, never a `feature_id`. Always **`check_remaining`**, passing the user's current count from the publisher's own store (scoped to `sub`) as `current_count` — see TOOLS.md → Reading the user's current count.
 
-**Identity tool** (the paired remove side, or any per-user free tool): no Entitlement API call — read `PremiumFeatureAccessCheck.identity[:sub]` and scope the body to it.
+**Identity tool** (the paired remove side, or any per-user free tool): no Entitlement API call — read `PremiumFeatureAccessCheck.identity` and scope the body to its `[:sub]`; with `nil` (the /mcp gate off), answer that nobody is signed in and touch no record:
+
+```ruby
+identity = PremiumFeatureAccessCheck.identity
+next MCP::Tool::Response.new([{ type: "text", text: "No user is signed in." }]) if identity.nil?
+# ...existing tool body, scoped to identity[:sub]...
+```
 
 **The in-widget paywall (`ui_paywall`, servers that render widgets).** The helper below, in `premium_feature_access_check.rb`, is applied to every resource the server reads out whose MIME type is `text/html;profile=mcp-app`: the paywall script tag goes first in `<head>`, and the script's origin joins the resource's `resourceDomains`. The widget HTML itself is never edited.
 
@@ -451,4 +538,4 @@ Widget = MCP::Resource.define(
 end
 ```
 
-**Placement guidance.** A standalone puma server follows the composition above. In a Rails app, mount the gate-wrapped transport (`mount PlugpassGate.new(transport) => "/mcp"` plus a route for the PRM path) — the same invariants hold. Tool blocks receive **symbolized keyword args**; `required` entries in `input_schema` are strings. Thread-locals are per-request under puma (one thread per request) — the pattern doesn't target fiber-scheduling servers like falcon. In-memory state means single-process puma (`workers 0`) or an external store. On a server whose directive names `ui_paywall`, every `text/html;profile=mcp-app` resource read passes through `with_paywall`.
+**Placement guidance.** A standalone puma server follows the composition above. In a Rails app, mount the gate-wrapped transport at `/mcp` and `/mcp/test` (`mount PlugpassGate.new(transport) => "/mcp"` and `=> "/mcp/test"`, plus routes for both PRM paths) — the same invariants hold: strict at the test path, armed by publish at `/mcp` through `enforced?`, never challenging while off. Tool blocks receive **symbolized keyword args**; `required` entries in `input_schema` are strings. Thread-locals are per-request under puma (one thread per request) — the pattern doesn't target fiber-scheduling servers like falcon. In-memory state means single-process puma (`workers 0`) or an external store. On a server whose directive names `ui_paywall`, every `text/html;profile=mcp-app` resource read passes through `with_paywall`.

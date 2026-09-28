@@ -1,19 +1,25 @@
 # JVM (Java/Kotlin) scaffolding template
 
-The publisher's server becomes an **OAuth-protected resource server**: a servlet `Filter` gates `/mcp` (validating the bearer against Plugpass's JWKS with Nimbus + the JDK's native Ed25519), a tiny servlet serves the RFC 9728 PRM document, and the MCP servlet transport runs behind them under embedded Jetty. Standalone source, no platform package. Version pins: `io.modelcontextprotocol.sdk:mcp` **2.0.1** (the aggregate — `mcp-core` + Jackson 3; apps pinned to Jackson 2 use `mcp-core` + `mcp-json-jackson2`), `com.nimbusds:nimbus-jose-jwt` 10.9.x, `org.eclipse.jetty.ee10:jetty-ee10-servlet` 12.1.x. Java 17+ (the reference targets 21). Keep the shade plugin's `ServicesResourceTransformer` — the SDK discovers its JSON mapper via ServiceLoader.
+The publisher's server becomes an **OAuth-protected resource server**: a servlet `Filter` gates `/mcp` and `/mcp/test` (validating the bearer against Plugpass's JWKS with Nimbus + the JDK's native Ed25519 — `/mcp/test` strict from the first deploy, `/mcp` once the plugin is published), a tiny servlet serves the RFC 9728 PRM documents for both, and the MCP servlet transport runs behind them under embedded Jetty. Standalone source, no platform package. Version pins: `io.modelcontextprotocol.sdk:mcp` **2.0.1** (the aggregate — `mcp-core` + Jackson 3; apps pinned to Jackson 2 use `mcp-core` + `mcp-json-jackson2`), `com.nimbusds:nimbus-jose-jwt` 10.9.x, `org.eclipse.jetty.ee10:jetty-ee10-servlet` 12.1.x. Java 17+ (the reference targets 21). Keep the shade plugin's `ServicesResourceTransformer` — the SDK discovers its JSON mapper via ServiceLoader.
 
 > **This SDK line serves the 2025 protocol era only.** `io.modelcontextprotocol.sdk:mcp` implements nothing past 2025-11-25: there is no `server/discover` and no per-request `_meta` envelope, so a 2026-07-28 host opens with discover, takes the 404, and falls back. Everything else in this template holds unchanged — including the status probe, which is an ordinary tool parameter and needs no protocol support. **The one behavioral difference: a widget denial on a modern host carries no paywall-UI marker, so the chat asks beside the modal there.**
 
-**Three structural decisions carry the whole design — never undo them:**
+**Four structural decisions carry the whole design — never undo them:**
 
 1. **Use `HttpServletStatelessServerTransport`** (not the streamable provider). It answers `tools/call` with a plain `application/json` body, synchronously on the request thread, no `startAsync`, no sessions — so the auth filter's buffering wrapper holds the complete response after `chain.doFilter` returns and can swap in a `401` when a tool discovered mid-call that the bearer is revoked. (The streamable provider answers tools/call over SSE; a buffering filter still works there only because of deferred-`complete()` servlet semantics, with mid-stream-notification caveats — stay stateless unless the publisher's tools need sampling/elicitation.) GET returns 405 — spec-legal for streamable-HTTP servers.
 2. **Verify Ed25519 with the JDK (`Signature.getInstance("Ed25519")`), not Nimbus's `Ed25519Verifier`** — the Nimbus verifier still requires the optional Google Tink dependency, and its stock `DefaultJWSVerifierFactory` has no EdDSA support at all. Nimbus handles JWKS fetching/caching/selection and claims verification; the signature check is ~10 lines of JDK crypto.
-3. **Every accepted audience comes from Plugpass, never from the request.** A bearer's `aud` must be the baked `RESOURCE_URL` or one of the retired URLs Plugpass reports for this server (the addresses it moved off, which old installs still call). The PRM `resource` and the challenge's `resource_metadata` name the URL the request was addressed to (`X-Forwarded-Host`, else `Host`) only when that URL is an accepted audience, else `RESOURCE_URL`. This is what lets a locally-listening server accept real bearers minted for its public URL, and what keeps a moved server working for installs of its old address.
+3. **Every accepted audience comes from Plugpass, never from the request.** A bearer's `aud` must be the path's own resource — the baked `RESOURCE_URL` at `/mcp`, `{RESOURCE_URL}/test` at `/mcp/test` — or one of the retired URLs Plugpass reports for this server (the addresses it moved off, which old installs still call) in the same form. The two never cross. The PRM `resource` and the challenge's `resource_metadata` name the URL the request was addressed to (`X-Forwarded-Host`, else `Host`) only when that URL is an accepted audience, else `RESOURCE_URL` — with the `/test` suffix at the test path. This is what lets a locally-listening server accept real bearers minted for its public URL, and what keeps a moved server working for installs of its old address.
+4. **The `/mcp` gate is armed by publish, and only by publish.** `enforced()` answers whether the plugin has a published version — fetched from Plugpass before the first request is handled, cached five minutes and refreshed in the background, keyed by `RESOURCE_URL` and nothing else, final once `true`, strict while there is no answer. Off, `/mcp` challenges nobody: a valid bearer is handled as when on, a missing (or malformed, or expired) bearer means no `PlugpassAuth` on the request, and every tool states what it does with none. The test path never consults it.
 
 ```java
 // PremiumFeatureAccessCheck.java — written once per server. Standalone.
 public final class PremiumFeatureAccessCheck {
   public static final String MCP_PATH = "/mcp";
+  // The test path: the same transport, strictly gated from the first deploy, for
+  // a resource of its own — RESOURCE_URL + "/test" — that Plugpass mints only to
+  // the plugin's test users.
+  public static final String TEST_PATH_SUFFIX = "/test";
+  public static final String TEST_MCP_PATH = MCP_PATH + TEST_PATH_SUFFIX;
 
   // Plugpass endpoints for this server.
   private static final String PLUGIN_ID = "<the plugin's Plugpass id>";
@@ -40,10 +46,12 @@ public final class PremiumFeatureAccessCheck {
   public static String paywallScriptUrl() { return PAYWALL_SCRIPT_URL; }
   public static String checkToolName() { return CHECK_TOOL_NAME; }
 
-  // RFC 9728 path-aware PRM URL: origin + /.well-known/oauth-protected-resource + /mcp.
+  // RFC 9728 path-aware PRM URL: origin + /.well-known/oauth-protected-resource +
+  // the resource's path — the test document for a test resource.
   public static String prmUrl(String resource) {
-    String origin = resource.substring(0, resource.length() - MCP_PATH.length());
-    return origin + "/.well-known/oauth-protected-resource" + MCP_PATH;
+    String path = resource.endsWith(TEST_MCP_PATH) ? TEST_MCP_PATH : MCP_PATH;
+    String origin = resource.substring(0, resource.length() - path.length());
+    return origin + "/.well-known/oauth-protected-resource" + path;
   }
 
   // The URLs this server moved off, which Plugpass reports so old installs keep
@@ -79,18 +87,77 @@ public final class PremiumFeatureAccessCheck {
     return retired;
   }
 
+  // The enforcement state — whether the plugin is published, the one input that
+  // turns the /mcp gate on. Fetched before the first request a process serves is
+  // handled (one attempt at a time under the monitor; a concurrent caller waits
+  // and takes its answer), cached 5 minutes and refreshed in the background after
+  // that; keyed by RESOURCE_URL and by nothing in any request. true is final for
+  // the process. A failed fetch keeps the last answer; with no answer yet the
+  // gate is strict, and the fetch is retried after 1 minute.
+  private static final HttpClient ENFORCEMENT_HTTP =
+      HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(5)).build();
+  private static final ExecutorService ENFORCEMENT_REFRESHER =
+      Executors.newSingleThreadExecutor(r -> { Thread t = new Thread(r, "plugpass-enforcement"); t.setDaemon(true); return t; });
+  private static Boolean enforcementAnswer = null; // the last answer; null until one arrives
+  private static long enforcementExpiresAt = System.nanoTime();
+  private static long enforcementAttemptAt = System.nanoTime();
+
+  private static synchronized void refreshEnforcement() {
+    long now = System.nanoTime();
+    if (now - enforcementAttemptAt < 0) return;
+    enforcementAttemptAt = now + Duration.ofMinutes(1).toNanos();
+    try {
+      HttpRequest request = HttpRequest.newBuilder(URI.create(entitlementApiOrigin()
+              + "/entitlement/enforcement?resource="
+              + URLEncoder.encode(resourceUrl(), StandardCharsets.UTF_8)))
+          .timeout(Duration.ofSeconds(5)).GET().build();
+      HttpResponse<String> response = ENFORCEMENT_HTTP.send(request, HttpResponse.BodyHandlers.ofString());
+      if (response.statusCode() == 200
+          && JSONObjectUtils.parse(response.body()).get("enforced") instanceof Boolean answer) {
+        enforcementAnswer = answer;
+        enforcementExpiresAt = System.nanoTime() + Duration.ofMinutes(5).toNanos();
+      }
+    } catch (Exception e) {
+      // unreachable: the last answer stands (strict while there is none) until the retry
+    }
+  }
+
+  public static boolean enforced() {
+    Boolean answer;
+    long expiresAt;
+    synchronized (PremiumFeatureAccessCheck.class) {
+      answer = enforcementAnswer;
+      expiresAt = enforcementExpiresAt;
+    }
+    if (Boolean.TRUE.equals(answer)) return true; // final
+    if (answer == null) {
+      // No answer yet: learn it before handling the request; strict until it arrives.
+      refreshEnforcement();
+      synchronized (PremiumFeatureAccessCheck.class) {
+        return enforcementAnswer == null || enforcementAnswer;
+      }
+    }
+    if (System.nanoTime() - expiresAt >= 0) {
+      // Off and stale: refresh in the background, the cached answer serving meanwhile.
+      ENFORCEMENT_REFRESHER.execute(PremiumFeatureAccessCheck::refreshEnforcement);
+    }
+    return false;
+  }
+
   // The URL a request was addressed to — X-Forwarded-Host (a proxy on an old
   // address sets it), else its Host, on RESOURCE_URL's scheme and path — when
-  // that URL is an accepted audience; otherwise RESOURCE_URL.
-  public static String addressedResource(HttpServletRequest req) {
+  // that URL is an accepted audience; otherwise RESOURCE_URL. At the test path,
+  // the same with the /test suffix.
+  public static String addressedResource(HttpServletRequest req, boolean test) {
+    String suffix = test ? TEST_PATH_SUFFIX : "";
     String forwarded = req.getHeader("X-Forwarded-Host");
     String raw = forwarded != null ? forwarded.split(",")[0] : req.getHeader("Host");
     String host = raw == null ? "" : raw.trim().toLowerCase(Locale.ROOT);
     URI current = URI.create(resourceUrl());
     String currentHost = current.getPort() == -1 ? current.getHost() : current.getHost() + ":" + current.getPort();
-    if (host.isEmpty() || host.equals(currentHost)) return resourceUrl();
+    if (host.isEmpty() || host.equals(currentHost)) return resourceUrl() + suffix;
     String candidate = current.getScheme() + "://" + host + current.getPath();
-    return retiredAudiences().contains(candidate) ? candidate : resourceUrl();
+    return (retiredAudiences().contains(candidate) ? candidate : resourceUrl()) + suffix;
   }
 
   // Remote JWKS: 4h cache, rate-limited refetch (an unknown kid re-fetches
@@ -105,12 +172,15 @@ public final class PremiumFeatureAccessCheck {
       .build();
 
   /**
-   * EdDSA-pinned, issuer exact, exp + sub required, audience = the baked
-   * RESOURCE_URL or one of this server's retired URLs. Nimbus selects the OKP
-   * key by kid; the JDK verifies Ed25519 (raw x wrapped in the fixed 12-byte
+   * EdDSA-pinned, issuer exact, exp + sub required, audience = the path's own
+   * resource (the baked RESOURCE_URL, or its /test form at the test path) or one
+   * of this server's retired URLs in the same form — a canonical token is refused
+   * at the test path and a test token at the canonical path. Nimbus selects the
+   * OKP key by kid; the JDK verifies Ed25519 (raw x wrapped in the fixed 12-byte
    * SPKI prefix). Returns sub, or null.
    */
-  public static String verifyBearer(String token) {
+  public static String verifyBearer(String token, boolean test) {
+    String suffix = test ? TEST_PATH_SUFFIX : "";
     try {
       SignedJWT jwt = SignedJWT.parse(token);
       if (!JWSAlgorithm.EdDSA.equals(jwt.getHeader().getAlgorithm())) return null; // alg pinned
@@ -128,12 +198,14 @@ public final class PremiumFeatureAccessCheck {
       sig.update(jwt.getSigningInput());
       if (!sig.verify(jwt.getSignature().decode())) return null;
 
-      // Claims: iss exact, aud contains RESOURCE_URL (or, only when it does not,
-      // one of the retired URLs), exp + sub required (60s default clock skew).
+      // Claims: iss exact, aud contains the path's own resource (or, only when it
+      // does not, a retired URL's same form), exp + sub required (60s default
+      // clock skew).
       JWTClaimsSet claims = jwt.getJWTClaimsSet();
-      Set<String> accepted = claims.getAudience().contains(resourceUrl())
-          ? Set.of(resourceUrl())
-          : Stream.concat(Stream.of(resourceUrl()), retiredAudiences().stream())
+      String own = resourceUrl() + suffix;
+      Set<String> accepted = claims.getAudience().contains(own)
+          ? Set.of(own)
+          : Stream.concat(Stream.of(own), retiredAudiences().stream().map(url -> url + suffix))
               .collect(Collectors.toUnmodifiableSet());
       new DefaultJWTClaimsVerifier<SecurityContext>(
           accepted,
@@ -148,9 +220,13 @@ public final class PremiumFeatureAccessCheck {
   }
 
   /** Per-request holder the filter creates, the context extractor forwards,
-   *  and tool handlers read. The AtomicBoolean is the reauth back-channel. */
+   *  and tool handlers read — absent on a request with no identity (the /mcp
+   *  gate off, before the plugin is published), which every tool handles
+   *  explicitly. The AtomicBoolean is the reauth back-channel; the filter creates
+   *  it for every request, identity or none. */
   public record PlugpassAuth(String sub, String bearer, AtomicBoolean reauthRequired) {}
   public static final String AUTH_ATTRIBUTE = "plugpass.auth";
+  public static final String REAUTH_ATTRIBUTE = "plugpass.reauth";
 
   // Entitlement API client: java.net.http.HttpClient, 5s connect + request
   // timeouts PER ATTEMPT with ONE retry after a 2s backoff on a transport
@@ -255,26 +331,44 @@ public final class PremiumFeatureAccessCheck {
 }
 ```
 
-**`BearerAuthFilter`** — the gate plus the reauth swap (buffer POST bodies only):
+**`BearerAuthFilter`** — mapped on `/mcp/*` (which covers `/mcp` and `/mcp/test`): the gate plus the reauth swap (buffer POST bodies only). The test path is the same servlet: the filter rewrites the request URI to `/mcp` on the way in, after the gate has read it, since the stateless transport 404s any other URI:
 
 ```java
 public final class BearerAuthFilter extends HttpFilter {
   @Override
   protected void doFilter(HttpServletRequest req, HttpServletResponse res, FilterChain chain)
       throws IOException, ServletException {
-    String resource = PremiumFeatureAccessCheck.addressedResource(req);
+    String uri = req.getRequestURI();
+    boolean test = uri.equals(PremiumFeatureAccessCheck.TEST_MCP_PATH);
+    if (!test && !uri.equals(PremiumFeatureAccessCheck.MCP_PATH)) { res.sendError(404); return; }
+    String resource = PremiumFeatureAccessCheck.addressedResource(req, test);
+    // The gate: the test path is strict from the first deploy; /mcp challenges
+    // only while the plugin is published. Off, a request with no valid bearer is
+    // handled with no identity — never challenged.
+    boolean strict = test || PremiumFeatureAccessCheck.enforced();
     String header = req.getHeader("Authorization");
     String token = header != null && header.regionMatches(true, 0, "Bearer ", 0, 7) ? header.substring(7).trim() : null;
-    if (token == null) { challenge(res, resource, "Missing bearer token"); return; }
-    String sub = PremiumFeatureAccessCheck.verifyBearer(token);
-    if (sub == null) { challenge(res, resource, "Token invalid or expired"); return; }
+    String sub = token == null ? null : PremiumFeatureAccessCheck.verifyBearer(token, test);
+    if (sub == null && strict) {
+      challenge(res, resource, token == null ? "Missing bearer token" : "Token invalid or expired");
+      return;
+    }
+    // Off, a malformed or expired bearer is no bearer: no identity is set.
+    var reauth = new AtomicBoolean(false);
+    req.setAttribute(PremiumFeatureAccessCheck.REAUTH_ATTRIBUTE, reauth);
+    if (sub != null) {
+      req.setAttribute(PremiumFeatureAccessCheck.AUTH_ATTRIBUTE,
+          new PremiumFeatureAccessCheck.PlugpassAuth(sub, token, reauth));
+    }
 
-    var auth = new PremiumFeatureAccessCheck.PlugpassAuth(sub, token, new AtomicBoolean(false));
-    req.setAttribute(PremiumFeatureAccessCheck.AUTH_ATTRIBUTE, auth);
-
+    HttpServletRequest inner = test ? new HttpServletRequestWrapper(req) {
+      @Override public String getRequestURI() { return PremiumFeatureAccessCheck.MCP_PATH; }
+      @Override public String getServletPath() { return PremiumFeatureAccessCheck.MCP_PATH; }
+      @Override public String getPathInfo() { return null; }
+    } : req;
     BufferingResponseWrapper buffer = new BufferingResponseWrapper(res); // overrides getWriter/getOutputStream only
-    chain.doFilter(req, buffer);                                        // stateless transport: fully synchronous
-    if (auth.reauthRequired().get() && !res.isCommitted()) {
+    chain.doFilter(inner, buffer);                                      // stateless transport: fully synchronous
+    if (reauth.get() && !res.isCommitted()) {
       challenge(res, resource, "Access token no longer valid");         // → the client re-authorizes and retries
       return;
     }
@@ -299,9 +393,13 @@ public final class BearerAuthFilter extends HttpFilter {
 ```java
 var transport = HttpServletStatelessServerTransport.builder()
     .mcpEndpoint(PremiumFeatureAccessCheck.MCP_PATH)
-    .contextExtractor(request -> McpTransportContext.create(
-        Map.of(PremiumFeatureAccessCheck.AUTH_ATTRIBUTE,
-               request.getAttribute(PremiumFeatureAccessCheck.AUTH_ATTRIBUTE))))
+    // The holder rides the context when the request carries an identity; a
+    // request with none (the /mcp gate off) carries an empty context.
+    .contextExtractor(request -> {
+      Object auth = request.getAttribute(PremiumFeatureAccessCheck.AUTH_ATTRIBUTE);
+      return McpTransportContext.create(
+          auth == null ? Map.of() : Map.of(PremiumFeatureAccessCheck.AUTH_ATTRIBUTE, auth));
+    })
     .build();
 
 McpServer.sync(transport)
@@ -313,19 +411,21 @@ McpServer.sync(transport)
 Server jetty = new Server(new InetSocketAddress("0.0.0.0", port));
 ServletContextHandler handler = new ServletContextHandler();
 handler.setContextPath("/");
-handler.addServlet(new ServletHolder(transport), PremiumFeatureAccessCheck.MCP_PATH);
-handler.addServlet(new ServletHolder(new PrmServlet()), "/.well-known/oauth-protected-resource/mcp");
+// `/mcp/*` reaches /mcp and /mcp/test alike; the filter 404s every other URI
+// under it and rewrites the test path to /mcp for the transport.
+handler.addServlet(new ServletHolder(transport), PremiumFeatureAccessCheck.MCP_PATH + "/*");
+handler.addServlet(new ServletHolder(new PrmServlet()), "/.well-known/oauth-protected-resource/mcp/*");
 FilterHolder auth = new FilterHolder(new BearerAuthFilter());
 auth.setAsyncSupported(true);
-handler.addFilter(auth, PremiumFeatureAccessCheck.MCP_PATH, EnumSet.of(DispatcherType.REQUEST)); // /mcp ONLY — never the PRM path
+handler.addFilter(auth, PremiumFeatureAccessCheck.MCP_PATH + "/*", EnumSet.of(DispatcherType.REQUEST)); // the MCP paths ONLY — never the PRM paths
 jetty.setHandler(handler);
 jetty.start();
 jetty.join();
 ```
 
-`PrmServlet` is a trivial `doGet` writing `{"resource": addressedResource(req), "authorization_servers": [issuer()], "bearer_methods_supported": ["header"]}` as `application/json` — unauthenticated.
+`PrmServlet` is a trivial `doGet` serving both documents, unauthenticated: for a request URI of `/.well-known/oauth-protected-resource/mcp` or `…/mcp/test` (404 otherwise) it writes `{"resource": addressedResource(req, test), "authorization_servers": [issuer()], "bearer_methods_supported": ["header"]}` as `application/json`, `test` being whether the URI ends in `/test`.
 
-**Per-request identity inside a tool**: stateless handlers receive the transport context directly — `BiFunction<McpTransportContext, CallToolRequest, CallToolResult>`; read `var auth = (PlugpassAuth) ctx.get(PremiumFeatureAccessCheck.AUTH_ATTRIBUTE)`. On reauth: `auth.reauthRequired().set(true)`.
+**Per-request identity inside a tool**: stateless handlers receive the transport context directly — `BiFunction<McpTransportContext, CallToolRequest, CallToolResult>`; read `var auth = (PlugpassAuth) ctx.get(PremiumFeatureAccessCheck.AUTH_ATTRIBUTE)`, `null` on a request with no identity (the /mcp gate off, before the plugin is published), which every tool handles explicitly. On reauth: `auth.reauthRequired().set(true)`.
 
 **The check proxy tool (check host only).** A pure pipe — never parse or reformat `result_text`. SDK 2.0 builds tool input schemas as **`Map<String, Object>` that must be valid JSON Schema 2020-12** (meta-validated at `build()`), and input validation runs by default:
 
@@ -364,7 +464,9 @@ var checkPremiumAccess = McpStatelessServerFeatures.SyncToolSpecification.builde
         .build()) // no outputSchema
     .callHandler((ctx, request) -> {
       var auth = (PremiumFeatureAccessCheck.PlugpassAuth) ctx.get(PremiumFeatureAccessCheck.AUTH_ATTRIBUTE);
-      if (auth == null) return unavailableCheckGrant(); // unreachable behind the gate
+      // No identity — the /mcp gate off, before the plugin is published: the one
+      // answer the proxy composes itself, without reaching Plugpass.
+      if (auth == null) return unavailableCheckGrant();
       // The paywall's read-only probe: asks whether this user is entitled NOW,
       // consuming nothing (check_remaining, never check_premium_access), and answers
       // in a code that is not a check result — no PLUGPASS_PLUGIN, no USE_AUTHORIZED
@@ -400,11 +502,17 @@ var checkPremiumAccess = McpStatelessServerFeatures.SyncToolSpecification.builde
     .build();
 ```
 
-**Solo paid tool wrapper** (consume-on-invocation; no `auth_token` parameter on this path): read the holder from the context (`auth.sub()` scopes the body, `auth.bearer()` is the forwarded bearer), call `track_usage` (`feature_id` = the tool's own plugpass-component-id, matching its `_meta`; the id's `tool_` prefix carries the feature type), and branch: `ok` → run the body; `non_authorized` → `nonAuthorizedToolResponse(result, new DeniedCall("<tool name>", request.arguments()), PAID_TOOL_META, request, PAID_TOOL_FEATURE_ID)` (the renderer reads the tool's own registered meta — its widget, who may call it — and the request, never a baked per-tool constant); `reauth_required` → set the flag + placeholder; `unavailable` → run the body (it consumed nothing and grants). Stamp `_meta` via `Tool.builder(...).meta(PAID_TOOL_META)`, the map hoisted to a `static final String PAID_TOOL_FEATURE_ID = "<plugpass_id>"` + `static final Map<String, Object> PAID_TOOL_META = Map.of("plugpass_component_id", PAID_TOOL_FEATURE_ID)` (a UI-backed tool's also carries its `"ui", Map.of("resourceUri", …, "visibility", …)`) that both the builder and the marker rule read, and never declare an `outputSchema` on a wrapped tool (paywall/reauth responses are text-only). Re-derive the tool's `.annotations(…)`: metering makes it neither read-only nor idempotent, whatever it was before the wrap — `.annotations(hints(false, <its own destructive value>, false, <its own open-world value>))`, see TOOLS.md § Tool annotations.
+**Solo paid tool wrapper** (consume-on-invocation; no `auth_token` parameter on this path): read the holder from the context — `null` (no bearer: the /mcp gate off, the plugin unpublished) runs the body with no entitlement call, as the tool ran before Plugpass; with one, `auth.sub()` scopes the body and `auth.bearer()` is the forwarded bearer — call `track_usage` (`feature_id` = the tool's own plugpass-component-id, matching its `_meta`; the id's `tool_` prefix carries the feature type), and branch: `ok` → run the body; `non_authorized` → `nonAuthorizedToolResponse(result, new DeniedCall("<tool name>", request.arguments()), PAID_TOOL_META, request, PAID_TOOL_FEATURE_ID)` (the renderer reads the tool's own registered meta — its widget, who may call it — and the request, never a baked per-tool constant); `reauth_required` → set the flag + placeholder; `unavailable` → run the body (it consumed nothing and grants). Stamp `_meta` via `Tool.builder(...).meta(PAID_TOOL_META)`, the map hoisted to a `static final String PAID_TOOL_FEATURE_ID = "<plugpass_id>"` + `static final Map<String, Object> PAID_TOOL_META = Map.of("plugpass_component_id", PAID_TOOL_FEATURE_ID)` (a UI-backed tool's also carries its `"ui", Map.of("resourceUri", …, "visibility", …)`) that both the builder and the marker rule read, and never declare an `outputSchema` on a wrapped tool (paywall/reauth responses are text-only). Re-derive the tool's `.annotations(…)`: metering makes it neither read-only nor idempotent, whatever it was before the wrap — `.annotations(hints(false, <its own destructive value>, false, <its own open-world value>))`, see TOOLS.md § Tool annotations.
 
 **Paired-tool add side** (`operation: add`): same shape, and `feature_id` is the tool's OWN `plugpass_id` (its `tool_` prefix carries the feature type) exactly as for a solo tool — every gated artifact bakes its own component's id, and the `entitlement` subfield is identity, never a `feature_id`. Always **`check_remaining`**, passing the user's current count from the publisher's own store (scoped to `sub`) as `current_count` — see TOOLS.md → Reading the user's current count.
 
-**Identity tool** (the paired remove side, or any per-user free tool): no Entitlement API call — read `auth.sub()` from the context and scope the body to it.
+**Identity tool** (the paired remove side, or any per-user free tool): no Entitlement API call — read the holder from the context and scope the body to `auth.sub()`; with `null` (the /mcp gate off), answer that nobody is signed in and touch no record:
+
+```java
+var auth = (PremiumFeatureAccessCheck.PlugpassAuth) ctx.get(PremiumFeatureAccessCheck.AUTH_ATTRIBUTE);
+if (auth == null) return CallToolResult.builder().addTextContent("No user is signed in.").build();
+// …existing tool body, scoped to auth.sub()…
+```
 
 **The in-widget paywall (`ui_paywall`, servers that render widgets).** The helper below, in `PremiumFeatureAccessCheck`, is applied to every resource the server reads out whose MIME type is `text/html;profile=mcp-app`: the paywall script tag goes first in `<head>`, and the script's origin joins the resource's `resourceDomains`. The widget HTML itself is never edited.
 
@@ -448,4 +556,4 @@ new McpStatelessServerFeatures.SyncResourceSpecification(
     })
 ```
 
-**Placement guidance.** An embedded-Jetty server follows the composition above; a servlet-container deployment registers the same three pieces in its `web.xml`/programmatic config (filter on `/mcp` only, `asyncSupported` true, PRM servlet public). On a server whose directive names `ui_paywall`, every `text/html;profile=mcp-app` resource read passes through `withPaywall`. If the publisher's server must stay on the stateful `HttpServletStreamableServerTransportProvider` (tools that use sampling/elicitation), the identity path changes to `exchange.transportContext()` on `McpSyncServerExchange` and the same buffering filter works via the servlet's deferred-`complete()` semantics — but never wrap the GET listening stream, leave `keepAliveInterval` unset, and know that mid-call notifications are delayed until completion. Migration notes for a publisher's older SDK: 1.x `McpSchema.JsonSchema` is deprecated (bridge maps in), and 2.0 validates tool inputs by default.
+**Placement guidance.** An embedded-Jetty server follows the composition above; a servlet-container deployment registers the same three pieces in its `web.xml`/programmatic config (filter on `/mcp/*` only — strict at the test path, armed by publish at `/mcp` through `enforced()`, never challenging while off — `asyncSupported` true, PRM servlet public at both paths). On a server whose directive names `ui_paywall`, every `text/html;profile=mcp-app` resource read passes through `withPaywall`. If the publisher's server must stay on the stateful `HttpServletStreamableServerTransportProvider` (tools that use sampling/elicitation), the identity path changes to `exchange.transportContext()` on `McpSyncServerExchange` and the same buffering filter works via the servlet's deferred-`complete()` semantics — but never wrap the GET listening stream, leave `keepAliveInterval` unset, and know that mid-call notifications are delayed until completion. Migration notes for a publisher's older SDK: 1.x `McpSchema.JsonSchema` is deprecated (bridge maps in), and 2.0 validates tool inputs by default.

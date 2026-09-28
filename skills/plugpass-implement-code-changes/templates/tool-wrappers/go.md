@@ -1,14 +1,15 @@
 # Go scaffolding template
 
-The publisher's server becomes an **OAuth-protected resource server** using the official SDK's `auth` package: `auth.RequireBearerToken` gates `/mcp` (emitting the `WWW-Authenticate` challenge with `resource_metadata`), `auth.ProtectedResourceMetadataHandler` serves the RFC 9728 PRM document, and a custom `TokenVerifier` does the local JWKS validation. Standalone source, no platform package. Version pins: `github.com/modelcontextprotocol/go-sdk` **v1.7.0+** (it is what implements protocol 2026-07-28; on v1.6.x the server serves the legacy era only), `github.com/golang-jwt/jwt/v5` v5.3.x, `github.com/MicahParks/keyfunc/v3` v3.8.x.
+The publisher's server becomes an **OAuth-protected resource server** using the official SDK's `auth` package: `auth.RequireBearerToken` gates the strict paths (emitting the `WWW-Authenticate` challenge with `resource_metadata`) — `/mcp/test` from the first deploy, `/mcp` once the plugin is published, through the publish-armed gate below — `auth.ProtectedResourceMetadataHandler` serves the RFC 9728 PRM documents for both, and a custom `TokenVerifier` does the local JWKS validation. Standalone source, no platform package. Version pins: `github.com/modelcontextprotocol/go-sdk` **v1.7.0+** (it is what implements protocol 2026-07-28; on v1.6.x the server serves the legacy era only), `github.com/golang-jwt/jwt/v5` v5.3.x, `github.com/MicahParks/keyfunc/v3` v3.8.x.
 
-**Three structural decisions carry the whole design — never undo them:**
+**Four structural decisions carry the whole design — never undo them:**
 
 1. **The server serves BOTH protocol eras from the one handler.** The SDK routes each request by its negotiated version, answers `server/discover`, and parses the per-request `_meta` envelope; `req.ClientCapabilities()` reads that envelope, falling back to the handshake on a 2025-era connection. The client's UI capability rides the envelope — that is what the paywall-UI marker reads — and a host that gets only the legacy era never sends it. Nothing extra is wired for it: the SDK line does the era routing.
 2. **`StreamableHTTPOptions{Stateless: true, JSONResponse: true}`, always.** In JSON mode the SDK buffers the response and `ServeHTTP` returns only after the tool handler finished — so a wrapping middleware can discard the buffered response and write a `401` when a tool discovered mid-call that the bearer is revoked. In SSE mode events flush immediately (the `200` is committed before the handler runs). And **stateless mode is what makes middleware context values visible inside tool handlers** — in stateful mode handler contexts descend from the *initialize* request, not the current POST, and the reauth flag silently never fires.
 
 > **The gate's challenge needs a header fixup.** `auth.RequireBearerToken` emits `WWW-Authenticate: Bearer resource_metadata="…"` with **no** `error="invalid_token"` (RFC 6750 permits omitting the error on a missing token) — but the Plugpass contract requires `error="invalid_token"` (the signal clients key OAuth discovery off). The `challengeWriter`/`withFullChallenge` wrapper below fills it in on the gate's 401. Every other language SDK emits the full challenge itself; only the Go SDK needs this one wrapper.
-3. **Every accepted audience comes from Plugpass, never from the request.** A bearer's `aud` must be the baked `RESOURCE_URL` or one of the retired URLs Plugpass reports for this server (the addresses it moved off, which old installs still call). The PRM `resource` and the challenge's `resource_metadata` name the URL the request was addressed to (`X-Forwarded-Host`, else `Host`) only when that URL is an accepted audience, else `RESOURCE_URL`. This is what lets a locally-listening server accept real bearers minted for its public URL, and what keeps a moved server working for installs of its old address.
+3. **Every accepted audience comes from Plugpass, never from the request.** A bearer's `aud` must be the path's own resource — the baked `RESOURCE_URL` at `/mcp`, `{RESOURCE_URL}/test` at `/mcp/test` — or one of the retired URLs Plugpass reports for this server (the addresses it moved off, which old installs still call) in the same form. The two never cross. The PRM `resource` and the challenge's `resource_metadata` name the URL the request was addressed to (`X-Forwarded-Host`, else `Host`) only when that URL is an accepted audience, else `RESOURCE_URL` — with the `/test` suffix at the test path. This is what lets a locally-listening server accept real bearers minted for its public URL, and what keeps a moved server working for installs of its old address.
+4. **The `/mcp` gate is armed by publish, and only by publish.** `enforced()` answers whether the plugin has a published version — fetched from Plugpass before the first request is handled, cached five minutes and refreshed in the background, keyed by `resourceURL` and nothing else, final once `true`, strict while there is no answer. Off, `/mcp` challenges nobody: a valid bearer takes the strict chain exactly as when on, a missing (or malformed, or expired) bearer takes the open chain with no `TokenInfo`, and every tool states what it does with none. The test path never consults it.
 
 ```go
 // premium_feature_access_check.go — written once per server. Standalone.
@@ -34,6 +35,11 @@ import (
 )
 
 const mcpPath = "/mcp"
+
+// The test path: the same handler, strictly gated from the first deploy, for a
+// resource of its own — resourceURL + "/test" — that Plugpass mints only to the
+// plugin's test users.
+const testPathSuffix = "/test"
 
 // Plugpass endpoints for this server.
 const (
@@ -72,10 +78,15 @@ func loadPlugpassConfig() plugpassConfig {
 	}
 }
 
-// RFC 9728 path-aware PRM URL: origin + /.well-known/oauth-protected-resource + /mcp.
+// RFC 9728 path-aware PRM URL: origin + /.well-known/oauth-protected-resource +
+// the resource's path — the test document for a test resource.
 func prmURL(resource string) string {
 	u, _ := url.Parse(resource)
-	return u.Scheme + "://" + u.Host + "/.well-known/oauth-protected-resource" + mcpPath
+	path := mcpPath
+	if strings.HasSuffix(u.Path, testPathSuffix) {
+		path += testPathSuffix
+	}
+	return u.Scheme + "://" + u.Host + "/.well-known/oauth-protected-resource" + path
 }
 
 // The URLs this server moved off, which Plugpass reports so old installs keep
@@ -115,10 +126,76 @@ func retiredAudiences(ctx context.Context, cfg plugpassConfig) map[string]bool {
 	return retiredURLs
 }
 
+// The enforcement state — whether the plugin is published, the one input that
+// turns the /mcp gate on. Fetched before the first request a process serves is
+// handled (one attempt at a time under the mutex; a concurrent caller waits and
+// takes its answer), cached 5 minutes and refreshed in the background after
+// that; keyed by resourceURL and by nothing in any request. true is final for
+// the process. A failed fetch keeps the last answer; with no answer yet the
+// gate is strict, and the fetch is retried after 1 minute.
+var (
+	enforcementMu        sync.Mutex
+	enforcementAnswer    *bool // the last answer; nil until one arrives
+	enforcementExpires   time.Time
+	enforcementAttemptAt time.Time
+	enforcementClient    = &http.Client{Timeout: 5 * time.Second}
+)
+
+func refreshEnforcement(ctx context.Context, cfg plugpassConfig) {
+	enforcementMu.Lock()
+	defer enforcementMu.Unlock()
+	if time.Now().Before(enforcementAttemptAt) {
+		return
+	}
+	enforcementAttemptAt = time.Now().Add(time.Minute)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet,
+		cfg.entitlementAPIOrigin+"/entitlement/enforcement?resource="+url.QueryEscape(cfg.resourceURL), nil)
+	if err != nil {
+		return
+	}
+	res, err := enforcementClient.Do(req)
+	if err != nil {
+		return // unreachable: the last answer stands (strict while there is none) until the retry
+	}
+	defer res.Body.Close()
+	var body struct {
+		Enforced *bool `json:"enforced"`
+	}
+	if res.StatusCode == http.StatusOK && json.NewDecoder(res.Body).Decode(&body) == nil && body.Enforced != nil {
+		enforcementAnswer, enforcementExpires = body.Enforced, time.Now().Add(5*time.Minute)
+	}
+}
+
+func enforced(ctx context.Context, cfg plugpassConfig) bool {
+	enforcementMu.Lock()
+	answer, expires := enforcementAnswer, enforcementExpires
+	enforcementMu.Unlock()
+	if answer != nil && *answer {
+		return true // final
+	}
+	if answer == nil {
+		// No answer yet: learn it before handling the request; strict until it arrives.
+		refreshEnforcement(ctx, cfg)
+		enforcementMu.Lock()
+		defer enforcementMu.Unlock()
+		return enforcementAnswer == nil || *enforcementAnswer
+	}
+	if time.Now().After(expires) {
+		// Off and stale: refresh in the background, the cached answer serving meanwhile.
+		go refreshEnforcement(context.Background(), cfg)
+	}
+	return false
+}
+
 // The URL a request was addressed to — X-Forwarded-Host (a proxy on an old
 // address sets it), else its own host, on RESOURCE_URL's scheme and path — when
-// that URL is an accepted audience; otherwise RESOURCE_URL.
-func addressedResource(ctx context.Context, cfg plugpassConfig, r *http.Request) string {
+// that URL is an accepted audience; otherwise RESOURCE_URL. At the test path,
+// the same with the /test suffix.
+func addressedResource(ctx context.Context, cfg plugpassConfig, r *http.Request, test bool) string {
+	suffix := ""
+	if test {
+		suffix = testPathSuffix
+	}
 	host := r.Host
 	if fwd := r.Header.Get("X-Forwarded-Host"); fwd != "" {
 		host, _, _ = strings.Cut(fwd, ",")
@@ -126,13 +203,13 @@ func addressedResource(ctx context.Context, cfg plugpassConfig, r *http.Request)
 	host = strings.ToLower(strings.TrimSpace(host))
 	current, _ := url.Parse(cfg.resourceURL)
 	if host == "" || host == current.Host {
-		return cfg.resourceURL
+		return cfg.resourceURL + suffix
 	}
 	candidate := current.Scheme + "://" + host + current.Path
 	if retiredAudiences(ctx, cfg)[candidate] {
-		return candidate
+		return candidate + suffix
 	}
-	return cfg.resourceURL
+	return cfg.resourceURL + suffix
 }
 
 // The full 401 challenge for a resource.
@@ -163,12 +240,18 @@ func jwksKeyfunc(jwksURL string) (jwt.Keyfunc, error) {
 	return kf.Keyfunc, nil
 }
 
-// The auth.TokenVerifier the bearer gate runs: EdDSA-pinned, issuer exact, exp
-// required, audience = the baked RESOURCE_URL or one of this server's retired
-// URLs; extracts sub. Every token failure MUST wrap auth.ErrInvalidToken —
-// anything else becomes a 500 with no WWW-Authenticate challenge, silently
-// breaking client OAuth discovery.
-func verifyBearer(cfg plugpassConfig) auth.TokenVerifier {
+// The auth.TokenVerifier the bearer gate runs, one per path: EdDSA-pinned,
+// issuer exact, exp required, audience = the path's own resource (the baked
+// RESOURCE_URL, or its /test form at the test path) or one of this server's
+// retired URLs in the same form — a canonical token is refused at the test path
+// and a test token at the canonical path; extracts sub. Every token failure MUST
+// wrap auth.ErrInvalidToken — anything else becomes a 500 with no
+// WWW-Authenticate challenge, silently breaking client OAuth discovery.
+func verifyBearer(cfg plugpassConfig, test bool) auth.TokenVerifier {
+	suffix := ""
+	if test {
+		suffix = testPathSuffix
+	}
 	return func(ctx context.Context, token string, _ *http.Request) (*auth.TokenInfo, error) {
 		kf, err := jwksKeyfunc(cfg.jwksURL)
 		if err != nil {
@@ -186,9 +269,13 @@ func verifyBearer(cfg plugpassConfig) auth.TokenVerifier {
 		if err != nil || len(auds) == 0 {
 			return nil, fmt.Errorf("%w: missing aud", auth.ErrInvalidToken)
 		}
-		if !slices.Contains(auds, cfg.resourceURL) {
+		if !slices.Contains(auds, cfg.resourceURL+suffix) {
 			retired := retiredAudiences(ctx, cfg)
-			if !slices.ContainsFunc(auds, func(a string) bool { return retired[a] }) {
+			retiredForm := func(a string) bool {
+				canonical, ok := strings.CutSuffix(a, suffix)
+				return ok && retired[canonical]
+			}
+			if !slices.ContainsFunc(auds, retiredForm) {
 				return nil, fmt.Errorf("%w: audience not accepted", auth.ErrInvalidToken)
 			}
 		}
@@ -206,6 +293,24 @@ func verifyBearer(cfg plugpassConfig) auth.TokenVerifier {
 			Extra:      map[string]any{"raw_token": token}, // the bearer the wrappers forward
 		}, nil
 	}
+}
+
+// The verified identity a tool call carries, or nil on a request with none (the
+// /mcp gate off, before the plugin is published), which every tool handles
+// explicitly: UserID is the sub, bearerOf the raw token the wrappers forward.
+func identityOf(req *mcp.CallToolRequest) *auth.TokenInfo {
+	if req == nil || req.Extra == nil {
+		return nil
+	}
+	return req.Extra.TokenInfo
+}
+
+func bearerOf(info *auth.TokenInfo) string {
+	if info == nil {
+		return ""
+	}
+	bearer, _ := info.Extra["raw_token"].(string)
+	return bearer
 }
 
 // Per-request reauth signal, injected by reauthTo401 below; tool handlers set
@@ -258,11 +363,42 @@ type resourceKey struct{}
 
 // Outermost: resolves the addressed resource once, for every challenge the
 // request can draw.
-func withFullChallenge(cfg plugpassConfig, next http.Handler) http.Handler {
+func withFullChallenge(cfg plugpassConfig, test bool, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		resource := addressedResource(r.Context(), cfg, r)
+		resource := addressedResource(r.Context(), cfg, r, test)
 		r = r.WithContext(context.WithValue(r.Context(), resourceKey{}, resource))
 		next.ServeHTTP(&challengeWriter{ResponseWriter: w, resource: resource}, r)
+	})
+}
+
+// The bearer a request carries, if any (the scheme compared case-insensitively).
+func bearerToken(r *http.Request) (string, bool) {
+	header := r.Header.Get("Authorization")
+	if len(header) < 7 || !strings.EqualFold(header[:7], "bearer ") {
+		return "", false
+	}
+	return strings.TrimSpace(header[7:]), true
+}
+
+// The gate, armed by publish: the test path is strict from the first deploy;
+// /mcp challenges only while the plugin is published. Strict, the request runs
+// the strict chain (auth.RequireBearerToken, which challenges or injects the
+// TokenInfo); off, a valid bearer takes the same chain, and a missing, malformed,
+// or expired one takes the open chain — no TokenInfo, never challenged.
+func publishArmedGate(cfg plugpassConfig, test bool, strict, open http.Handler) http.Handler {
+	verify := verifyBearer(cfg, test)
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if test || enforced(r.Context(), cfg) {
+			strict.ServeHTTP(w, r)
+			return
+		}
+		if token, ok := bearerToken(r); ok {
+			if _, err := verify(r.Context(), token, r); err == nil {
+				strict.ServeHTTP(w, r)
+				return
+			}
+		}
+		open.ServeHTTP(w, r)
 	})
 }
 
@@ -392,7 +528,7 @@ func widgetCallable(toolMeta mcp.Meta) bool {
 }
 ```
 
-**`main.go` composition** — PRM route public, bearer gate outermost on `/mcp`, reauth buffer inside it:
+**`main.go` composition** — both PRM routes public; per path, the challenge fixup outermost, the publish-armed gate choosing between the bearer-gated chain and the open one, the reauth buffer inside both:
 
 ```go
 import (
@@ -410,24 +546,34 @@ func main() {
 		func(*http.Request) *mcp.Server { return server },
 		&mcp.StreamableHTTPOptions{Stateless: true, JSONResponse: true}, // required: lets a revoked-bearer tool swap in a 401
 	)
-	requireAuth := auth.RequireBearerToken(verifyBearer(cfg), &auth.RequireBearerTokenOptions{
-		ResourceMetadataURL: prmURL(cfg.resourceURL), // withFullChallenge rewrites it per request
-	})
+	reauthed := reauthTo401(cfg, mcpHandler)
 
 	mux := http.NewServeMux()
-	mux.HandleFunc("/.well-known/oauth-protected-resource"+mcpPath, func(w http.ResponseWriter, r *http.Request) {
-		auth.ProtectedResourceMetadataHandler(&oauthex.ProtectedResourceMetadata{
-			Resource:               addressedResource(r.Context(), cfg, r),
-			AuthorizationServers:   []string{cfg.issuer},
-			BearerMethodsSupported: []string{"header"},
-		}).ServeHTTP(w, r)
-	})
-	mux.Handle(mcpPath, withFullChallenge(cfg, requireAuth(reauthTo401(cfg, mcpHandler))))
+	for _, m := range []struct {
+		path string
+		test bool
+	}{{mcpPath, false}, {mcpPath + testPathSuffix, true}} {
+		suffix := ""
+		if m.test {
+			suffix = testPathSuffix
+		}
+		mux.HandleFunc("/.well-known/oauth-protected-resource"+m.path, func(w http.ResponseWriter, r *http.Request) {
+			auth.ProtectedResourceMetadataHandler(&oauthex.ProtectedResourceMetadata{
+				Resource:               addressedResource(r.Context(), cfg, r, m.test),
+				AuthorizationServers:   []string{cfg.issuer},
+				BearerMethodsSupported: []string{"header"},
+			}).ServeHTTP(w, r)
+		})
+		requireAuth := auth.RequireBearerToken(verifyBearer(cfg, m.test), &auth.RequireBearerTokenOptions{
+			ResourceMetadataURL: prmURL(cfg.resourceURL + suffix), // withFullChallenge rewrites it per request
+		})
+		mux.Handle(m.path, withFullChallenge(cfg, m.test, publishArmedGate(cfg, m.test, requireAuth(reauthed), reauthed)))
+	}
 	log.Fatal(http.ListenAndServe(":"+cmp.Or(os.Getenv("PORT"), "8080"), mux))
 }
 ```
 
-**Per-request identity inside a tool**: the SDK plumbs the gate's `TokenInfo` into every request — read `req.Extra.TokenInfo.UserID` (the sub) and `req.Extra.TokenInfo.Extra["raw_token"].(string)` (the bearer to forward). The reauth flag rides the handler's `ctx` (`setReauthRequired(ctx)`).
+**Per-request identity inside a tool**: the SDK plumbs the gate's `TokenInfo` into every request — read `info := identityOf(req)`: `info.UserID` is the sub, `bearerOf(info)` the bearer to forward, and `nil` a request with no identity (the /mcp gate off, before the plugin is published), which every tool handles explicitly. The reauth flag rides the handler's `ctx` (`setReauthRequired(ctx)`).
 
 **The check proxy tool (check host only).** A pure pipe — never parse or reformat `result_text`:
 
@@ -452,7 +598,13 @@ mcp.AddTool(server, &mcp.Tool{
 	// spec defaults are TRUE, so leaving either nil publishes the pessimistic value.
 	Annotations: toolHints(false, false, false, false),
 }, func(ctx context.Context, req *mcp.CallToolRequest, args checkPremiumAccessArgs) (*mcp.CallToolResult, any, error) {
-	bearer, _ := req.Extra.TokenInfo.Extra["raw_token"].(string)
+	info := identityOf(req)
+	// No identity — the /mcp gate off, before the plugin is published: the one
+	// answer the proxy composes itself, without reaching Plugpass.
+	if info == nil {
+		return unavailableCheckGrant(), nil, nil
+	}
+	bearer := bearerOf(info)
 	// The paywall's read-only probe: asks whether this user is entitled NOW,
 	// consuming nothing (check_remaining, never check_premium_access), and answers
 	// in a code that is not a check result — no PLUGPASS_PLUGIN, no USE_AUTHORIZED
@@ -493,11 +645,19 @@ mcp.AddTool(server, &mcp.Tool{
 })
 ```
 
-**Solo paid tool wrapper** (consume-on-invocation; no `auth_token` parameter on this path): validate nothing in the handler — the gate already did — read `sub` + bearer from `req.Extra.TokenInfo`, call `track_usage` (`feature_id` = the tool's own plugpass-component-id, matching its `_meta`; the id's `tool_` prefix carries the feature type), and branch: `ok` → run the body scoped to `sub`; `non_authorized` → `nonAuthorizedToolResponse(result, deniedCall{Name: "<tool name>", Arguments: args}, paidToolMeta, req, cfg, paidToolFeatureID)` (the renderer reads the tool's own registered `Meta` — its widget, who may call it — and the request, never a baked per-tool constant); `reauth_required` → `setReauthRequired(ctx)` + placeholder; error/timeout, or any other non-200 → run the body (the unavailable grant consumed nothing). Keep `_meta` via the tool's `Meta` field, hoisted to a package-level `const paidToolFeatureID = "<plugpass_id>"` + `var paidToolMeta = mcp.Meta{"plugpass_component_id": paidToolFeatureID}` (a UI-backed tool keeps its `"ui": map[string]any{"resourceUri": …, "visibility": …}` beside it) that both the registration (`Meta: paidToolMeta`) and the marker rule read, and never declare an output schema on a wrapped tool (use `any` for the structured output type). Re-derive the tool's `Annotations`: metering makes it neither read-only nor idempotent, whatever it was before the wrap — `Annotations: toolHints(false, <its own destructive value>, false, <its own open-world value>)`, see TOOLS.md § Tool annotations.
+**Solo paid tool wrapper** (consume-on-invocation; no `auth_token` parameter on this path): validate nothing in the handler — the gate already did — read `info := identityOf(req)`; when it is `nil` (no bearer — the /mcp gate off, the plugin unpublished) run the body with no entitlement call, as the tool ran before Plugpass; otherwise take `sub` (`info.UserID`) and the bearer (`bearerOf(info)`), call `track_usage` (`feature_id` = the tool's own plugpass-component-id, matching its `_meta`; the id's `tool_` prefix carries the feature type), and branch: `ok` → run the body scoped to `sub`; `non_authorized` → `nonAuthorizedToolResponse(result, deniedCall{Name: "<tool name>", Arguments: args}, paidToolMeta, req, cfg, paidToolFeatureID)` (the renderer reads the tool's own registered `Meta` — its widget, who may call it — and the request, never a baked per-tool constant); `reauth_required` → `setReauthRequired(ctx)` + placeholder; error/timeout, or any other non-200 → run the body (the unavailable grant consumed nothing). Keep `_meta` via the tool's `Meta` field, hoisted to a package-level `const paidToolFeatureID = "<plugpass_id>"` + `var paidToolMeta = mcp.Meta{"plugpass_component_id": paidToolFeatureID}` (a UI-backed tool keeps its `"ui": map[string]any{"resourceUri": …, "visibility": …}` beside it) that both the registration (`Meta: paidToolMeta`) and the marker rule read, and never declare an output schema on a wrapped tool (use `any` for the structured output type). Re-derive the tool's `Annotations`: metering makes it neither read-only nor idempotent, whatever it was before the wrap — `Annotations: toolHints(false, <its own destructive value>, false, <its own open-world value>)`, see TOOLS.md § Tool annotations.
 
 **Paired-tool add side** (`operation: add`): same shape, and `feature_id` is the tool's OWN `plugpass_id` (its `tool_` prefix carries the feature type) exactly as for a solo tool — every gated artifact bakes its own component's id, and the `entitlement` subfield is identity, never a `feature_id`. Always **`check_remaining`**, passing the user's current count from the publisher's own store (scoped to `sub`) as `current_count` — see TOOLS.md → Reading the user's current count.
 
-**Identity tool** (the paired remove side, or any per-user free tool): no Entitlement API call — read `req.Extra.TokenInfo.UserID` and scope the body to it.
+**Identity tool** (the paired remove side, or any per-user free tool): no Entitlement API call — read `identityOf(req)` and scope the body to its `UserID`; when it is `nil` (the /mcp gate off), answer that nobody is signed in and touch no record:
+
+```go
+info := identityOf(req)
+if info == nil {
+	return textResult("No user is signed in."), nil, nil
+}
+// …existing tool body, scoped to info.UserID…
+```
 
 **The in-widget paywall (`ui_paywall`, servers that render widgets).** The helper below, in `premium_feature_access_check.go`, is applied to every resource the server reads out whose MIME type is `text/html;profile=mcp-app`: the paywall script tag goes first in `<head>`, and the script's origin joins the resource's `resourceDomains`. The widget HTML itself is never edited.
 
@@ -547,4 +707,4 @@ server.AddResource(&mcp.Resource{URI: "ui://<plugin>/<widget>", Name: "widget", 
 	})
 ```
 
-**Placement guidance.** A vanilla `net/http` server follows the composition above; a server using chi/gin/echo mounts the same three pieces (public PRM route; `requireAuth(reauthTo401(mcpHandler))` on `/mcp`) through its router's `http.Handler` adapters. Invariants regardless of layout: `Stateless: true, JSONResponse: true` (both — the flag mechanism silently dies in stateful mode); verifier failures wrap `auth.ErrInvalidToken`; the gate covers every `/mcp` method; on a server whose directive names `ui_paywall`, every `text/html;profile=mcp-app` resource read passes through `withPaywall`. Local-dev note: the SDK 403s requests whose `Host` isn't loopback when listening on loopback (DNS-rebinding guard) — testing through a tunnel needs `DisableLocalhostProtection: true`, never in production.
+**Placement guidance.** A vanilla `net/http` server follows the composition above; a server using chi/gin/echo mounts the same pieces (the public PRM routes; per path, `withFullChallenge(cfg, test, publishArmedGate(cfg, test, requireAuth(reauthed), reauthed))`) through its router's `http.Handler` adapters. Invariants regardless of layout: `Stateless: true, JSONResponse: true` (both — the flag mechanism silently dies in stateful mode); verifier failures wrap `auth.ErrInvalidToken`; the handler is mounted at `/mcp` and `/mcp/test`, each behind `withFullChallenge` and `publishArmedGate` covering every method — strict at the test path, armed by publish at `/mcp`, never challenging while off; both PRM routes public; on a server whose directive names `ui_paywall`, every `text/html;profile=mcp-app` resource read passes through `withPaywall`. Local-dev note: the SDK 403s requests whose `Host` isn't loopback when listening on loopback (DNS-rebinding guard) — testing through a tunnel needs `DisableLocalhostProtection: true`, never in production.

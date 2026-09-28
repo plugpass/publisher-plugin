@@ -1,12 +1,13 @@
 # Rust scaffolding template
 
-The publisher's server becomes an **OAuth-protected resource server**: an axum middleware gates `/mcp` (validating the bearer against Plugpass's JWKS with `jsonwebtoken`), an axum route serves the RFC 9728 PRM document, and rmcp's streamable-HTTP service runs behind them. Standalone source, no platform package. Version pins: `rmcp = { version = "3.2", features = ["server", "transport-streamable-http-server"] }` (**the 3.x line — it is what implements protocol 2026-07-28; on 2.x the server serves the legacy era only**), `jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }` (**the feature pin is load-bearing — bare `jsonwebtoken = "10"` has no crypto provider and panics at runtime on the first verify**), `axum = "0.8"`, `http = "1"`, `reqwest = { version = "0.13", features = ["json"] }`, `schemars = "1"` (must be 1.x to match rmcp's), `serde`, `serde_json`, `tokio`.
+The publisher's server becomes an **OAuth-protected resource server**: an axum middleware gates `/mcp` and `/mcp/test` (validating the bearer against Plugpass's JWKS with `jsonwebtoken` — `/mcp/test` strict from the first deploy, `/mcp` once the plugin is published), axum routes serve the RFC 9728 PRM documents for both, and rmcp's streamable-HTTP service runs behind them at both paths. Standalone source, no platform package. Version pins: `rmcp = { version = "3.2", features = ["server", "transport-streamable-http-server"] }` (**the 3.x line — it is what implements protocol 2026-07-28; on 2.x the server serves the legacy era only**), `jsonwebtoken = { version = "10", default-features = false, features = ["rust_crypto"] }` (**the feature pin is load-bearing — bare `jsonwebtoken = "10"` has no crypto provider and panics at runtime on the first verify**), `axum = "0.8"`, `http = "1"`, `reqwest = { version = "0.13", features = ["json"] }`, `schemars = "1"` (must be 1.x to match rmcp's), `serde`, `serde_json`, `tokio`.
 
-**Three structural decisions carry the whole design — never undo them:**
+**Four structural decisions carry the whole design — never undo them:**
 
 1. **The server serves BOTH protocol eras from the one service.** rmcp routes each request by its negotiated version, answers `server/discover` (a defaulted `ServerHandler` method), and parses the per-request `_meta` envelope into a `RequestMetaObject` whose `client_capabilities()` the marker rule reads. The client's UI capability rides that envelope, and a host that gets only the legacy era never sends it. Nothing extra is wired for it: rmcp does the era routing.
 2. **`.with_legacy_session_mode(false).with_json_response(true)` on the transport config, always — as a pair.** 2026-07-28 requests are always served statelessly (SEP-2567 removes sessions); `legacy_session_mode: false` puts the 2025-era leg on the same stateless path, and `json_response` then buffers BOTH, so the gate middleware holds the complete response and can swap in a `401` when a tool discovered mid-call that the bearer is revoked. `json_response` has **no effect in a session-mode legacy exchange** (SSE streams the `200` before the tool runs) — dropping either flag silently kills the reauth mechanism. Leave `stateless_protocol_metadata_required` at its `false` default, or 2025-era clients are refused.
-3. **Every accepted audience comes from Plugpass, never from the request.** A bearer's `aud` must be the baked `RESOURCE_URL` or one of the retired URLs Plugpass reports for this server (the addresses it moved off, which old installs still call). The PRM `resource` and the challenge's `resource_metadata` name the URL the request was addressed to (`X-Forwarded-Host`, else `Host`) only when that URL is an accepted audience, else `RESOURCE_URL`. This is what lets a locally-listening server accept real bearers minted for its public URL, and what keeps a moved server working for installs of its old address.
+3. **Every accepted audience comes from Plugpass, never from the request.** A bearer's `aud` must be the path's own resource — the baked `RESOURCE_URL` at `/mcp`, `{RESOURCE_URL}/test` at `/mcp/test` — or one of the retired URLs Plugpass reports for this server (the addresses it moved off, which old installs still call) in the same form. The two never cross. The PRM `resource` and the challenge's `resource_metadata` name the URL the request was addressed to (`X-Forwarded-Host`, else `Host`) only when that URL is an accepted audience, else `RESOURCE_URL` — with the `/test` suffix at the test path. This is what lets a locally-listening server accept real bearers minted for its public URL, and what keeps a moved server working for installs of its old address.
+4. **The `/mcp` gate is armed by publish, and only by publish.** `enforced()` answers whether the plugin has a published version — fetched from Plugpass before the first request is handled, cached five minutes and refreshed in the background, keyed by `RESOURCE_URL` and nothing else, final once `true`, strict while there is no answer. Off, `/mcp` challenges nobody: a valid bearer is handled as when on, a missing (or malformed, or expired) bearer means no `Identity` in the request extensions, and every tool states what it does with none. The test path never consults it.
 
 ```rust
 // premium_feature_access_check.rs — written once per server. Standalone.
@@ -19,6 +20,10 @@ use jsonwebtoken::jwk::JwkSet;
 use jsonwebtoken::{decode, decode_header, Algorithm, DecodingKey, Validation};
 
 pub const MCP_PATH: &str = "/mcp";
+// The test path: the same service, strictly gated from the first deploy, for a
+// resource of its own — `{RESOURCE_URL}/test` — that Plugpass mints only to the
+// plugin's test users.
+pub const TEST_PATH_SUFFIX: &str = "/test";
 
 // Plugpass endpoints for this server.
 const PLUGIN_ID: &str = "<the plugin's Plugpass id>";
@@ -61,10 +66,14 @@ pub fn plugpass_config() -> PlugpassConfig {
     }
 }
 
-// RFC 9728 path-aware PRM URL: origin + /.well-known/oauth-protected-resource + /mcp.
+// RFC 9728 path-aware PRM URL: origin + /.well-known/oauth-protected-resource +
+// the resource's path — the test document for a test resource.
 pub fn prm_url(resource: &str) -> String {
-    let origin = resource.trim_end_matches(MCP_PATH);
-    format!("{origin}/.well-known/oauth-protected-resource{MCP_PATH}")
+    let (origin, path) = match resource.strip_suffix(TEST_PATH_SUFFIX) {
+        Some(canonical) => (canonical.trim_end_matches(MCP_PATH), format!("{MCP_PATH}{TEST_PATH_SUFFIX}")),
+        None => (resource.trim_end_matches(MCP_PATH), MCP_PATH.to_string()),
+    };
+    format!("{origin}/.well-known/oauth-protected-resource{path}")
 }
 
 // Per-request values the gate inserts into the request extensions; rmcp carries
@@ -125,10 +134,75 @@ pub async fn retired_audiences(cfg: &PlugpassConfig) -> HashSet<String> {
     urls
 }
 
+// The enforcement state — whether the plugin is published, the one input that
+// turns the /mcp gate on. Fetched before the first request a process serves is
+// handled (one attempt at a time under the async lock; a concurrent caller
+// waits and takes its answer), cached 5 minutes and refreshed in the background
+// after that; keyed by RESOURCE_URL and by nothing in any request. `true` is
+// final for the process. A failed fetch keeps the last answer; with no answer
+// yet the gate is strict, and the fetch is retried after 1 minute.
+static ENFORCEMENT: Mutex<Option<(bool, Instant)>> = Mutex::new(None); // (enforced, expires_at)
+static ENFORCEMENT_ATTEMPT_AT: Mutex<Option<Instant>> = Mutex::new(None);
+const ENFORCEMENT_TTL: Duration = Duration::from_secs(300);
+const ENFORCEMENT_RETRY: Duration = Duration::from_secs(60);
+
+fn enforcement_fetch_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+async fn refresh_enforcement(cfg: &PlugpassConfig) {
+    let _in_flight = enforcement_fetch_lock().lock().await;
+    {
+        let mut attempt_at = ENFORCEMENT_ATTEMPT_AT.lock().unwrap();
+        if attempt_at.is_some_and(|at| Instant::now() < at) {
+            return;
+        }
+        *attempt_at = Some(Instant::now() + ENFORCEMENT_RETRY);
+    }
+    #[derive(serde::Deserialize)]
+    struct Body { enforced: bool }
+    let fetched = async {
+        let url = reqwest::Url::parse_with_params(
+            &format!("{}/entitlement/enforcement", cfg.entitlement_api_origin),
+            &[("resource", cfg.resource_url.as_str())],
+        ).ok()?;
+        let res = http_client().get(url).send().await.ok()?;
+        if !res.status().is_success() { return None; }
+        res.json::<Body>().await.ok()
+    }.await;
+    // Unreachable: the last answer stands (strict while there is none) until the retry.
+    if let Some(body) = fetched {
+        *ENFORCEMENT.lock().unwrap() = Some((body.enforced, Instant::now() + ENFORCEMENT_TTL));
+    }
+}
+
+pub async fn enforced(cfg: &PlugpassConfig) -> bool {
+    let answer = *ENFORCEMENT.lock().unwrap();
+    match answer {
+        Some((true, _)) => true, // final
+        None => {
+            // No answer yet: learn it before handling the request; strict until it arrives.
+            refresh_enforcement(cfg).await;
+            ENFORCEMENT.lock().unwrap().map_or(true, |(enforced, _)| enforced)
+        }
+        Some((false, expires_at)) => {
+            if Instant::now() >= expires_at {
+                // Off and stale: refresh in the background, the cached answer serving meanwhile.
+                let cfg = cfg.clone();
+                tokio::spawn(async move { refresh_enforcement(&cfg).await });
+            }
+            false
+        }
+    }
+}
+
 // The URL a request was addressed to — `X-Forwarded-Host` (a proxy on an old
 // address sets it), else its `Host`, on RESOURCE_URL's scheme and path — when
-// that URL is an accepted audience; otherwise RESOURCE_URL.
-pub async fn addressed_resource(cfg: &PlugpassConfig, headers: &http::HeaderMap) -> String {
+// that URL is an accepted audience; otherwise RESOURCE_URL. At the test path,
+// the same with the `/test` suffix.
+pub async fn addressed_resource(cfg: &PlugpassConfig, headers: &http::HeaderMap, test: bool) -> String {
+    let suffix = if test { TEST_PATH_SUFFIX } else { "" };
     let raw = headers
         .get("x-forwarded-host")
         .or_else(|| headers.get(http::header::HOST))
@@ -143,16 +217,20 @@ pub async fn addressed_resource(cfg: &PlugpassConfig, headers: &http::HeaderMap)
         None => current.host_str().unwrap_or("").to_string(),
     };
     if host.is_empty() || host == current_host {
-        return cfg.resource_url.clone();
+        return format!("{}{suffix}", cfg.resource_url);
     }
     let candidate = format!("{}://{host}{}", current.scheme(), current.path());
-    if retired_audiences(cfg).await.contains(&candidate) { candidate } else { cfg.resource_url.clone() }
+    let accepted = if retired_audiences(cfg).await.contains(&candidate) { candidate } else { cfg.resource_url.clone() };
+    format!("{accepted}{suffix}")
 }
 
-// EdDSA-pinned, issuer exact, exp+sub required, audience = the baked
-// RESOURCE_URL or one of this server's retired URLs. Returns the user id, or
-// None on any failure.
-pub async fn verify_bearer(token: &str, cfg: &PlugpassConfig) -> Option<String> {
+// EdDSA-pinned, issuer exact, exp+sub required, audience = the path's own
+// resource (the baked RESOURCE_URL, or its `/test` form at the test path) or one
+// of this server's retired URLs in the same form — a canonical token is refused
+// at the test path and a test token at the canonical path. Returns the user
+// id, or None on any failure.
+pub async fn verify_bearer(token: &str, cfg: &PlugpassConfig, test: bool) -> Option<String> {
+    let suffix = if test { TEST_PATH_SUFFIX } else { "" };
     let header = decode_header(token).ok()?;
     let key = decoding_key_for(&cfg.jwks_url, header.kid.as_deref()?).await?;
     let mut validation = Validation::new(Algorithm::EdDSA);
@@ -165,9 +243,11 @@ pub async fn verify_bearer(token: &str, cfg: &PlugpassConfig) -> Option<String> 
         serde_json::Value::Array(auds) => auds.iter().filter_map(|a| a.as_str()).collect(),
         _ => return None,
     };
-    if !auds.contains(&cfg.resource_url.as_str()) {
+    let own = format!("{}{suffix}", cfg.resource_url);
+    if !auds.contains(&own.as_str()) {
         let retired = retired_audiences(cfg).await;
-        if !auds.iter().any(|aud| retired.contains(*aud)) {
+        let retired_form = |aud: &&str| aud.strip_suffix(suffix).is_some_and(|canonical| retired.contains(canonical));
+        if !auds.iter().any(retired_form) {
             return None;
         }
     }
@@ -278,7 +358,7 @@ pub fn widget_callable(tool_meta: &MetaObject) -> bool {
 }
 ```
 
-**`main.rs` composition** — PRM route public; the gate layered on the nested MCP service:
+**`main.rs` composition** — both PRM routes public; the same MCP service at `/mcp` and `/mcp/test`, each behind the gate with its own `test` flag:
 
 ```rust
 use rmcp::transport::streamable_http_server::{
@@ -286,8 +366,8 @@ use rmcp::transport::streamable_http_server::{
 };
 
 let cfg = plugpass_config();
-let mcp_service = StreamableHttpService::new(
-    move || Ok(MyServer::new(cfg.clone(), /* …shared state via Arc… */)), // fresh handler per POST
+let mcp_service = || StreamableHttpService::new(
+    { let cfg = cfg.clone(); move || Ok(MyServer::new(cfg.clone(), /* …shared state via Arc… */)) }, // fresh handler per POST
     Arc::new(NeverSessionManager::default()),
     StreamableHttpServerConfig::default()   // #[non_exhaustive] — builders only, never a struct literal
         .with_legacy_session_mode(false)    // required, as a pair: BOTH eras stateless + buffered,
@@ -297,21 +377,31 @@ let mcp_service = StreamableHttpService::new(
         .disable_allowed_hosts(),           // default allows loopback Hosts only — a public deploy 403s
                                             // without this (defensible: every request is bearer-gated)
 );
-let protected = Router::new()
-    .nest_service(MCP_PATH, mcp_service)
-    .layer(middleware::from_fn_with_state(cfg.clone(), bearer_gate));
+let gated = |path: &str, test: bool| Router::new()
+    .route_service(path, mcp_service())
+    .layer(middleware::from_fn_with_state((cfg.clone(), test), bearer_gate));
 let app = Router::new()
     .route("/.well-known/oauth-protected-resource/mcp", get(prm_document))
+    .route("/.well-known/oauth-protected-resource/mcp/test", get(test_prm_document))
     .with_state(cfg.clone())
-    .merge(protected);
+    .merge(gated(MCP_PATH, false))
+    .merge(gated(&format!("{MCP_PATH}{TEST_PATH_SUFFIX}"), true));
 axum::serve(tokio::net::TcpListener::bind(("0.0.0.0", port)).await?, app).await?;
 ```
 
 ```rust
-// The PRM document (unauthenticated) for the addressed resource, and the gate.
+// The PRM documents (unauthenticated) for the addressed resource, and the gate.
 async fn prm_document(State(cfg): State<PlugpassConfig>, headers: http::HeaderMap) -> Json<serde_json::Value> {
+    prm_document_for(&cfg, &headers, false).await
+}
+
+async fn test_prm_document(State(cfg): State<PlugpassConfig>, headers: http::HeaderMap) -> Json<serde_json::Value> {
+    prm_document_for(&cfg, &headers, true).await
+}
+
+async fn prm_document_for(cfg: &PlugpassConfig, headers: &http::HeaderMap, test: bool) -> Json<serde_json::Value> {
     Json(serde_json::json!({
-        "resource": addressed_resource(&cfg, &headers).await,
+        "resource": addressed_resource(cfg, headers, test).await,
         "authorization_servers": [cfg.issuer],
         "bearer_methods_supported": ["header"],
     }))
@@ -328,16 +418,22 @@ fn challenge_401(resource: &str, description: &str) -> Response {
     ).into_response()
 }
 
-async fn bearer_gate(State(cfg): State<PlugpassConfig>, mut request: Request, next: Next) -> Response {
-    let resource = addressed_resource(&cfg, request.headers()).await;
-    let Some(token) = bearer_from(request.headers()) else {
-        return challenge_401(&resource, "Missing bearer token");
-    };
-    let Some(sub) = verify_bearer(&token, &cfg).await else {
-        return challenge_401(&resource, "Token invalid or expired");
-    };
+// The gate: the test path is strict from the first deploy; /mcp challenges only
+// while the plugin is published. Off, a request with no valid bearer is handled
+// with no `Identity` — never challenged.
+async fn bearer_gate(State((cfg, test)): State<(PlugpassConfig, bool)>, mut request: Request, next: Next) -> Response {
+    let resource = addressed_resource(&cfg, request.headers(), test).await;
+    let strict = test || enforced(&cfg).await;
+    match bearer_from(request.headers()) {
+        Some(token) => match verify_bearer(&token, &cfg, test).await {
+            Some(sub) => { request.extensions_mut().insert(Identity { sub, bearer: token }); }
+            None if strict => return challenge_401(&resource, "Token invalid or expired"),
+            None => {} // off: a malformed or expired bearer is no bearer
+        },
+        None if strict => return challenge_401(&resource, "Missing bearer token"),
+        None => {}
+    }
     let signal = ReauthSignal(Arc::new(AtomicBool::new(false)));
-    request.extensions_mut().insert(Identity { sub, bearer: token });
     request.extensions_mut().insert(signal.clone());
     let response = next.run(request).await; // stateless+json: resolves only after the tool finished
     if signal.0.load(Ordering::Relaxed) {
@@ -347,7 +443,7 @@ async fn bearer_gate(State(cfg): State<PlugpassConfig>, mut request: Request, ne
 }
 ```
 
-**Per-request identity inside a tool**: extract `Extension(parts): Extension<http::request::Parts>` (the `rmcp::handler::server::common::Extension` extractor — it moved out of `::tool::` in rmcp 2.2) and read the gate's values **nested inside** the parts — `parts.extensions.get::<Identity>()` / `parts.extensions.get::<ReauthSignal>()`. rmcp injects the whole `http::request::Parts` as one context extension, so a top-level `Extension<Identity>` will NOT find them.
+**Per-request identity inside a tool**: extract `Extension(parts): Extension<http::request::Parts>` (the `rmcp::handler::server::common::Extension` extractor — it moved out of `::tool::` in rmcp 2.2) and read the gate's values **nested inside** the parts — `parts.extensions.get::<Identity>()` (`None` on a request with no identity: the /mcp gate off, before the plugin is published, which every tool handles explicitly) / `parts.extensions.get::<ReauthSignal>()`. rmcp injects the whole `http::request::Parts` as one context extension, so a top-level `Extension<Identity>` will NOT find them.
 
 **The check proxy tool (check host only).** A pure pipe — never parse or reformat `result_text`:
 
@@ -383,8 +479,10 @@ async fn check_premium_access(
     Parameters(args): Parameters<CheckPremiumAccessArgs>,
     Extension(parts): Extension<http::request::Parts>,
 ) -> Result<CallToolResult, ErrorData> {
+    // No identity — the /mcp gate off, before the plugin is published: the one
+    // answer the proxy composes itself, without reaching Plugpass.
     let Some(identity) = parts.extensions.get::<Identity>().cloned() else {
-        return Ok(unavailable_check_grant()); // unreachable behind the gate
+        return Ok(unavailable_check_grant());
     };
     // The paywall's read-only probe: asks whether this user is entitled NOW,
     // consuming nothing (check_remaining, never check_premium_access), and answers
@@ -426,11 +524,18 @@ async fn check_premium_access(
 }
 ```
 
-**Solo paid tool wrapper** (consume-on-invocation; no `auth_token` parameter on this path): read `Identity` from the parts extensions, call `track_usage` (`feature_id` = the tool's own plugpass-component-id, matching its `_meta`; the id's `tool_` prefix carries the feature type), branch: `Ok` → run the body scoped to `identity.sub`; `NonAuthorized` → `non_authorized_tool_response(&result_text, DeniedCall { name: "<tool name>".into(), arguments: serde_json::to_value(&args).unwrap_or(Value::Null) }, &paid_tool_meta(), &meta, &self.cfg, PAID_TOOL_FEATURE_ID)` — the args struct derives `serde::Serialize` beside `Deserialize` (`#[serde(skip_serializing_if = "Option::is_none")]` on each optional field, so the echo is the call as sent), every wrapped tool's handler extracts `meta: RequestMetaObject` (rmcp's request-`_meta` extractor, beside `Parameters` and `Extension`), and the renderer reads the tool's own registered `MetaObject` (its widget, who may call it) and the request's capabilities — never a baked per-tool constant; `ReauthRequired` → set the signal + placeholder; `Unavailable` → run the body (it consumed nothing and grants). Stamp `_meta` with the macro's `meta` attribute, `#[tool(name = "…", description = "…", meta = paid_tool_meta())]`, where `fn paid_tool_meta() -> MetaObject` builds the `MetaObject` carrying `plugpass_component_id` (from a `const PAID_TOOL_FEATURE_ID: &str`) (and, on a UI-backed tool, its `ui: { resourceUri, visibility }`) — the one function both the attribute and the marker rule read. Wrapped tools return `Result<CallToolResult, ErrorData>` — never a `Json<T>` typed result (no output schema: paywall/reauth responses are text-only). Re-derive the macro's `annotations(…)`: metering makes the tool neither read-only nor idempotent, whatever it was before the wrap — `read_only_hint = false, idempotent_hint = false`, the other two keeping the tool's own values; see TOOLS.md § Tool annotations.
+**Solo paid tool wrapper** (consume-on-invocation; no `auth_token` parameter on this path): read `Identity` from the parts extensions — `None` (no bearer: the /mcp gate off, the plugin unpublished) runs the body with no entitlement call, as the tool ran before Plugpass; with one, call `track_usage` (`feature_id` = the tool's own plugpass-component-id, matching its `_meta`; the id's `tool_` prefix carries the feature type), branch: `Ok` → run the body scoped to `identity.sub`; `NonAuthorized` → `non_authorized_tool_response(&result_text, DeniedCall { name: "<tool name>".into(), arguments: serde_json::to_value(&args).unwrap_or(Value::Null) }, &paid_tool_meta(), &meta, &self.cfg, PAID_TOOL_FEATURE_ID)` — the args struct derives `serde::Serialize` beside `Deserialize` (`#[serde(skip_serializing_if = "Option::is_none")]` on each optional field, so the echo is the call as sent), every wrapped tool's handler extracts `meta: RequestMetaObject` (rmcp's request-`_meta` extractor, beside `Parameters` and `Extension`), and the renderer reads the tool's own registered `MetaObject` (its widget, who may call it) and the request's capabilities — never a baked per-tool constant; `ReauthRequired` → set the signal + placeholder; `Unavailable` → run the body (it consumed nothing and grants). Stamp `_meta` with the macro's `meta` attribute, `#[tool(name = "…", description = "…", meta = paid_tool_meta())]`, where `fn paid_tool_meta() -> MetaObject` builds the `MetaObject` carrying `plugpass_component_id` (from a `const PAID_TOOL_FEATURE_ID: &str`) (and, on a UI-backed tool, its `ui: { resourceUri, visibility }`) — the one function both the attribute and the marker rule read. Wrapped tools return `Result<CallToolResult, ErrorData>` — never a `Json<T>` typed result (no output schema: paywall/reauth responses are text-only). Re-derive the macro's `annotations(…)`: metering makes the tool neither read-only nor idempotent, whatever it was before the wrap — `read_only_hint = false, idempotent_hint = false`, the other two keeping the tool's own values; see TOOLS.md § Tool annotations.
 
 **Paired-tool add side** (`operation: add`): same shape, and `feature_id` is the tool's OWN `plugpass_id` (its `tool_` prefix carries the feature type) exactly as for a solo tool — every gated artifact bakes its own component's id, and the `entitlement` subfield is identity, never a `feature_id`. Always **`check_remaining`**, passing the user's current count from the publisher's own store (scoped to `sub`) as `current_count` — see TOOLS.md → Reading the user's current count.
 
-**Identity tool** (the paired remove side, or any per-user free tool): no Entitlement API call — read `Identity.sub` from the parts extensions and scope the body to it.
+**Identity tool** (the paired remove side, or any per-user free tool): no Entitlement API call — read `Identity` from the parts extensions and scope the body to its `sub`; with `None` (the /mcp gate off), answer that nobody is signed in and touch no record:
+
+```rust
+let Some(identity) = parts.extensions.get::<Identity>().cloned() else {
+    return Ok(CallToolResult::success(vec![ContentBlock::text("No user is signed in.")]));
+};
+// …existing tool body, scoped to identity.sub…
+```
 
 **The in-widget paywall (`ui_paywall`, servers that render widgets).** The helper below, in `premium_feature_access_check.rs`, is applied to every resource the server reads out whose MIME type is `text/html;profile=mcp-app`: the paywall script tag goes first in `<head>`, and the script's origin joins the resource's `resourceDomains`. The widget HTML itself is never edited.
 
@@ -497,4 +602,4 @@ async fn read_resource(&self, request: ReadResourceRequestParams, _context: Requ
 }
 ```
 
-**Placement guidance.** The handler struct keeps rmcp's macro requirements: a `tool_router: ToolRouter<Self>` field initialized with `Self::tool_router()`, `#[tool_router]` on the impl block, `#[tool_handler(router = self.tool_router)]` on the `ServerHandler` impl (the macro's default rebuilds a router per call and leaves the field unread); args structs derive `serde::Deserialize + schemars::JsonSchema` (schemars 1.x). rmcp's config/model types are `#[non_exhaustive]` — always builders or mutate-a-`Default`. Invariants regardless of layout: the `legacy_session_mode(false)` + `json_response(true)` pair on the transport config, so both eras are stateless and buffered; the gate layered on the MCP service covering every method; the PRM route outside the gate; extensions read through `Parts`, never top-level; on a server whose directive names `ui_paywall`, every `text/html;profile=mcp-app` resource read passes through `with_paywall`.
+**Placement guidance.** The handler struct keeps rmcp's macro requirements: a `tool_router: ToolRouter<Self>` field initialized with `Self::tool_router()`, `#[tool_router]` on the impl block, `#[tool_handler(router = self.tool_router)]` on the `ServerHandler` impl (the macro's default rebuilds a router per call and leaves the field unread); args structs derive `serde::Deserialize + schemars::JsonSchema` (schemars 1.x). rmcp's config/model types are `#[non_exhaustive]` — always builders or mutate-a-`Default`. Invariants regardless of layout: the `legacy_session_mode(false)` + `json_response(true)` pair on the transport config, so both eras are stateless and buffered; the MCP service at `/mcp` and `/mcp/test`, each behind the gate covering every method — strict at the test path, armed by publish at `/mcp` through `enforced()`, never challenging while off; both PRM routes outside the gate; extensions read through `Parts`, never top-level; on a server whose directive names `ui_paywall`, every `text/html;profile=mcp-app` resource read passes through `with_paywall`.

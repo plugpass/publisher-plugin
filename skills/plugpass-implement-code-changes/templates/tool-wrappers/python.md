@@ -1,28 +1,40 @@
 # Python scaffolding template
 
-The publisher's server becomes an **OAuth-protected resource server** using the official MCP SDK's built-in auth: a `TokenVerifier` + `AuthSettings` make the server serve the RFC 9728 PRM document itself and answer `/mcp` requests without a valid bearer with the `401` + `WWW-Authenticate` challenge (`error="invalid_token"`, `resource_metadata="…"` — the exact shape MCP clients key OAuth discovery off). Standalone source, no platform package. Version pins: **`mcp>=2.2.0,<3`** (the 2.x line — it is what implements protocol 2026-07-28; on 1.x the server serves the legacy era only), `pyjwt[crypto]>=2.13.0`, `httpx`.
+The publisher's server becomes an **OAuth-protected resource server**: a pure-ASGI gate in front of the official MCP SDK's streamable-HTTP app validates bearers locally against Plugpass's JWKS, serves the RFC 9728 PRM documents at both paths, and answers requests without a valid bearer with the `401` + `WWW-Authenticate` challenge (`error="invalid_token"`, `resource_metadata="…"` — the exact shape MCP clients key OAuth discovery off) — at `/mcp` once the plugin is published, at `/mcp/test` from the first deploy. The gate hands the verified identity to the SDK's request context exactly as the SDK's own auth would (`request.user.access_token`); the SDK's `AuthSettings` are **not** used, since they challenge every request whatever the enforcement state. Standalone source, no platform package. Version pins: **`mcp>=2.2.0,<3`** (the 2.x line — it is what implements protocol 2026-07-28; on 1.x the server serves the legacy era only), `pyjwt[crypto]>=2.13.0`, `httpx`.
 
-**Three structural decisions carry the whole design — never undo them:**
+**Four structural decisions carry the whole design — never undo them:**
 
 1. **The server serves BOTH protocol eras from the one app.** The SDK's session manager routes each request by its `MCP-Protocol-Version` header: 2026-07-28 to the modern, envelope-based leg (which owns `server/discover`), the handshake versions to their own. The client's UI capability rides the modern envelope — that is what the paywall-UI marker reads — and a host that gets only the legacy era never sends it. Nothing extra is wired for it: the SDK line does the era routing.
 2. **`stateless_http=True, json_response=True` on the app, always.** In JSON mode BOTH legs write the HTTP response only after the tool handler finished, so an outer ASGI middleware can replace it with a `401` when a tool discovers mid-call that the bearer is revoked (`reauth_required` from the Entitlement API). In SSE mode the `200` headers hit the wire before the tool runs — the swap is impossible. Stateless also makes per-request auth context reliable.
-3. **Every accepted audience comes from Plugpass, never from the request.** A bearer's `aud` must be the baked `RESOURCE_URL` (also the `AuthSettings.resource_server_url`, which drives the PRM route path) or one of the retired URLs Plugpass reports for this server (the addresses it moved off, which old installs still call). The PRM `resource` and the challenge's `resource_metadata` name the URL the request was addressed to (`X-Forwarded-Host`, else `Host`) only when that URL is an accepted audience, else `RESOURCE_URL`. This is what lets a locally-listening server accept real bearers minted for its public URL, and what keeps a moved server working for installs of its old address.
+3. **Every accepted audience comes from Plugpass, never from the request.** A bearer's `aud` must be the path's own resource — the baked `RESOURCE_URL` at `/mcp`, `{RESOURCE_URL}/test` at `/mcp/test` — or one of the retired URLs Plugpass reports for this server (the addresses it moved off, which old installs still call) in the same form. The two never cross. The PRM `resource` and the challenge's `resource_metadata` name the URL the request was addressed to (`X-Forwarded-Host`, else `Host`) only when that URL is an accepted audience, else `RESOURCE_URL` — with the `/test` suffix at the test path. This is what lets a locally-listening server accept real bearers minted for its public URL, and what keeps a moved server working for installs of its old address.
+4. **The `/mcp` gate is armed by publish, and only by publish.** `enforced()` answers whether the plugin has a published version — fetched from Plugpass before the first request is handled, cached five minutes and refreshed in the background, keyed by `RESOURCE_URL` and nothing else, final once `True`, strict while there is no answer. Off, `/mcp` challenges nobody: a valid bearer is handled as when on, a missing (or malformed, or expired) bearer means no identity, and every tool states what it does with none. The test path never consults it.
 
 ```python
 # premium_feature_access_check.py — written once per server. Standalone.
+import asyncio
 import json
-import os
 import re
 import time
 from dataclasses import dataclass
+from typing import Any
+from urllib.parse import urlsplit
 
 import anyio
 import httpx
 import jwt as pyjwt
 from jwt import PyJWKClient
+from mcp import types
+from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.auth.provider import AccessToken
+from mcp.server.mcpserver import Context
+from starlette.authentication import AuthCredentials, UnauthenticatedUser
 
 MCP_PATH = "/mcp"
+# The test path: the same app, strictly gated from the first deploy, for a
+# resource of its own — `{RESOURCE_URL}/test` — that Plugpass mints only to the
+# plugin's test users.
+TEST_PATH_SUFFIX = "/test"
+TEST_MCP_PATH = f"{MCP_PATH}{TEST_PATH_SUFFIX}"
 
 # Plugpass endpoints for this server.
 PLUGIN_ID = "<the plugin's Plugpass id>"
@@ -52,16 +64,16 @@ class PlugpassConfig:
     paywall_script_url: str
     check_tool_name: str | None
 
-    @property
-    def prm_url(self) -> str:
-        return prm_url(self.resource_url)
-
 
 PRM_PATH = f"/.well-known/oauth-protected-resource{MCP_PATH}"
+TEST_PRM_PATH = f"{PRM_PATH}{TEST_PATH_SUFFIX}"
 
 
 def prm_url(resource: str) -> str:
-    # RFC 9728 path-aware form: origin + /.well-known/oauth-protected-resource + /mcp
+    # RFC 9728 path-aware form: origin + /.well-known/oauth-protected-resource +
+    # the resource's path — the test document for a test resource.
+    if resource.endswith(TEST_MCP_PATH):
+        return f"{resource.removesuffix(TEST_MCP_PATH)}{TEST_PRM_PATH}"
     return f"{resource.removesuffix(MCP_PATH)}{PRM_PATH}"
 
 
@@ -111,27 +123,82 @@ async def retired_audiences(cfg: PlugpassConfig) -> frozenset[str]:
         return urls
 
 
-async def addressed_resource(cfg: PlugpassConfig, scope) -> str:
+# The enforcement state — whether the plugin is published, the one input that
+# turns the /mcp gate on. Fetched before the first request a process serves is
+# handled (one attempt at a time; a concurrent caller waits on the lock and takes
+# its answer), cached 5 minutes and refreshed in the background after that;
+# keyed by RESOURCE_URL and by nothing in any request. True is final for the
+# process. A failed fetch keeps the last answer; with no answer yet the gate is
+# strict, and the fetch is retried after 1 minute.
+ENFORCEMENT_TTL_S = 300
+ENFORCEMENT_RETRY_S = 60
+_enforcement: tuple[bool, float] | None = None  # (enforced, expires_at (monotonic))
+_enforcement_attempt_at = 0.0
+_enforcement_lock = anyio.Lock()
+_enforcement_tasks: set[asyncio.Task[None]] = set()
+
+
+async def _refresh_enforcement(cfg: PlugpassConfig) -> None:
+    global _enforcement, _enforcement_attempt_at
+    async with _enforcement_lock:
+        now = time.monotonic()
+        if now < _enforcement_attempt_at:
+            return
+        _enforcement_attempt_at = now + ENFORCEMENT_RETRY_S
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                res = await client.get(
+                    f"{cfg.entitlement_api_origin}/entitlement/enforcement",
+                    params={"resource": cfg.resource_url},
+                )
+            enforced_answer = res.json().get("enforced") if res.status_code == 200 else None
+            if isinstance(enforced_answer, bool):
+                _enforcement = (enforced_answer, time.monotonic() + ENFORCEMENT_TTL_S)
+        except Exception:
+            pass  # unreachable: the last answer stands (strict while there is none) until the retry
+
+
+async def enforced(cfg: PlugpassConfig) -> bool:
+    answer = _enforcement
+    if answer is not None and answer[0]:
+        return True  # final
+    if answer is None:
+        # No answer yet: learn it before handling the request; strict until it arrives.
+        await _refresh_enforcement(cfg)
+        return _enforcement is None or _enforcement[0]
+    if time.monotonic() >= answer[1] and time.monotonic() >= _enforcement_attempt_at:
+        # Off and stale: refresh in the background, the cached answer serving meanwhile.
+        task = asyncio.create_task(_refresh_enforcement(cfg))
+        _enforcement_tasks.add(task)
+        task.add_done_callback(_enforcement_tasks.discard)
+    return answer[0]
+
+
+async def addressed_resource(cfg: PlugpassConfig, scope, test: bool = False) -> str:
     """The URL a request was addressed to — `X-Forwarded-Host` (a proxy on an
     old address sets it), else its own host, on RESOURCE_URL's scheme and path —
-    when that URL is an accepted audience; otherwise RESOURCE_URL."""
+    when that URL is an accepted audience; otherwise RESOURCE_URL. At the test
+    path, the same with the `/test` suffix."""
+    suffix = TEST_PATH_SUFFIX if test else ""
     headers = dict(scope.get("headers") or [])
     raw = headers.get(b"x-forwarded-host") or headers.get(b"host") or b""
     host = raw.decode("latin-1").split(",")[0].strip().lower()
     scheme, rest = cfg.resource_url.split("://", 1)
     current_host, _, path = rest.partition("/")
     if not host or host == current_host.lower():
-        return cfg.resource_url
+        return cfg.resource_url + suffix
     candidate = f"{scheme}://{host}/{path}"
-    return candidate if candidate in await retired_audiences(cfg) else cfg.resource_url
+    accepted = candidate if candidate in await retired_audiences(cfg) else cfg.resource_url
+    return accepted + suffix
 
 
 class PlugpassTokenVerifier:
-    """mcp.server.auth.provider.TokenVerifier — local JWKS validation, no
-    Plugpass round-trip. EdDSA-pinned, issuer exact, exp required, audience =
-    the baked RESOURCE_URL or one of this server's retired URLs. PyJWKClient
-    caches the key set (lifespan=4h) and refetches once on an unknown kid (key
-    rotation)."""
+    """Local JWKS validation, no Plugpass round-trip — the gate's verifier.
+    EdDSA-pinned, issuer exact, exp required, audience = the path's own resource
+    (the baked RESOURCE_URL, or its `/test` form at the test path) or one of this
+    server's retired URLs in the same form; a canonical token is refused at the
+    test path and a test token at the canonical path. PyJWKClient caches the key
+    set (lifespan=4h) and refetches once on an unknown kid (key rotation)."""
 
     def __init__(self, cfg: PlugpassConfig) -> None:
         self._cfg = cfg
@@ -152,17 +219,18 @@ class PlugpassTokenVerifier:
             options={"require": ["exp", "aud", "iss"], "verify_aud": False},
         )
 
-    async def verify_token(self, token: str) -> AccessToken | None:
+    async def verify_token(self, token: str, test: bool = False) -> AccessToken | None:
         try:
             # PyJWKClient's fetch is blocking urllib — keep it off the event loop.
             payload = await anyio.to_thread.run_sync(self._decode, token)
         except Exception:
-            return None  # any failure → the SDK's 401 challenge (fail closed)
+            return None  # any failure → no identity (the gate challenges when strict)
+        suffix = TEST_PATH_SUFFIX if test else ""
         aud = payload.get("aud")
         auds = [aud] if isinstance(aud, str) else [a for a in aud or [] if isinstance(a, str)]
-        if self._cfg.resource_url not in auds:
+        if self._cfg.resource_url + suffix not in auds:
             retired = await retired_audiences(self._cfg)
-            if not any(a in retired for a in auds):
+            if not any(a.endswith(suffix) and a.removesuffix(suffix) in retired for a in auds):
                 return None
         sub = payload.get("sub")
         if not isinstance(sub, str) or not sub:
@@ -171,6 +239,14 @@ class PlugpassTokenVerifier:
             token=token, client_id=sub, scopes=[],
             expires_at=payload.get("exp"), subject=sub, claims=payload,
         )
+
+
+def identity(ctx: Context) -> AccessToken | None:
+    """The verified identity the request carries — `subject` is the user id, `token`
+    the bearer to forward — or None on a request with none (the /mcp gate off,
+    before the plugin is published), which every tool handles explicitly."""
+    user = ctx.request_context.request.user
+    return user.access_token if isinstance(user, AuthenticatedUser) else None
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +276,7 @@ async def entitlement(bearer: str, body: dict, op: str, cfg: PlugpassConfig) -> 
                 )
         except (httpx.TransportError, httpx.HTTPStatusError):
             if attempt == 0:
-                await asyncio.sleep(2)
+                await anyio.sleep(2)
                 continue
             return {"status": "unavailable"}
         except Exception:
@@ -335,70 +411,97 @@ def widget_callable(tool_meta: dict[str, Any]) -> bool:
 
 
 # The check proxy's unavailable grant — Plugpass could not answer, so the check
-# grants and the paid skill runs. A wrapped tool needs no equivalent: it just
-# runs its body.
+# grants and the paid skill runs; and its answer to a request with no identity
+# (the /mcp gate off), composed here without reaching Plugpass. A wrapped tool
+# needs no equivalent: it just runs its body.
 UNAVAILABLE_CHECK_GRANT = "<the unavailable grant text from TOOLS.md>"
 
 
-class AddressedResourceMiddleware:
-    """Pure ASGI, outermost. For a request addressed to one of this server's
-    retired URLs, the PRM document and every 401 challenge name that URL
-    instead of RESOURCE_URL (see addressed_resource)."""
+async def _send_json(send, status: int, body: dict, headers: tuple[tuple[bytes, bytes], ...] = ()) -> None:
+    payload = json.dumps(body).encode()
+    await send({"type": "http.response.start", "status": status, "headers": [
+        (b"content-type", b"application/json"),
+        (b"content-length", str(len(payload)).encode()),
+        *headers,
+    ]})
+    await send({"type": "http.response.body", "body": payload})
+
+
+async def _send_challenge(send, resource: str, description: str) -> None:
+    # The 401 challenge for the addressed resource. error="invalid_token" exactly
+    # — the signal MCP clients treat as "needs OAuth"; other codes read as a
+    # broken server.
+    header = (
+        f'Bearer realm="{resource}", error="invalid_token", '
+        f'error_description="{description}", resource_metadata="{prm_url(resource)}"'
+    )
+    await _send_json(
+        send, 401, {"error": "invalid_token", "error_description": description},
+        ((b"www-authenticate", header.encode()),),
+    )
+
+
+class PlugpassGate:
+    """Pure ASGI, outermost. Serves both PRM documents, gates /mcp and /mcp/test,
+    and hands the verified identity to the SDK's request context — the same
+    `request.user.access_token` the SDK's own auth populates. The test path is
+    the same app: after the gate has read it, its path is rewritten to MCP_PATH
+    on the way in. The gate: the test path is strict from the first deploy;
+    /mcp challenges only while the plugin is published. Off, a request with no
+    valid bearer is handled with no identity — never challenged."""
 
     def __init__(self, app, cfg: PlugpassConfig) -> None:
         self.app, self.cfg = app, cfg
+        self.verifier = PlugpassTokenVerifier(cfg)
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
-        resource = await addressed_resource(self.cfg, scope)
-        if resource == self.cfg.resource_url:
+        path = scope.get("path", "")
+        if path in (PRM_PATH, TEST_PRM_PATH):
+            if scope.get("method") != "GET":
+                return await _send_json(send, 405, {"error": "method_not_allowed"})
+            resource = await addressed_resource(self.cfg, scope, test=path == TEST_PRM_PATH)
+            return await _send_json(send, 200, {
+                "resource": resource,
+                "authorization_servers": [self.cfg.issuer],
+                "bearer_methods_supported": ["header"],
+            })
+        if path not in (MCP_PATH, TEST_MCP_PATH):
             return await self.app(scope, receive, send)
-        is_prm = scope.get("path") == PRM_PATH
-        start: dict | None = None
-        chunks: list[bytes] = []
-
-        async def wrapped_send(message):
-            nonlocal start
-            if message["type"] == "http.response.start":
-                headers = []
-                for k, v in message["headers"]:
-                    if k.lower() == b"www-authenticate":
-                        v = re.sub(
-                            rb'resource_metadata="[^"]*"',
-                            f'resource_metadata="{prm_url(resource)}"'.encode(),
-                            v,
-                        )
-                    headers.append((k, v))
-                message = {**message, "headers": headers}
-                if is_prm and message["status"] == 200:
-                    start = message  # rewritten below, once the body is known
-                    return
-            elif start is not None and message["type"] == "http.response.body":
-                chunks.append(message.get("body", b""))
-                if message.get("more_body"):
-                    return
-                doc = json.loads(b"".join(chunks))
-                doc["resource"] = resource
-                body = json.dumps(doc).encode()
-                headers = [(k, v) for k, v in start["headers"] if k.lower() != b"content-length"]
-                headers.append((b"content-length", str(len(body)).encode()))
-                await send({**start, "headers": headers})
-                await send({"type": "http.response.body", "body": body})
-                return
-            await send(message)
-
-        await self.app(scope, receive, wrapped_send)
+        test = path == TEST_MCP_PATH
+        resource = await addressed_resource(self.cfg, scope, test=test)
+        strict = test or await enforced(self.cfg)
+        headers = dict(scope.get("headers") or [])
+        header = headers.get(b"authorization", b"").decode("latin-1")
+        access: AccessToken | None = None
+        if header[:7].lower() == "bearer ":
+            access = await self.verifier.verify_token(header[7:].strip(), test=test)
+            if access is None and strict:
+                return await _send_challenge(send, resource, "Token invalid or expired")
+            # Off: a malformed or expired bearer is no bearer.
+        elif strict:
+            return await _send_challenge(send, resource, "Missing bearer token")
+        # What the SDK's AuthenticationMiddleware would have set: the tools read
+        # `request.user`, and the SDK's AuthContextMiddleware its contextvar.
+        scope["user"] = AuthenticatedUser(access) if access is not None else UnauthenticatedUser()
+        scope["auth"] = AuthCredentials([])
+        state = scope.setdefault("state", {})
+        state["plugpass_resource"] = resource  # the reauth swap's challenge names it
+        if test:
+            scope = {**scope, "path": MCP_PATH, "raw_path": MCP_PATH.encode()}
+        await self.app(scope, receive, send)
 
 
 class ReauthTo401Middleware:
     """Pure ASGI. When a tool set `plugpass_reauth_required` in the request
     scope state (the Entitlement API reported the bearer revoked), replace the
-    whole response with the 401 challenge — same shape as the initial one, so
-    the client re-authorizes and retries. Requires json_response=True."""
+    whole response with the 401 challenge for the addressed resource — same
+    shape as the initial one, so the client re-authorizes and retries. Requires
+    json_response=True."""
 
-    def __init__(self, app, resource_metadata_url: str) -> None:
-        self.app, self.url = app, resource_metadata_url
+    def __init__(self, app) -> None:
+        self.app = app
 
     async def __call__(self, scope, receive, send):
         if scope["type"] != "http":
@@ -407,19 +510,12 @@ class ReauthTo401Middleware:
 
         async def wrapped_send(message):
             nonlocal replaced
-            if message["type"] == "http.response.start" and scope.get("state", {}).get(
-                "plugpass_reauth_required"
-            ):
+            state = scope.get("state", {})
+            if message["type"] == "http.response.start" and state.get("plugpass_reauth_required"):
                 replaced = True
-                body = b'{"error": "invalid_token", "error_description": "Access token no longer valid"}'
-                await send({"type": "http.response.start", "status": 401, "headers": [
-                    (b"content-type", b"application/json"),
-                    (b"content-length", str(len(body)).encode()),
-                    (b"www-authenticate",
-                     f'Bearer error="invalid_token", error_description="Access token no longer valid", resource_metadata="{self.url}"'.encode()),
-                ]})
-                await send({"type": "http.response.body", "body": body})
-                return
+                return await _send_challenge(
+                    send, state.get("plugpass_resource", RESOURCE_URL), "Access token no longer valid"
+                )
             if replaced:
                 return  # discard the inner app's response
             await send(message)
@@ -427,42 +523,35 @@ class ReauthTo401Middleware:
         await self.app(scope, receive, wrapped_send)
 ```
 
-**Server entry** (`server.py`) — the SDK serves the PRM document and the challenge itself; the custom ASGI pieces are the reauth middleware and, outermost, the addressed-resource middleware:
+**Server entry** (`server.py`) — the SDK app without `AuthSettings`; the custom ASGI pieces are the SDK's `AuthContextMiddleware` (its contextvar off the gate's `scope["user"]`), the reauth middleware, and, outermost, the gate:
 
 ```python
+import os
+
 import uvicorn
+from mcp.server.auth.middleware.auth_context import AuthContextMiddleware
 from mcp.server.mcpserver import MCPServer
 
 cfg = plugpass_config()
 host, port = "0.0.0.0", int(os.environ.get("PORT", "8000"))
-mcp = MCPServer(
-    "<server name>",
-    token_verifier=PlugpassTokenVerifier(cfg),
-    auth=AuthSettings(
-        issuer_url=cfg.issuer,                 # → PRM authorization_servers
-        resource_server_url=cfg.resource_url,  # MUST include /mcp — drives the PRM path AND its default `resource`
-        required_scopes=None,
-        # The verifier checks `aud` itself (RESOURCE_URL or a retired URL), so
-        # the SDK's own audience check must stay off.
-        validate_token_resource=False,
-    ),
-)
+mcp = MCPServer("<server name>")  # no AuthSettings: the gate below is the auth
 
 # ...tool registrations (below)...
 
-# /mcp (401-gated, BOTH protocol eras) + /.well-known/oauth-protected-resource/mcp
+# /mcp and /mcp/test (BOTH protocol eras) + both PRM documents, all through the gate
 app = mcp.streamable_http_app(
     stateless_http=True,
     json_response=True,  # required: both legs buffer, so a revoked-bearer tool can swap in a 401
     host=host,
 )
-app.add_middleware(ReauthTo401Middleware, resource_metadata_url=cfg.prm_url)
-app.add_middleware(AddressedResourceMiddleware, cfg=cfg)  # added last = outermost
+app.add_middleware(AuthContextMiddleware)
+app.add_middleware(ReauthTo401Middleware)
+app.add_middleware(PlugpassGate, cfg=cfg)  # added last = outermost
 uvicorn.run(app, host=host, port=port)
 # NOT mcp.run(...) — it rebuilds the app internally and would drop the middleware.
 ```
 
-**Per-request identity inside a tool**: declare `ctx: Context` and read the validated principal off the request — `request = ctx.request_context.request`; `sub = request.user.access_token.subject`; the raw bearer to forward is `request.user.access_token.token`. On reauth: `request.state.plugpass_reauth_required = True` (the scope-state flag the middleware reads — reliable in both session modes, unlike contextvars).
+**Per-request identity inside a tool**: declare `ctx: Context` and read `access = identity(ctx)` — `access.subject` is the user id, `access.token` the raw bearer to forward, and `None` a request with no identity (the /mcp gate off, before the plugin is published), which every tool handles explicitly. On reauth: `ctx.request_context.request.state.plugpass_reauth_required = True` (the scope-state flag the middleware reads — reliable in both session modes, unlike contextvars).
 
 **The check proxy tool (check host only).** A pure pipe — never parse or reformat `result_text`:
 
@@ -494,7 +583,12 @@ async def check_premium_access(
     )] = False,
 ) -> str:
     request = ctx.request_context.request
-    bearer = request.user.access_token.token
+    access = identity(ctx)
+    # No identity — the /mcp gate off, before the plugin is published: the one
+    # answer the proxy composes itself, without reaching Plugpass.
+    if access is None:
+        return UNAVAILABLE_CHECK_GRANT
+    bearer = access.token
     # The paywall's read-only probe: asks whether this user is entitled NOW,
     # consuming nothing (check_remaining, never check_premium_access), and
     # answers in a code that is not a check result — no PLUGPASS_PLUGIN, no
@@ -545,30 +639,41 @@ PAID_TOOL_META: dict[str, Any] = {"plugpass_component_id": PAID_TOOL_FEATURE_ID}
           meta=PAID_TOOL_META)
 async def paid_tool(..., ctx: Context) -> str:
     request = ctx.request_context.request
-    sub = request.user.access_token.subject
-    result = await entitlement(
-        request.user.access_token.token,
-        {"plugin_id": cfg.plugin_id, "feature_id": PAID_TOOL_FEATURE_ID},
-        "track_usage", cfg,
-    )
-    if result["status"] == "reauth_required":
-        request.state.plugpass_reauth_required = True
-        return "Re-authentication required."
-    # The denial names this call (the tool's name and its actual arguments); the
-    # renderer reads the tool's own registered meta (its widget, who may call it)
-    # and the request: never a baked per-tool constant.
-    if result["status"] == "non_authorized":
-        return non_authorized_tool_response(
-            result, {"name": "paid_tool", "arguments": {...the call's arguments...}},
-            PAID_TOOL_META, ctx, cfg, PAID_TOOL_FEATURE_ID,
+    access = identity(ctx)
+    sub = access.subject if access is not None else ""
+    # No identity is the /mcp gate off (the plugin unpublished): the tool runs as
+    # it did before Plugpass, with no entitlement call. With one, consume.
+    if access is not None:
+        result = await entitlement(
+            access.token,
+            {"plugin_id": cfg.plugin_id, "feature_id": PAID_TOOL_FEATURE_ID},
+            "track_usage", cfg,
         )
-    # ...existing tool body — keyed / scoped to `sub`; "unavailable" consumed
-    # nothing and grants...
+        if result["status"] == "reauth_required":
+            request.state.plugpass_reauth_required = True
+            return "Re-authentication required."
+        # The denial names this call (the tool's name and its actual arguments); the
+        # renderer reads the tool's own registered meta (its widget, who may call it)
+        # and the request: never a baked per-tool constant.
+        if result["status"] == "non_authorized":
+            return non_authorized_tool_response(
+                result, {"name": "paid_tool", "arguments": {...the call's arguments...}},
+                PAID_TOOL_META, ctx, cfg, PAID_TOOL_FEATURE_ID,
+            )
+        # "ok" runs the body; "unavailable" consumed nothing and grants.
+    # ...existing tool body — keyed / scoped to `sub` (empty with no identity)...
 ```
 
 **Paired-tool add side** (`operation: add`): same shape, and `feature_id: "<the tool's own plugpass_id>"` exactly as for a solo tool (its `tool_` prefix carries the feature type) — every gated artifact bakes its own component's id, and the `entitlement` subfield is identity, never a `feature_id`. Always **`check_remaining`**, passing the user's current count from the publisher's own store (scoped to `sub`) as `current_count` — see TOOLS.md → Reading the user's current count.
 
-**Identity tool** (the paired remove side, or any per-user free tool): no Entitlement API call — read `ctx.request_context.request.user.access_token.subject` and scope the body to it.
+**Identity tool** (the paired remove side, or any per-user free tool): no Entitlement API call — read `identity(ctx)` and scope the body to its `subject`; with none (the /mcp gate off), answer that nobody is signed in and touch no record:
+
+```python
+access = identity(ctx)
+if access is None:
+    return "No user is signed in."
+# ...existing tool body, scoped to access.subject...
+```
 
 **The in-widget paywall (`ui_paywall`, servers that render widgets).** The helper below, in `premium_feature_access_check.py`, is applied to every resource the server reads out whose MIME type is `text/html;profile=mcp-app`: the paywall script tag goes first in `<head>`, and the script's origin joins the resource's `resourceDomains`. The widget HTML itself is never edited.
 
