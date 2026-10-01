@@ -261,7 +261,7 @@ Apply the Retry standing rule.
 
 # If UPDATE=`recommended` in CHECK_RESULT
 
-`UPDATE=recommended` only ever rides an authorized response, so the component's work is never blocked. Complete CORE_INSTRUCTIONS first, then run this nudge — at most once per session. Unlike every other case, never say "Do not execute CORE_INSTRUCTIONS" here; the work is already done. (This section is authored with the plugin’s own marketplace facts — the Plugpass or Claude Community marketplace; the server never returns `UPDATE=recommended` for official-marketplace plugins.)
+`UPDATE=recommended` only ever rides an authorized response, so the component's work is never blocked. Complete CORE_INSTRUCTIONS first, then run this nudge — at most once per session. Unlike every other case, never say "Do not execute CORE_INSTRUCTIONS" here; the work is already done.
 
 PLUGIN_ORIGIN = the value on the `PLUGIN_ORIGIN` line of CHECK_RESULT.
 
