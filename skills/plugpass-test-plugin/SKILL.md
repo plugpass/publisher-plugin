@@ -20,7 +20,7 @@ The Plugpass Publisher MCP server (this plugin's `.mcp.json` `plugpass-publisher
 
 **Presenting copy.** A `>` block is finished copy; the `>` characters delimit it here and are never part of it. Reproduce the text exactly — substituting each `{VARIABLE}` with its value — and never print the `>` characters, restyle the wording, or wrap it in a quote block. Where a step says to tell the publisher something, post it as your own message with nothing of your own before or after it. Copy given inline in double quotes is delivered the same way, without the quote marks.
 
-- PUBLISHER_PLUGIN_VERSION = `0.0.15` (stamped by the release pipeline). Include it as `publisher_plugin_version` on every Publisher MCP tool call in this skill.
+- PUBLISHER_PLUGIN_VERSION = `0.0.16` (stamped by the release pipeline). Include it as `publisher_plugin_version` on every Publisher MCP tool call in this skill.
 - USER_INPUT_TOOL = A tool that presents the user a question with selectable options and returns their choice (e.g. `AskUserQuestion`, `ask_user_input_v0`, etc.) that can be used in the default session state. Where a prompt below calls for USER_INPUT_TOOL and no such tool is available, ask the question in chat and wait for the reply.
 - OS = If your system instructions indicate the platform is `darwin`, then `mac`; if `linux`, then `linux`; if `win32`, then `windows`.
 - OPEN_URL_TOOL = A tool that opens a URL in a browser for the user: a dedicated one (e.g. `open_in_codex`) if present, else a shell command (e.g. Bash `open "<url>"`, Bash `xdg-open "<url>"`, PowerShell `Start-Process "<url>"`). Never a web search or page fetch.
@@ -41,7 +41,7 @@ If the product was given in ARGUMENTS, has already been specified, or is otherwi
 
 ## Step 3: Choose or create the test user
 
-If the test user's email was given in ARGUMENTS, has already been specified, or is otherwise known, skip this question: an email among `{test users}` is that user, and any other email is a new one to create. Otherwise, if `{test users}` has any `users`, ask with USER_INPUT_TOOL: "Which test user do you want to test as?", offering each user's email with its current state, plus "A new test user". Otherwise skip to creating one.
+If the test user's email was given in ARGUMENTS, has already been specified, or is otherwise known, skip this question: an email among `{test users}` is that user, and any other email is a new one to create. Otherwise, if `{test users}` has any `users` whose `user_type` is `internal`, ask with USER_INPUT_TOOL: "Which test user do you want to test as?", offering each such user's email with its current state, plus "A new test user". Otherwise skip to creating one.
 
 To create one, ask with USER_INPUT_TOOL for the email, offering the publisher's own email first when you know it, and "Another email". Then ask "What state should the test user start in?", offering "Not signed up", "Signed up" (only when no plan of `versions.{version}` has `is_free` true), and each plan of `versions.{version}` (a paid plan once per `intervals` entry, e.g. "Pro, monthly"). Call `plugpass_save_test_user` with `plugin_id`, `email`, `version: {version}`, `starting_status` (`not_signed_up`, `signed_up`, or `plan`), and for a plan `starting_plan_id` and `starting_term` (`monthly` or `annual`; omit for a free plan). When the user asks to test production while the draft is ready, `{version}` is `production` from here on.
 
