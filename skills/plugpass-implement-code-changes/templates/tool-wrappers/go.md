@@ -1,6 +1,6 @@
 # Go scaffolding template
 
-The publisher's server becomes an **OAuth-protected resource server** using the official SDK's `auth` package: `auth.RequireBearerToken` gates the strict paths (emitting the `WWW-Authenticate` challenge with `resource_metadata`) — `/mcp/test` from the first deploy, `/mcp` once the plugin is published, through the publish-armed gate below — `auth.ProtectedResourceMetadataHandler` serves the RFC 9728 PRM documents for both, and a custom `TokenVerifier` does the local JWKS validation. Standalone source, no platform package. Version pins: `github.com/modelcontextprotocol/go-sdk` **v1.7.0+** (it is what implements protocol 2026-07-28; on v1.6.x the server serves the legacy era only), `github.com/golang-jwt/jwt/v5` v5.3.x, `github.com/MicahParks/keyfunc/v3` v3.8.x.
+The publisher's server becomes an **OAuth-protected resource server** using the official SDK's `auth` package: `auth.RequireBearerToken` gates the strict paths (emitting the `WWW-Authenticate` challenge with `resource_metadata`) — `/mcp/test` from the first deploy, `/mcp` once the plugin is published, through the publish-armed gate below — `auth.ProtectedResourceMetadataHandler` serves the RFC 9728 PRM documents for both, and a custom `TokenVerifier` does the local JWKS validation. Standalone source, no platform package. Version pins: `github.com/modelcontextprotocol/go-sdk` **v1.7.0+** (it is what implements protocol 2026-07-28; on v1.6.x the server serves the legacy era only), `github.com/golang-jwt/jwt/v5` v5.3.x, `github.com/MicahParks/keyfunc/v3` v3.8.x (with its `github.com/MicahParks/jwkset` and `golang.org/x/time/rate`).
 
 **Four structural decisions carry the whole design — never undo them:**
 
@@ -19,7 +19,9 @@ import (
 	"cmp"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"os"
@@ -29,9 +31,11 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/MicahParks/jwkset"
 	"github.com/MicahParks/keyfunc/v3"
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/modelcontextprotocol/go-sdk/auth"
+	"golang.org/x/time/rate"
 )
 
 const mcpPath = "/mcp"
@@ -218,26 +222,79 @@ func challenge(resource, description string) string {
 		resource, "invalid_token", description, prmURL(resource))
 }
 
-// Lazy per-URL keyfunc singleton. keyfunc.NewDefault refreshes hourly in the
-// background (inside the 4h ceiling) and refetches on an unknown kid
-// (rate-limited) — the rotation semantics we need, built in.
+// The signing key set couldn't be fetched: no verdict on the bearer, so the
+// gate answers 503, never the 401 a client reads as signed out.
+var errKeySetUnavailable = errors.New("signing key set unavailable")
+
+func keySetUnavailable(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Retry-After", "30")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_, _ = w.Write([]byte(`{"error": "temporarily_unavailable", "error_description": "The signing key set could not be resolved"}`))
+}
+
+// The outcome of the key set's most recent fetch. jwkset logs a failed fetch
+// and answers "key not found", which alone can't tell a key set it couldn't
+// fetch from a key the set lacks.
+type keySetFetches struct {
+	base   http.RoundTripper
+	failed atomic.Bool
+}
+
+func (t *keySetFetches) RoundTrip(r *http.Request) (*http.Response, error) {
+	res, err := t.base.RoundTrip(r)
+	t.failed.Store(err != nil || res.StatusCode != http.StatusOK)
+	return res, err
+}
+
+// Lazy per-URL keyfunc singleton — keyfunc.NewDefault's storage, through the
+// fetch recorder: refreshed hourly in the background (inside the 4h ceiling)
+// and refetched on an unknown kid (rate-limited) — the rotation semantics we
+// need, built in.
+type jwksEntry struct {
+	keyfunc jwt.Keyfunc
+	fetches *keySetFetches
+}
+
 var (
 	jwksMu    sync.Mutex
-	jwksByURL = map[string]jwt.Keyfunc{}
+	jwksByURL = map[string]jwksEntry{}
 )
 
-func jwksKeyfunc(jwksURL string) (jwt.Keyfunc, error) {
+func jwksKeyfunc(jwksURL string) (jwksEntry, error) {
 	jwksMu.Lock()
 	defer jwksMu.Unlock()
-	if kf, ok := jwksByURL[jwksURL]; ok {
-		return kf, nil
+	if e, ok := jwksByURL[jwksURL]; ok {
+		return e, nil
 	}
-	kf, err := keyfunc.NewDefault([]string{jwksURL})
+	fetches := &keySetFetches{base: http.DefaultTransport}
+	remote, err := jwkset.NewStorageFromHTTP(jwksURL, jwkset.HTTPClientStorageOptions{
+		Client:                    &http.Client{Timeout: 5 * time.Second, Transport: fetches},
+		NoErrorReturnFirstHTTPReq: true,
+		RefreshInterval:           time.Hour,
+		RefreshErrorHandler: func(ctx context.Context, err error) {
+			slog.Default().ErrorContext(ctx, "Failed to refresh the signing key set.", "error", err, "url", jwksURL)
+		},
+	})
 	if err != nil {
-		return nil, err
+		return jwksEntry{}, err
 	}
-	jwksByURL[jwksURL] = kf.Keyfunc
-	return kf.Keyfunc, nil
+	storage, err := jwkset.NewHTTPClient(jwkset.HTTPClientOptions{
+		HTTPURLs:          map[string]jwkset.Storage{jwksURL: remote},
+		RateLimitWaitMax:  time.Minute,
+		RefreshUnknownKID: rate.NewLimiter(rate.Every(5*time.Minute), 1),
+	})
+	if err != nil {
+		return jwksEntry{}, err
+	}
+	kf, err := keyfunc.New(keyfunc.Options{Storage: storage})
+	if err != nil {
+		return jwksEntry{}, err
+	}
+	e := jwksEntry{keyfunc: kf.Keyfunc, fetches: fetches}
+	jwksByURL[jwksURL] = e
+	return e, nil
 }
 
 // The auth.TokenVerifier the bearer gate runs, one per path: EdDSA-pinned,
@@ -246,23 +303,28 @@ func jwksKeyfunc(jwksURL string) (jwt.Keyfunc, error) {
 // retired URLs in the same form — a canonical token is refused at the test path
 // and a test token at the canonical path; extracts sub. Every token failure MUST
 // wrap auth.ErrInvalidToken — anything else becomes a 500 with no
-// WWW-Authenticate challenge, silently breaking client OAuth discovery.
+// WWW-Authenticate challenge, silently breaking client OAuth discovery. A key
+// set that couldn't be fetched wraps errKeySetUnavailable instead, which the
+// gate answers itself before the SDK's middleware sees it.
 func verifyBearer(cfg plugpassConfig, test bool) auth.TokenVerifier {
 	suffix := ""
 	if test {
 		suffix = testPathSuffix
 	}
 	return func(ctx context.Context, token string, _ *http.Request) (*auth.TokenInfo, error) {
-		kf, err := jwksKeyfunc(cfg.jwksURL)
+		jwks, err := jwksKeyfunc(cfg.jwksURL)
 		if err != nil {
-			return nil, err // infra failure → 500 (correct: not a token problem)
+			return nil, fmt.Errorf("%w: %v", errKeySetUnavailable, err)
 		}
-		tok, err := jwt.Parse(token, kf,
+		tok, err := jwt.Parse(token, jwks.keyfunc,
 			jwt.WithValidMethods([]string{"EdDSA"}),
 			jwt.WithIssuer(cfg.issuer),
 			jwt.WithExpirationRequired(),
 		)
 		if err != nil || !tok.Valid {
+			if errors.Is(err, keyfunc.ErrKeyfunc) && jwks.fetches.failed.Load() {
+				return nil, fmt.Errorf("%w: %v", errKeySetUnavailable, err)
+			}
 			return nil, fmt.Errorf("%w: %v", auth.ErrInvalidToken, err)
 		}
 		auds, err := tok.Claims.GetAudience()
@@ -384,19 +446,23 @@ func bearerToken(r *http.Request) (string, bool) {
 // /mcp challenges only while the plugin is published. Strict, the request runs
 // the strict chain (auth.RequireBearerToken, which challenges or injects the
 // TokenInfo); off, a valid bearer takes the same chain, and a missing, malformed,
-// or expired one takes the open chain — no TokenInfo, never challenged.
+// or expired one takes the open chain — no TokenInfo, never challenged. A
+// bearer whose key set couldn't be fetched is answered 503 on either path.
 func publishArmedGate(cfg plugpassConfig, test bool, strict, open http.Handler) http.Handler {
 	verify := verifyBearer(cfg, test)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if test || enforced(r.Context(), cfg) {
-			strict.ServeHTTP(w, r)
-			return
-		}
+		valid := false
 		if token, ok := bearerToken(r); ok {
-			if _, err := verify(r.Context(), token, r); err == nil {
-				strict.ServeHTTP(w, r)
+			_, err := verify(r.Context(), token, r)
+			if errors.Is(err, errKeySetUnavailable) {
+				keySetUnavailable(w)
 				return
 			}
+			valid = err == nil
+		}
+		if valid || test || enforced(r.Context(), cfg) {
+			strict.ServeHTTP(w, r)
+			return
 		}
 		open.ServeHTTP(w, r)
 	})

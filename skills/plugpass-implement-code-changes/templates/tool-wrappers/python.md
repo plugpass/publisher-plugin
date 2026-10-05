@@ -23,6 +23,7 @@ import anyio
 import httpx
 import jwt as pyjwt
 from jwt import PyJWKClient
+from jwt.exceptions import PyJWKClientConnectionError, PyJWKSetError
 from mcp import types
 from mcp.server.auth.middleware.bearer_auth import AuthenticatedUser
 from mcp.server.auth.provider import AccessToken
@@ -192,6 +193,11 @@ async def addressed_resource(cfg: PlugpassConfig, scope, test: bool = False) -> 
     return accepted + suffix
 
 
+class KeySetUnavailable(Exception):
+    """The signing key set couldn't be fetched: no verdict on the bearer, so the
+    gate answers 503, never the 401 a client reads as signed out."""
+
+
 class PlugpassTokenVerifier:
     """Local JWKS validation, no Plugpass round-trip — the gate's verifier.
     EdDSA-pinned, issuer exact, exp required, audience = the path's own resource
@@ -208,7 +214,12 @@ class PlugpassTokenVerifier:
         )
 
     def _decode(self, token: str) -> dict:
-        signing_key = self._client.get_signing_key_from_jwt(token)
+        try:
+            signing_key = self._client.get_signing_key_from_jwt(token)
+        except (PyJWKClientConnectionError, PyJWKSetError, json.JSONDecodeError) as e:
+            # A fetch that failed, or a body that isn't a key set; a key the
+            # fetched set lacks is the token's fault (PyJWKClientError).
+            raise KeySetUnavailable() from e
         return pyjwt.decode(
             token,
             signing_key.key,
@@ -223,8 +234,10 @@ class PlugpassTokenVerifier:
         try:
             # PyJWKClient's fetch is blocking urllib — keep it off the event loop.
             payload = await anyio.to_thread.run_sync(self._decode, token)
+        except KeySetUnavailable:
+            raise
         except Exception:
-            return None  # any failure → no identity (the gate challenges when strict)
+            return None  # any other failure → no identity (the gate challenges when strict)
         suffix = TEST_PATH_SUFFIX if test else ""
         aud = payload.get("aud")
         auds = [aud] if isinstance(aud, str) else [a for a in aud or [] if isinstance(a, str)]
@@ -441,6 +454,15 @@ async def _send_challenge(send, resource: str, description: str) -> None:
     )
 
 
+async def _send_key_set_unavailable(send) -> None:
+    # The signing key set couldn't be fetched: no verdict on the bearer.
+    await _send_json(
+        send, 503,
+        {"error": "temporarily_unavailable", "error_description": "The signing key set could not be resolved"},
+        ((b"retry-after", b"30"), (b"cache-control", b"no-store")),
+    )
+
+
 class PlugpassGate:
     """Pure ASGI, outermost. Serves both PRM documents, gates /mcp and /mcp/test,
     and hands the verified identity to the SDK's request context — the same
@@ -476,7 +498,10 @@ class PlugpassGate:
         header = headers.get(b"authorization", b"").decode("latin-1")
         access: AccessToken | None = None
         if header[:7].lower() == "bearer ":
-            access = await self.verifier.verify_token(header[7:].strip(), test=test)
+            try:
+                access = await self.verifier.verify_token(header[7:].strip(), test=test)
+            except KeySetUnavailable:
+                return await _send_key_set_unavailable(send)
             if access is None and strict:
                 return await _send_challenge(send, resource, "Token invalid or expired")
             # Off: a malformed or expired bearer is no bearer.

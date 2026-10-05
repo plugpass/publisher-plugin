@@ -23,7 +23,7 @@ Any variables defined by tool presence should be assessed purely from its presen
     - OS = If your system instructions indicate the platform is `darwin`, then `mac`; if `linux`, then `linux`; if `win32`, then `windows`.
     - CODE_CLIENT = If (OS=`mac` || OS=`linux`), then Bash `echo "CLAUDE_CODE_ENTRYPOINT=$CLAUDE_CODE_ENTRYPOINT"`; if OS=`windows`, then PowerShell `Write-Output "CLAUDE_CODE_ENTRYPOINT=$env:CLAUDE_CODE_ENTRYPOINT"` (expected value: `cli` || `claude-desktop` || `remote`)
 - If PLATFORM=`openai`:
-  - OPENAI_CLIENT = If your system instructions include `# Codex desktop context`, then `desktop`; otherwise `codex-cli`.
+  - OPENAI_CLIENT = If your system instructions say you are Codex running inside the Codex desktop app, then `desktop`; otherwise `codex-cli`.
 - OPEN_URL_TOOL = A tool that opens a URL in a browser for the user: a dedicated one (e.g. `open_in_codex`) if present, else a shell command (e.g. Bash `open "<url>"`, Bash `xdg-open "<url>"`, PowerShell `Start-Process "<url>"`). Never a web search, page fetch, remote browser, or other context where the user can't access the URL's page.
 
 If the OPEN_URL_TOOL fails to open the page for any reason (error, approval declined, user says it didn't open, etc.), then post the following message in the same turn:

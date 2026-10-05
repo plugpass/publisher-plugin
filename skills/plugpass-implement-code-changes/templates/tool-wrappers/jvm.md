@@ -177,7 +177,8 @@ public final class PremiumFeatureAccessCheck {
    * of this server's retired URLs in the same form — a canonical token is refused
    * at the test path and a test token at the canonical path. Nimbus selects the
    * OKP key by kid; the JDK verifies Ed25519 (raw x wrapped in the fixed 12-byte
-   * SPKI prefix). Returns sub, or null.
+   * SPKI prefix). Returns sub, or null on any token failure; throws
+   * KeySetUnavailable when the key set couldn't be fetched.
    */
   public static String verifyBearer(String token, boolean test) {
     String suffix = test ? TEST_PATH_SUFFIX : "";
@@ -187,7 +188,14 @@ public final class PremiumFeatureAccessCheck {
       JWKSelector selector = new JWKSelector(new JWKMatcher.Builder()
           .keyType(KeyType.OKP).curves(Curve.Ed25519)
           .keyID(jwt.getHeader().getKeyID()).build());
-      List<JWK> keys = JWKS.get(selector, null);
+      List<JWK> keys;
+      try {
+        keys = JWKS.get(selector, null);
+      } catch (RateLimitReachedException e) {
+        return null; // a rate-limited refetch for a key the set lacks: the token's fault
+      } catch (KeySourceException e) {
+        throw new KeySetUnavailable(e);
+      }
       if (keys.isEmpty()) return null;
       OctetKeyPair okp = keys.get(0).toOctetKeyPair();
 
@@ -214,8 +222,18 @@ public final class PremiumFeatureAccessCheck {
           null
       ).verify(claims, null);
       return claims.getSubject();
+    } catch (KeySetUnavailable e) {
+      throw e;
     } catch (Exception e) {
       return null;
+    }
+  }
+
+  /** The signing key set couldn't be fetched: no verdict on the bearer, so the
+   *  filter answers 503, never the 401 a client reads as signed out. */
+  public static final class KeySetUnavailable extends RuntimeException {
+    KeySetUnavailable(Throwable cause) {
+      super("The signing key set could not be resolved", cause);
     }
   }
 
@@ -348,7 +366,13 @@ public final class BearerAuthFilter extends HttpFilter {
     boolean strict = test || PremiumFeatureAccessCheck.enforced();
     String header = req.getHeader("Authorization");
     String token = header != null && header.regionMatches(true, 0, "Bearer ", 0, 7) ? header.substring(7).trim() : null;
-    String sub = token == null ? null : PremiumFeatureAccessCheck.verifyBearer(token, test);
+    String sub;
+    try {
+      sub = token == null ? null : PremiumFeatureAccessCheck.verifyBearer(token, test);
+    } catch (PremiumFeatureAccessCheck.KeySetUnavailable e) {
+      keySetUnavailable(res);
+      return;
+    }
     if (sub == null && strict) {
       challenge(res, resource, token == null ? "Missing bearer token" : "Token invalid or expired");
       return;
@@ -373,6 +397,15 @@ public final class BearerAuthFilter extends HttpFilter {
       return;
     }
     buffer.replayTo(res); // status/headers passed through; body copied verbatim
+  }
+
+  // The signing key set couldn't be fetched: no verdict on the bearer.
+  private static void keySetUnavailable(HttpServletResponse res) throws IOException {
+    res.setStatus(503);
+    res.setHeader("Retry-After", "30");
+    res.setHeader("Cache-Control", "no-store");
+    res.setContentType("application/json");
+    res.getWriter().write("{\"error\": \"temporarily_unavailable\", \"error_description\": \"The signing key set could not be resolved\"}");
   }
 
   // The challenge for the addressed resource. error="invalid_token" exactly — the

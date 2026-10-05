@@ -169,19 +169,25 @@ module PremiumFeatureAccessCheck
   @jwks_mutex = Mutex.new
   @jwks_cache = {}
 
+  # The signing key set couldn't be fetched: no verdict on the bearer, so the
+  # gate answers 503, never the 401 a client reads as signed out.
+  class KeySetUnavailable < StandardError; end
+
   def self.key_for(kid)
     # …cache lookup keyed by jwks_url: fresh hit → find kid; miss/stale →
     # rate-limited refetch (Net::HTTP, 5s timeouts) → find kid; convert the
     # OKP/Ed25519 JWK via:
     #   OpenSSL::PKey.new_raw_public_key("ED25519", Base64.urlsafe_decode64(jwk["x"]))
-    # Monotonic clock for timestamps; nil on any failure…
+    # Monotonic clock for timestamps; nil when the fetched set lacks the kid;
+    # raise KeySetUnavailable when the set can't be fetched (a network error,
+    # a timeout, a non-200, a body that isn't a key set)…
   end
 
   # EdDSA-pinned, issuer exact, exp+sub required, audience = the path's own
   # resource (the baked RESOURCE_URL, or its /test form at the test path) or one
   # of this server's retired URLs in the same form — a canonical token is
   # refused at the test path and a test token at the canonical path. Returns the
-  # user id (sub), or nil on any failure.
+  # user id (sub), or nil on any token failure; KeySetUnavailable propagates.
   def self.verify_bearer(token, test: false)
     suffix = test ? TEST_PATH_SUFFIX : ""
     kid = JWT::EncodedToken.new(token).header["kid"]
@@ -368,7 +374,11 @@ class PlugpassGate
     resource = P.addressed_resource(env, test: test)
     strict = test || P.enforced?
     token = env["HTTP_AUTHORIZATION"] && env["HTTP_AUTHORIZATION"][/\ABearer (.+)\z/i, 1]
-    sub = token && P.verify_bearer(token, test: test)
+    begin
+      sub = token && P.verify_bearer(token, test: test)
+    rescue P::KeySetUnavailable
+      return key_set_unavailable
+    end
     if sub.nil? && strict
       return challenge(resource, token ? "Token invalid or expired" : "Missing bearer token")
     end
@@ -392,6 +402,12 @@ class PlugpassGate
       authorization_servers: [P.issuer],
       bearer_methods_supported: ["header"]
     )]]
+  end
+
+  # The signing key set couldn't be fetched: no verdict on the bearer.
+  def key_set_unavailable
+    [503, { "content-type" => "application/json", "retry-after" => "30", "cache-control" => "no-store" },
+     [JSON.generate(error: "temporarily_unavailable", error_description: "The signing key set could not be resolved")]]
   end
 
   # The challenge for the addressed resource. error="invalid_token" exactly — the

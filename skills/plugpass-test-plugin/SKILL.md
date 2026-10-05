@@ -12,7 +12,7 @@ This skill works in the publisher's plugin repo: it reads files in the current w
 
 ## What this skill does
 
-Gets the publisher into test mode: it confirms the plugin is ready to test, installs the working copy on the AI product they choose as a test version, chooses or creates a Plugpass test user, and posts the link that puts their browser into test mode for that test user. It never decides what to test, never writes tests, and never edits the plugin repo: the test build (step 4) is a copy outside the repo.
+Gets the publisher into test mode: it confirms the plugin is ready to test, installs the working copy on the AI product they choose as a test version, chooses or creates a Plugpass test user, and posts the link that puts their browser into test mode for that test user. It never decides what to test, never writes tests, and never edits the plugin repo: the test plugin (step 4) is a copy outside the repo.
 
 The Plugpass Publisher MCP server (this plugin's `.mcp.json` `plugpass-publisher` entry) provides the `plugpass_get_plugin_data`, `plugpass_list_test_users`, `plugpass_save_test_user`, `plugpass_reset_test_user`, and `plugpass_test_as_user` tools this skill calls — reference them by those bare names under any connector prefix.
 
@@ -20,7 +20,7 @@ The Plugpass Publisher MCP server (this plugin's `.mcp.json` `plugpass-publisher
 
 **Presenting copy.** A `>` block is finished copy; the `>` characters delimit it here and are never part of it. Reproduce the text exactly — substituting each `{VARIABLE}` with its value — and never print the `>` characters, restyle the wording, or wrap it in a quote block. Where a step says to tell the publisher something, post it as your own message with nothing of your own before or after it. Copy given inline in double quotes is delivered the same way, without the quote marks.
 
-- PUBLISHER_PLUGIN_VERSION = `0.0.20` (stamped by the release pipeline). Include it as `publisher_plugin_version` on every Publisher MCP tool call in this skill.
+- PUBLISHER_PLUGIN_VERSION = `0.0.21` (stamped by the release pipeline). Include it as `publisher_plugin_version` on every Publisher MCP tool call in this skill.
 - USER_INPUT_TOOL = A tool that presents the user a question with selectable options and returns their choice (e.g. `AskUserQuestion`, `ask_user_input_v0`, etc.) that can be used in the default session state. Where a prompt below calls for USER_INPUT_TOOL and no such tool is available, ask the question in chat and wait for the reply.
 - OS = If your system instructions indicate the platform is `darwin`, then `mac`; if `linux`, then `linux`; if `win32`, then `windows`.
 - OPEN_URL_TOOL = A tool that opens a URL in a browser for the user: a dedicated one (e.g. `open_in_codex`) if present, else a shell command (e.g. Bash `open "<url>"`, Bash `xdg-open "<url>"`, PowerShell `Start-Process "<url>"`). Never a web search or page fetch.
@@ -31,13 +31,13 @@ The Plugpass Publisher MCP server (this plugin's `.mcp.json` `plugpass-publisher
 
 Read `.claude-plugin/plugin.json` (else `.codex-plugin/plugin.json`). `{manifest name}` is its `name`; `{plugin-plugpass-id}` is `metadata.plugpass-plugin-id`. If the id is absent or empty, tell the user "This plugin isn't registered with Plugpass yet. Run the `plugpass-sync-plugin` skill first." and end the skill.
 
-Call `plugpass_get_plugin_data` with `plugin_id: {plugin-plugpass-id}`; keep its `plugin_slug` as `{plugin slug}`, its `plugin_display_name` as `{plugin display name}`, its `plugin_origin` as `{plugin origin}`, its `supported_products` as `{products}`, its `owned_servers` as `{owned servers}` (the publisher's own MCP servers, each with its `.mcp.json` key `server_name` and its `url`), and its `connector` as `{connector}` (the plugin's connector, with its `.mcp.json` key `server_key` and its `url`).
+Call `plugpass_get_plugin_data` with `plugin_id: {plugin-plugpass-id}`; keep its `plugin_slug` as `{plugin slug}`, its `plugin_display_name` as `{plugin display name}`, its `plugin_origin` as `{plugin origin}`, its `supported_products` as `{products}`, its `owned_servers` as `{owned servers}` (the publisher's own MCP servers, each with its `.mcp.json` key `server_name` and its `url`), its `connector` as `{connector}` (the plugin's connector, with its `.mcp.json` key `server_key` and its `url`), and its `chatgpt_install_url` as `{listing url}` (the plugin's ChatGPT Plugin Directory listing, or null).
 
 Call `plugpass_list_test_users` with `plugin_id: {plugin-plugpass-id}` and keep the response as `{test users}`. If `versions.draft` is present and its `outstanding` has an entry whose `code` starts with `impl_`, tell the user "This plugin's premium features aren't implemented yet. Run the `plugpass-implement-code-changes` skill first." and end the skill. If `any_version_ready` is false, tell the user "No version of this plugin is ready to test yet. Finish the plugin's setup in the Plugpass dashboard first; the Publish page lists what's outstanding." and end the skill. `{version}` is `draft` when `versions.draft` is present and `ready`, else `production`; `versions.{version}.plans` are the plans step 3 offers, and `users` the existing test users.
 
 ## Step 2: Ask which AI product to test on
 
-If the product was given in ARGUMENTS, has already been specified, or is otherwise known, skip this question. Otherwise ask with USER_INPUT_TOOL: "Which AI product do you want to test on?", offering each value of `{products}` by its label, in this order: `claude` Claude, `claude_code` Claude Code, `chatgpt_chat` ChatGPT Chat, `chatgpt_work` ChatGPT Work, `codex` Codex. Capture the answer's value as `{product}` and its label as `{product label}`.
+If the product was given in ARGUMENTS, has already been specified, or is otherwise known, skip this question. Otherwise ask with USER_INPUT_TOOL: "Which AI product do you want to test on?", offering each value of `{products}` by its label, in this order: `claude` Claude, `claude_code` Claude Code, `chatgpt` ChatGPT, `codex` Codex. Capture the answer's value as `{product}` and its label as `{product label}`.
 
 ## Step 3: Choose or create the test user
 
@@ -49,22 +49,22 @@ If the user chose an existing test user and wants to start over, call `plugpass_
 
 `{tested version}` is the chosen user's `resolved.kind`, or `{version}` for a new one. If the chosen user's `resolved.ready` is false, skip to step 5: the link call is refused, and its message names what to do.
 
-## Step 4: Load the test build
+## Step 4: Load the test plugin
 
 When `{tested version}` is `production`, the published plugin is what is tested. Tell the user, then skip to step 5:
 
 > If you already have the {plugin display name} plugin installed on {product label} then you can begin testing now. Or follow the [install instructions]({plugin origin}/install?product={product}) if you don't.
 
-Otherwise follow the steps for `{product}`. These are the steps as last verified (2026-09-25); if one no longer matches what you see, find the current path rather than declaring it impossible. The real install of this plugin in that product is turned off for the duration and turned back on afterward.
+Otherwise follow the steps for `{product}`. These are the steps as last verified (2026-10-02); if one no longer matches what you see, find the current path rather than declaring it impossible. The real install of this plugin in that product is turned off for the duration and turned back on afterward.
 
-**The test build** is a **copy** of the working copy, made outside the repo, in which each owned server's `.mcp.json` entry (the key named by its `server_name`), or when `{owned servers}` is empty the entry named by `{connector}`'s `server_key`, has its `url` suffixed with `/test`, the connector's test path; the repo is never written, and the copy is refreshed on every run. Make the copy with `rsync -a --delete --exclude .git --exclude node_modules --exclude .plugpass "$PWD/" "{copy path}/"` (PowerShell: `Copy-Item -Recurse -Force` with those folders excluded), creating its parent directory first (`mkdir -p`) and removing a symlink already at the destination (`unlink`), then `Edit` the copy's `.mcp.json`. `{build dir}` is the copy.
+**The test plugin** is a **copy** of the working copy, made outside the repo, in which each owned server's `.mcp.json` entry (the key named by its `server_name`), or when `{owned servers}` is empty the entry named by `{connector}`'s `server_key`, has its `url` suffixed with `/test`, the connector's test path; the repo is never written, and the copy is refreshed on every run. Make the copy with `rsync -a --delete --exclude .git --exclude node_modules --exclude .plugpass "$PWD/" "{copy path}/"` (PowerShell: `Copy-Item -Recurse -Force` with those folders excluded), creating its parent directory first (`mkdir -p`) and removing a symlink already at the destination (`unlink`), then `Edit` the copy's `.mcp.json`. `{build dir}` is the copy.
 
 Where a product takes an archive, build it from `{build dir}` yourself, leaving out `.git`, `node_modules`, and `.plugpass` directories (Bash: `zip -r "{test plugin path}" . -x '.git/*' 'node_modules/*' '.plugpass/*'` from that directory; PowerShell: `Compress-Archive` over the same directory with those folders excluded). The archive, and a copy made for it, go in your session's scratchpad or outputs folder when it has one, else a temporary directory (`mktemp -d`); `{test plugin path}` is the archive's absolute path.
 
-- **`claude_code` (terminal and desktop app):** put the copy at `~/.claude/skills/{manifest name}`. If the plugin is also installed from a marketplace, run `claude plugin disable {manifest name}@<marketplace>` first and tell the user to run `claude plugin enable {manifest name}@<marketplace>` when they are done testing. Tell the user "Start a new Claude Code session to load the test build. Remove the copy at `~/.claude/skills/{manifest name}` when you're done testing."
+- **`claude_code` (terminal and desktop app):** put the copy at `~/.claude/skills/{manifest name}`. If the plugin is also installed from a marketplace, run `claude plugin disable {manifest name}@<marketplace>` first and tell the user to run `claude plugin enable {manifest name}@<marketplace>` when they are done testing. Tell the user "Start a new Claude Code session to load the test plugin. Remove the copy at `~/.claude/skills/{manifest name}` when you're done testing."
 - **`claude` (web and desktop, Cowork included):** build the archive, then post the steps:
 
-  > **Install the test build in Claude**
+  > **Install the test plugin in Claude**
   > 1. Open [Claude plugin settings](https://claude.ai/customize/plugins)
   > 2. If the real {plugin display name} is installed, turn it off from its menu
   > 3. Click `Add` → `Upload plugin` and upload `{test plugin path}`
@@ -72,25 +72,35 @@ Where a product takes an archive, build it from `{build dir}` yourself, leaving 
 
   Then tell the user:
 
-  > When you're done testing, remove the test build (under `Created by you`) and turn the real {plugin display name} back on, both from their menus.
-- **`chatgpt_chat` (ChatGPT on the web):** build the archive, then post the steps:
+  > When you're done testing, remove the test plugin (under `Created by you`) and turn the real {plugin display name} back on, both from their menus.
+- **`chatgpt` (ChatGPT on the web, and the desktop app's Work and Codex):** run step 5 first and come back here, since creating or connecting ChatGPT's test app signs in as whoever is signed in on the plugin's site. ChatGPT reaches the connector through a developer-mode app the publisher creates once per plugin. `Read` `.plugpass/chatgpt-test-app.json`; `{app hex}` is its `app_id` after `asdk_app_`. When the file or the id is missing, post:
 
-  > **Install the test build in ChatGPT**
-  > 1. Open [ChatGPT plugins](https://chatgpt.com/plugins)
-  > 2. If the real {plugin display name} is installed, uninstall it from its menu
-  > 3. If you've uploaded a test build before, open it under `Personal` and choose `Upload new version` from its menu. Otherwise click `+` → `Upload plugin`
-  > 4. Upload `{test plugin path}`
-  > 5. Install the test build from its page if it isn't installed
+  > **Set up ChatGPT to test {plugin display name}**
+  > 1. If you haven't already enabled Developer Mode in ChatGPT, open [ChatGPT's plugin settings](https://chatgpt.com/#settings/Plugins), click `Developer mode`, and turn it on
+  > 2. [Create an app](https://chatgpt.com/plugins#settings/Connectors?create-connector=true) named `{plugin display name} test` with the server URL `{connector url}/test`, check `I understand and want to continue`, and click `Create`
+  > 3. Open `{plugin display name} test` under [Personal](https://chatgpt.com/plugins?view=personal) and paste its URL here
 
-  Then tell the user:
+  with `{connector url}` as `{connector}`'s `url`. The pasted URL ends in `plugin_asdk_app_` and the app's hex: `Write` `{"app_id": "asdk_app_{app hex}"}` to `.plugpass/chatgpt-test-app.json`, creating `.plugpass/` if absent, and add a `.plugpass/` line to the repo's `.gitignore` when it's missing (skip when the plugin directory isn't in a git repo). If the publisher's account has no developer mode, follow the `codex` steps instead.
 
-  > When you're done testing, uninstall the test build (under `Personal`) from its menu and reinstall the real {plugin display name}.
-- **`chatgpt_work`:** on the web, as for `chatgpt_chat`; in the ChatGPT desktop app, as for `codex`.
+  Call `plugpass_save_test_user` with `plugin_id`, `email`, and `chatgpt_app_id: asdk_app_{app hex}`. Then make the test plugin, except that the connector's `.mcp.json` entry (named by `{connector}`'s `server_key`) is removed rather than pointed at its test path, and in the copy `Write` `.app.json` as `{"apps": {"{connector server key}": {"id": "asdk_app_{app hex}"}}}`, set `"apps": "./.app.json"` in `.codex-plugin/plugin.json`, and set `name` to `dev-{app hex}` in `.codex-plugin/plugin.json` and `.claude-plugin/plugin.json`. Build the archive, then post the steps, leaving out the first and numbering the rest from 1 when `{listing url}` is null:
+
+  > **Install the test plugin in ChatGPT**
+  > 1. If {plugin display name} is installed in ChatGPT, [uninstall it]({listing url})
+  > 2. Open [your test plugin](https://chatgpt.com/plugins/plugin_asdk_app_{app hex}), choose `Upload new version` from its menu, and upload `{test plugin path}`
+  > 3. If it shows `Install plugin`, install it, then open [its settings](https://chatgpt.com/#settings/Plugins/plugin_asdk_app_{app hex}) and click `Connect another account`
+
+  Then tell the user, when `{listing url}` is present:
+
+  > When you're done testing, uninstall [your test plugin](https://chatgpt.com/plugins/plugin_asdk_app_{app hex}) from its menu, [end your test session]({plugin origin}/test-session/end), and [reinstall {plugin display name}]({listing url}).
+
+  and otherwise:
+
+  > When you're done testing, uninstall [your test plugin](https://chatgpt.com/plugins/plugin_asdk_app_{app hex}) from its menu and [end your test session]({plugin origin}/test-session/end).
 - **`codex` (the Codex CLI and the ChatGPT desktop app):** put the copy at `~/.codex/plugins/{manifest name}`. Tell the user "Set up a local marketplace per OpenAI's manual install guide: put the plugin at `~/.codex/plugins/{manifest name}` with `~/.agents/plugins/marketplace.json` pointing at it, or run `codex plugin marketplace add` for the CLI, then restart the app. After edits, update the directory the entry points to and restart."
 
 ## Step 5: Open the Test as user link
 
-Call `plugpass_test_as_user` with `plugin_id` and `email`; `{link}` is its `url`, single-use and valid for ten minutes. If the call is refused, relay its message to the user verbatim and end the skill.
+Call `plugpass_test_as_user` with `plugin_id` and `email`; `{link}` is its `url`, single-use and valid for ten minutes. If the call is refused, relay its message to the user verbatim and end the skill. When `{product}` is `chatgpt` and step 4's ChatGPT steps are still to run, return to them once the link is open.
 
 When you will drive the testing yourself in a browser you control (a browser tool such as the Chrome extension on Claude, Chrome DevTools, or the in-app browser on the ChatGPT desktop app), open {link} there. When the user has said where to open it, do that. Otherwise post the following and ask with USER_INPUT_TOOL, offering "Yes" and "No, I'll paste the link somewhere else":
 
@@ -114,15 +124,15 @@ Tell the user:
 
 When `{tested version}` is `draft`, add:
 
-> - Keep the test build current before each session.
+> - Keep the test plugin current before each session.
 
-When `{tested version}` is `draft` and `{owned servers}` is not empty, add:
+When `{tested version}` is `draft`, `{product}` isn't `chatgpt`, and `{owned servers}` is not empty, add:
 
-> - The test build points your own MCP {server | servers} at {its | their} test path, which is what test mode uses. If you add {its | a server's} connector by URL, use the test path ({url}/test for each server), turn the real connector off while you test since the two carry the same tool names, and remove the test connector when you're done.
+> - The test plugin points your own MCP {server | servers} at {its | their} test path, which is what test mode uses. If you add {its | a server's} connector by URL, use the test path ({url}/test for each server), turn the real connector off while you test since the two carry the same tool names, and remove the test connector when you're done.
 
-When `{tested version}` is `draft` and `{owned servers}` is empty, add, with `{url}` as `{connector}`'s `url`:
+When `{tested version}` is `draft`, `{product}` isn't `chatgpt`, and `{owned servers}` is empty, add, with `{url}` as `{connector}`'s `url`:
 
-> - The test build points the plugin's connector at its test path, which is what test mode uses. If you add the connector by URL, use its test path ({url}/test), turn the real connector off while you test since the two carry the same tool names, and remove the test connector when you're done.
+> - The test plugin points the plugin's connector at its test path, which is what test mode uses. If you add the connector by URL, use its test path ({url}/test), turn the real connector off while you test since the two carry the same tool names, and remove the test connector when you're done.
 
 If `{test users}` has `has_unpublished_changes` true, add:
 

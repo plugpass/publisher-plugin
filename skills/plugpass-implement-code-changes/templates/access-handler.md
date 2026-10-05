@@ -26,7 +26,7 @@ Any variables defined by tool presence should be assessed purely from its presen
     - OS = If your system instructions indicate the platform is `darwin`, then `mac`; if `linux`, then `linux`; if `win32`, then `windows`.
     - CODE_CLIENT = If (OS=`mac` || OS=`linux`), then Bash `echo "CLAUDE_CODE_ENTRYPOINT=$CLAUDE_CODE_ENTRYPOINT"`; if OS=`windows`, then PowerShell `Write-Output "CLAUDE_CODE_ENTRYPOINT=$env:CLAUDE_CODE_ENTRYPOINT"` (expected value: `cli` || `claude-desktop` || `remote`)
 - If PLATFORM=`openai`:
-  - OPENAI_CLIENT = If your system instructions include `# Codex desktop context`, then `desktop`; otherwise `codex-cli`.
+  - OPENAI_CLIENT = If your system instructions say you are Codex running inside the Codex desktop app, then `desktop`; if they identify you as Codex but don't say you are in the desktop app, then `codex-cli`; otherwise `chatgpt`.
 - OPEN_URL_TOOL = A tool that opens a URL in a browser for the user: a dedicated one (e.g. `open_in_codex`) if present, else a shell command (e.g. Bash `open "<url>"`, Bash `xdg-open "<url>"`, PowerShell `Start-Process "<url>"`). Never a web search, page fetch, remote browser, or other context where the user can't access the URL's page.
 - CAN_OPEN_URL = OPEN_URL_TOOL is present && (CODE_CLIENT=`cli` || CODE_CLIENT=`claude-desktop` || PLATFORM=`openai`) ? `true` : `false`
 - FEATURE_ID = the FEATURE_ID passed when this skill was invoked, else the `FEATURE_ID` line of CHECK_RESULT.
@@ -98,6 +98,26 @@ Then post the `ConnectConfirm` prompt in the same turn:
 ### If user answers `Yes` to `ConnectConfirm`
 
 Apply the Retry standing rule.
+
+## If OPENAI_CLIENT=`chatgpt`
+
+> Connect {PluginDisplayName} to ChatGPT to use this feature.
+>
+> [Connect {PluginDisplayName}]({PluginOrigin}/connect?platform=openai)
+
+Then post the `ConnectConfirm` prompt in the same turn:
+
+>
+> Have you connected?
+>
+> 1. Yes
+> 2. Not now
+
+### If user answers `Yes` to `ConnectConfirm`
+
+If NOT_CONNECTED=`false` now, apply the Retry standing rule. Otherwise post:
+
+> Start a new chat to use {PluginDisplayName}.
 
 ## If CLAUDE_PRODUCT=`claude`
 

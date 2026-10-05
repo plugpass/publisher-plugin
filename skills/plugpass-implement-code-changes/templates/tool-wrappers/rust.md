@@ -96,10 +96,17 @@ fn http_client() -> &'static reqwest::Client {
     CLIENT.get_or_init(|| reqwest::Client::builder().timeout(Duration::from_secs(5)).build().unwrap())
 }
 
-async fn decoding_key_for(jwks_url: &str, kid: &str) -> Option<DecodingKey> {
+// The signing key set couldn't be fetched: no verdict on the bearer, so the
+// gate answers 503, never the 401 a client reads as signed out.
+pub struct KeySetUnavailable;
+
+async fn decoding_key_for(jwks_url: &str, kid: &str) -> Result<Option<DecodingKey>, KeySetUnavailable> {
     /* …fetch/cache logic: fresh cache hit → find(kid); miss or stale →
        (rate-limited) refetch via http_client().get(jwks_url) → JwkSet json →
-       find(kid) → DecodingKey::from_jwk(jwk).ok() (handles OKP/Ed25519)… */
+       find(kid) → DecodingKey::from_jwk(jwk).ok() (handles OKP/Ed25519).
+       Ok(None) when the fetched set lacks the kid; Err(KeySetUnavailable) when
+       the set can't be fetched (a transport error, a timeout, a non-200, a body
+       that isn't a key set)… */
 }
 
 // The URLs this server moved off, which Plugpass reports so old installs keep
@@ -228,16 +235,28 @@ pub async fn addressed_resource(cfg: &PlugpassConfig, headers: &http::HeaderMap,
 // resource (the baked RESOURCE_URL, or its `/test` form at the test path) or one
 // of this server's retired URLs in the same form — a canonical token is refused
 // at the test path and a test token at the canonical path. Returns the user
-// id, or None on any failure.
-pub async fn verify_bearer(token: &str, cfg: &PlugpassConfig, test: bool) -> Option<String> {
+// id, None on any token failure, and Err when the key set couldn't be fetched.
+pub async fn verify_bearer(
+    token: &str,
+    cfg: &PlugpassConfig,
+    test: bool,
+) -> Result<Option<String>, KeySetUnavailable> {
+    let Some(kid) = decode_header(token).ok().and_then(|header| header.kid) else {
+        return Ok(None);
+    };
+    match decoding_key_for(&cfg.jwks_url, &kid).await? {
+        Some(key) => Ok(verify_claims(token, &key, cfg, test).await),
+        None => Ok(None),
+    }
+}
+
+async fn verify_claims(token: &str, key: &DecodingKey, cfg: &PlugpassConfig, test: bool) -> Option<String> {
     let suffix = if test { TEST_PATH_SUFFIX } else { "" };
-    let header = decode_header(token).ok()?;
-    let key = decoding_key_for(&cfg.jwks_url, header.kid.as_deref()?).await?;
     let mut validation = Validation::new(Algorithm::EdDSA);
     validation.set_issuer(&[&cfg.issuer]);
     validation.validate_aud = false; // checked below: RESOURCE_URL or a retired URL
     validation.set_required_spec_claims(&["exp", "aud", "iss", "sub"]);
-    let data = decode::<serde_json::Map<String, serde_json::Value>>(token, &key, &validation).ok()?;
+    let data = decode::<serde_json::Map<String, serde_json::Value>>(token, key, &validation).ok()?;
     let auds: Vec<&str> = match data.claims.get("aud")? {
         serde_json::Value::String(aud) => vec![aud.as_str()],
         serde_json::Value::Array(auds) => auds.iter().filter_map(|a| a.as_str()).collect(),
@@ -418,6 +437,18 @@ fn challenge_401(resource: &str, description: &str) -> Response {
     ).into_response()
 }
 
+// The signing key set couldn't be fetched: no verdict on the bearer.
+fn key_set_unavailable() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        [(header::RETRY_AFTER, "30"), (header::CACHE_CONTROL, "no-store")],
+        Json(serde_json::json!({
+            "error": "temporarily_unavailable",
+            "error_description": "The signing key set could not be resolved",
+        })),
+    ).into_response()
+}
+
 // The gate: the test path is strict from the first deploy; /mcp challenges only
 // while the plugin is published. Off, a request with no valid bearer is handled
 // with no `Identity` — never challenged.
@@ -426,9 +457,10 @@ async fn bearer_gate(State((cfg, test)): State<(PlugpassConfig, bool)>, mut requ
     let strict = test || enforced(&cfg).await;
     match bearer_from(request.headers()) {
         Some(token) => match verify_bearer(&token, &cfg, test).await {
-            Some(sub) => { request.extensions_mut().insert(Identity { sub, bearer: token }); }
-            None if strict => return challenge_401(&resource, "Token invalid or expired"),
-            None => {} // off: a malformed or expired bearer is no bearer
+            Err(KeySetUnavailable) => return key_set_unavailable(),
+            Ok(Some(sub)) => { request.extensions_mut().insert(Identity { sub, bearer: token }); }
+            Ok(None) if strict => return challenge_401(&resource, "Token invalid or expired"),
+            Ok(None) => {} // off: a malformed or expired bearer is no bearer
         },
         None if strict => return challenge_401(&resource, "Missing bearer token"),
         None => {}

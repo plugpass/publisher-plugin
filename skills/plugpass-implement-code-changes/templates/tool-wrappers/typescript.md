@@ -12,7 +12,7 @@ The publisher's server becomes an **OAuth-protected resource server**: a `/mcp` 
 ```ts
 // premium-feature-access-check.ts — written once per server. Standalone.
 import type { AuthInfo, CallToolResult } from '@modelcontextprotocol/server';
-import { createRemoteJWKSet, jwtVerify, type JWTVerifyGetKey } from 'jose';
+import { createRemoteJWKSet, errors, jwtVerify, type JWTVerifyGetKey } from 'jose';
 
 // Plugpass endpoints for this server.
 const PLUGIN_ID = '<the plugin's Plugpass id>';
@@ -195,17 +195,56 @@ export function unauthorized(resource: string, description: string): Response {
   });
 }
 
+// The signing key set couldn't be fetched: no verdict on the bearer, so the
+// route answers 503, never the 401 a client reads as signed out.
+export class KeySetUnavailableError extends Error {}
+
+export function keySetUnavailable(): Response {
+  return new Response(
+    JSON.stringify({
+      error: 'temporarily_unavailable',
+      error_description: 'The signing key set could not be resolved',
+    }),
+    {
+      status: 503,
+      headers: {
+        'content-type': 'application/json',
+        'retry-after': '30',
+        'cache-control': 'no-store',
+      },
+    }
+  );
+}
+
 // Per-URL JWKS, cached 4h; jose refetches on an unknown kid (throttled by
 // cooldownDuration). Module-scope-safe on Workers: construction does no I/O.
+// A key the fetched set lacks, or an algorithm it can't use, is the token's
+// fault; every other failure is the fetch's — KeySetUnavailableError.
 const jwksByUrl = new Map<string, JWTVerifyGetKey>();
 function getJwks(jwksUrl: string): JWTVerifyGetKey {
   let jwks = jwksByUrl.get(jwksUrl);
   if (!jwks) {
-    jwks = createRemoteJWKSet(new URL(jwksUrl), {
+    const remote = createRemoteJWKSet(new URL(jwksUrl), {
       cacheMaxAge: 4 * 60 * 60 * 1000,
       cooldownDuration: 30_000,
       timeoutDuration: 5_000,
     });
+    jwks = async (protectedHeader, token) => {
+      try {
+        return await remote(protectedHeader, token);
+      } catch (err) {
+        if (
+          err instanceof errors.JWKSNoMatchingKey ||
+          err instanceof errors.JWKSMultipleMatchingKeys ||
+          err instanceof errors.JOSENotSupported
+        ) {
+          throw err;
+        }
+        throw new KeySetUnavailableError('The signing key set could not be fetched', {
+          cause: err,
+        });
+      }
+    };
     jwksByUrl.set(jwksUrl, jwks);
   }
   return jwks;
@@ -215,7 +254,8 @@ function getJwks(jwksUrl: string): JWTVerifyGetKey {
 // audience = the path's own resource — the baked RESOURCE_URL, or its `/test`
 // form at the test path — or one of this server's retired URLs in the same
 // form. A canonical token is refused at the test path and a test token at the
-// canonical path. Returns the user id; throws on any failure.
+// canonical path. Returns the user id; throws on any failure — a
+// KeySetUnavailableError when the key set couldn't be fetched.
 export async function verifyBearer(
   token: string,
   cfg: PlugpassConfig,
@@ -478,7 +518,8 @@ async function handleMcp(request: Request, test: boolean): Promise<Response> {
       const { sub } = await verifyBearer(token, cfg, test);
       // The verified identity every tool reads as `ctx.http.authInfo`.
       authInfo = { token, clientId: sub, scopes: [], extra: { sub } };
-    } catch {
+    } catch (err) {
+      if (err instanceof KeySetUnavailableError) return keySetUnavailable();
       if (strict) return unauthorized(resource, 'Token invalid or expired');
       // Off: a malformed or expired bearer is no bearer.
     }
