@@ -4,15 +4,16 @@ description: >
   Installs a test version of the publisher's plugin on one of their supported AI products
   and provides a link that puts their browser into test mode for the test user they specify,
   so they can test signing up, encountering paywalls, upgrading, using premium features, and
-  the rest of the plugin's user experience without paying.
-allowed-tools: mcp__plugin_plugpass_plugpass-publisher__plugpass_get_plugin_data, mcp__plugin_plugpass_plugpass-publisher__plugpass_list_test_users, mcp__plugin_plugpass_plugpass-publisher__plugpass_save_test_user, mcp__plugin_plugpass_plugpass-publisher__plugpass_reset_test_user, mcp__plugin_plugpass_plugpass-publisher__plugpass_test_as_user, Read, Write, Edit, Glob, Grep, Bash(unlink:*), Bash(rsync:*), Bash(cp:*), Bash(zip:*), Bash(mkdir:*), Bash(mktemp:*), Bash(claude:*), Bash(codex:*), Bash(echo:*), Bash(open:*), Bash(xdg-open:*), PowerShell(New-Item:*), PowerShell(Remove-Item:*), PowerShell(Copy-Item:*), PowerShell(Compress-Archive:*), PowerShell(claude:*), PowerShell(codex:*), PowerShell(Write-Output:*), PowerShell(Start-Process:*), AskUserQuestion, Skill, WebSearch, WebFetch
+  the rest of the plugin's user experience without paying. When they're done testing, it
+  switches them back to their real plugin.
+allowed-tools: mcp__plugin_plugpass_plugpass-publisher__plugpass_get_plugin_data, mcp__plugin_plugpass_plugpass-publisher__plugpass_list_test_users, mcp__plugin_plugpass_plugpass-publisher__plugpass_save_test_user, mcp__plugin_plugpass_plugpass-publisher__plugpass_reset_test_user, mcp__plugin_plugpass_plugpass-publisher__plugpass_test_as_user, Read, Write, Edit, Glob, Grep, Bash(unlink:*), Bash(rsync:*), Bash(cp:*), Bash(zip:*), Bash(mkdir:*), Bash(mktemp:*), Bash(claude:*), Bash(codex:*), Bash(/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex:*), Bash(echo:*), Bash(open:*), Bash(xdg-open:*), PowerShell(New-Item:*), PowerShell(Remove-Item:*), PowerShell(Copy-Item:*), PowerShell(Compress-Archive:*), PowerShell(claude:*), PowerShell(codex:*), PowerShell(Write-Output:*), PowerShell(Start-Process:*), AskUserQuestion, Skill, WebSearch, WebFetch
 ---
 
 This skill works in the publisher's plugin repo: it reads files in the current working directory and runs terminal commands there. If your environment cannot do both, tell the user "Plugpass needs to read files in your plugin's repo and run terminal commands, which isn't possible here. Open your plugin's directory in an AI coding tool like Claude Code or Codex and run this skill again." and end the skill.
 
 ## What this skill does
 
-Gets the publisher into test mode: it confirms the plugin is ready to test, installs the working copy on the AI product they choose as a test version, chooses or creates a Plugpass test user, and posts the link that puts their browser into test mode for that test user. It never decides what to test, never writes tests, and never edits the plugin repo: the test plugin (step 4) is a copy outside the repo.
+Gets the publisher into test mode: it confirms the plugin is ready to test, installs the working copy on the AI product they choose as a test version, chooses or creates a Plugpass test user, and posts the link that puts their browser into test mode for that test user. When they're done testing, it switches them back to their real plugin. It never decides what to test, never writes tests, and never edits the plugin repo: the test plugin (step 4) is a copy outside the repo.
 
 The Plugpass Publisher MCP server (this plugin's `.mcp.json` `plugpass-publisher` entry) provides the `plugpass_get_plugin_data`, `plugpass_list_test_users`, `plugpass_save_test_user`, `plugpass_reset_test_user`, and `plugpass_test_as_user` tools this skill calls — reference them by those bare names under any connector prefix.
 
@@ -20,20 +21,20 @@ The Plugpass Publisher MCP server (this plugin's `.mcp.json` `plugpass-publisher
 
 **Presenting copy.** A `>` block is finished copy; the `>` characters delimit it here and are never part of it. Reproduce the text exactly — substituting each `{VARIABLE}` with its value — and never print the `>` characters, restyle the wording, or wrap it in a quote block. Where a step says to tell the publisher something, post it as your own message with nothing of your own before or after it. Copy given inline in double quotes is delivered the same way, without the quote marks.
 
-- PUBLISHER_PLUGIN_VERSION = `0.0.21` (stamped by the release pipeline). Include it as `publisher_plugin_version` on every Publisher MCP tool call in this skill.
+- PUBLISHER_PLUGIN_VERSION = `0.0.22` (stamped by the release pipeline). Include it as `publisher_plugin_version` on every Publisher MCP tool call in this skill.
 - USER_INPUT_TOOL = A tool that presents the user a question with selectable options and returns their choice (e.g. `AskUserQuestion`, `ask_user_input_v0`, etc.) that can be used in the default session state. Where a prompt below calls for USER_INPUT_TOOL and no such tool is available, ask the question in chat and wait for the reply.
 - OS = If your system instructions indicate the platform is `darwin`, then `mac`; if `linux`, then `linux`; if `win32`, then `windows`.
 - OPEN_URL_TOOL = A tool that opens a URL in a browser for the user: a dedicated one (e.g. `open_in_codex`) if present, else a shell command (e.g. Bash `open "<url>"`, Bash `xdg-open "<url>"`, PowerShell `Start-Process "<url>"`). Never a web search or page fetch.
 - PUBLISHER_TOOLS_MISSING = If a Publisher MCP tool this skill needs is not in your tool catalog under any connector prefix (if not loaded, attempt to load it via tool search), the Publisher MCP server isn't connected: invoke the `plugpass-access-handler` skill and follow its instructions. When it returns after a successful connection, retry the call that needed the tool.
-- ARGUMENTS = The text after the command, if any (the plugin's install page passes them as `{product name} {test user email}`): the last whitespace-separated token containing `@` is the test user's email, and whatever precedes it is the product, matched case-insensitively against `{products}` by value or label. An argument that matches nothing is ignored and its question asked as usual.
+- ARGUMENTS = The text after the command, if any (the plugin's install page passes them as `{product name} {test user email}`): the last whitespace-separated token containing `@` is the test user's email, and whatever precedes it is the product, matched case-insensitively against `{products}` by value or label. An argument that matches nothing is ignored and its question asked as usual. When the first token is `done`, the user is done testing, and whatever follows it is the product.
 
 ## Step 1: Confirm the plugin is ready to test
 
 Read `.claude-plugin/plugin.json` (else `.codex-plugin/plugin.json`). `{manifest name}` is its `name`; `{plugin-plugpass-id}` is `metadata.plugpass-plugin-id`. If the id is absent or empty, tell the user "This plugin isn't registered with Plugpass yet. Run the `plugpass-sync-plugin` skill first." and end the skill.
 
-Call `plugpass_get_plugin_data` with `plugin_id: {plugin-plugpass-id}`; keep its `plugin_slug` as `{plugin slug}`, its `plugin_display_name` as `{plugin display name}`, its `plugin_origin` as `{plugin origin}`, its `supported_products` as `{products}`, its `owned_servers` as `{owned servers}` (the publisher's own MCP servers, each with its `.mcp.json` key `server_name` and its `url`), its `connector` as `{connector}` (the plugin's connector, with its `.mcp.json` key `server_key` and its `url`), and its `chatgpt_install_url` as `{listing url}` (the plugin's ChatGPT Plugin Directory listing, or null).
+Call `plugpass_get_plugin_data` with `plugin_id: {plugin-plugpass-id}`; keep its `plugin_slug` as `{plugin slug}`, its `plugin_display_name` as `{plugin display name}`, its `plugin_origin` as `{plugin origin}`, its `supported_products` as `{products}`, its `owned_servers` as `{owned servers}` (the publisher's own MCP servers, each with its `.mcp.json` key `server_name` and its `url`), its `connector` as `{connector}` (the plugin's connector, with its `.mcp.json` key `server_key` and its `url`), and its `chatgpt_install_url` as `{listing url}` (the plugin's ChatGPT Plugin Directory listing, or null). When the user is done testing, skip to Switching back.
 
-Call `plugpass_list_test_users` with `plugin_id: {plugin-plugpass-id}` and keep the response as `{test users}`. If `versions.draft` is present and its `outstanding` has an entry whose `code` starts with `impl_`, tell the user "This plugin's premium features aren't implemented yet. Run the `plugpass-implement-code-changes` skill first." and end the skill. If `any_version_ready` is false, tell the user "No version of this plugin is ready to test yet. Finish the plugin's setup in the Plugpass dashboard first; the Publish page lists what's outstanding." and end the skill. `{version}` is `draft` when `versions.draft` is present and `ready`, else `production`; `versions.{version}.plans` are the plans step 3 offers, and `users` the existing test users.
+Call `plugpass_list_test_users` with `plugin_id: {plugin-plugpass-id}` and keep the response as `{test users}`. If `versions.draft` is present and its `outstanding` has an entry whose `code` starts with `impl_`, tell the user "This plugin's premium features aren't implemented yet. Run the `plugpass-implement-code-changes` skill first." and end the skill. If `any_version_ready` is false, tell the user "No version of this plugin is ready to test yet. Finish the plugin's setup in the Plugpass dashboard first." and end the skill. `{version}` is `draft` when `versions.draft` is present and `ready`, else `production`; `versions.{version}.plans` are the plans step 3 offers, and `users` the existing test users.
 
 ## Step 2: Ask which AI product to test on
 
@@ -61,7 +62,13 @@ Otherwise follow the steps for `{product}`. These are the steps as last verified
 
 Where a product takes an archive, build it from `{build dir}` yourself, leaving out `.git`, `node_modules`, and `.plugpass` directories (Bash: `zip -r "{test plugin path}" . -x '.git/*' 'node_modules/*' '.plugpass/*'` from that directory; PowerShell: `Compress-Archive` over the same directory with those folders excluded). The archive, and a copy made for it, go in your session's scratchpad or outputs folder when it has one, else a temporary directory (`mktemp -d`); `{test plugin path}` is the archive's absolute path.
 
-- **`claude_code` (terminal and desktop app):** put the copy at `~/.claude/skills/{manifest name}`. If the plugin is also installed from a marketplace, run `claude plugin disable {manifest name}@<marketplace>` first and tell the user to run `claude plugin enable {manifest name}@<marketplace>` when they are done testing. Tell the user "Start a new Claude Code session to load the test plugin. Remove the copy at `~/.claude/skills/{manifest name}` when you're done testing."
+**Local state** lives in `.plugpass/` in the repo: create it when absent, and add a `.plugpass/` line to the repo's `.gitignore` when it's missing (skip when the plugin directory isn't in a git repo). `.plugpass/test-plugin.json` lists, under each product's value, the installs this skill turned off there, such as `{"codex": ["{manifest name}@<marketplace>"]}`; add to a product's list, keeping what's already on it. `{done command}` is this skill's command in your client followed by `done`: `/plugpass-test-plugin done` in Claude Code, `$plugpass-test-plugin done` in Codex.
+
+- **`claude_code` (terminal and desktop app):** put the copy at `$HOME/.claude/skills/{manifest name}`. If the plugin is also installed from a marketplace, run `claude plugin disable {manifest name}@<marketplace>` first and add `{manifest name}@<marketplace>` to `claude_code`'s list in `.plugpass/test-plugin.json`. Tell the user, leaving out " & enable the real {plugin display name} one again" when `claude_code`'s list is empty:
+
+  > Start a new Claude Code session to load the test plugin.
+  >
+  > Let me know when you're done testing (or run `{done command}`), and I'll remove the test plugin & enable the real {plugin display name} one again.
 - **`claude` (web and desktop, Cowork included):** build the archive, then post the steps:
 
   > **Install the test plugin in Claude**
@@ -80,7 +87,7 @@ Where a product takes an archive, build it from `{build dir}` yourself, leaving 
   > 2. [Create an app](https://chatgpt.com/plugins#settings/Connectors?create-connector=true) named `{plugin display name} test` with the server URL `{connector url}/test`, check `I understand and want to continue`, and click `Create`
   > 3. Open `{plugin display name} test` under [Personal](https://chatgpt.com/plugins?view=personal) and paste its URL here
 
-  with `{connector url}` as `{connector}`'s `url`. The pasted URL ends in `plugin_asdk_app_` and the app's hex: `Write` `{"app_id": "asdk_app_{app hex}"}` to `.plugpass/chatgpt-test-app.json`, creating `.plugpass/` if absent, and add a `.plugpass/` line to the repo's `.gitignore` when it's missing (skip when the plugin directory isn't in a git repo). If the publisher's account has no developer mode, follow the `codex` steps instead.
+  with `{connector url}` as `{connector}`'s `url`. The pasted URL ends in `plugin_asdk_app_` and the app's hex: `Write` `{"app_id": "asdk_app_{app hex}"}` to `.plugpass/chatgpt-test-app.json`. If the publisher's account has no developer mode, follow the `codex` steps instead.
 
   Call `plugpass_save_test_user` with `plugin_id`, `email`, and `chatgpt_app_id: asdk_app_{app hex}`. Then make the test plugin, except that the connector's `.mcp.json` entry (named by `{connector}`'s `server_key`) is removed rather than pointed at its test path, and in the copy `Write` `.app.json` as `{"apps": {"{connector server key}": {"id": "asdk_app_{app hex}"}}}`, set `"apps": "./.app.json"` in `.codex-plugin/plugin.json`, and set `name` to `dev-{app hex}` in `.codex-plugin/plugin.json` and `.claude-plugin/plugin.json`. Build the archive, then post the steps, leaving out the first and numbering the rest from 1 when `{listing url}` is null:
 
@@ -96,7 +103,23 @@ Where a product takes an archive, build it from `{build dir}` yourself, leaving 
   and otherwise:
 
   > When you're done testing, uninstall [your test plugin](https://chatgpt.com/plugins/plugin_asdk_app_{app hex}) from its menu and [end your test session]({plugin origin}/test-session/end).
-- **`codex` (the Codex CLI and the ChatGPT desktop app):** put the copy at `~/.codex/plugins/{manifest name}`. Tell the user "Set up a local marketplace per OpenAI's manual install guide: put the plugin at `~/.codex/plugins/{manifest name}` with `~/.agents/plugins/marketplace.json` pointing at it, or run `codex plugin marketplace add` for the CLI, then restart the app. After edits, update the directory the entry points to and restart."
+- **`codex` (the Codex CLI and the ChatGPT desktop app):** `{codex}` is the `codex` command, or when it isn't found, the ChatGPT desktop app's own copy (on a Mac, `/Applications/ChatGPT.app/Contents/Resources/codex-cli/bin/codex`). If neither is found, tell the user "I couldn't find Codex on this computer. Run this skill in Codex, or [install the Codex CLI](https://learn.chatgpt.com/docs/codex/cli) and run it again." and end the skill.
+
+  Put the copy at `$HOME/.codex/plugpass-test/plugins/{manifest name}`. Create `~/.codex/plugpass-test/.agents/plugins/marketplace.json` as `{"name": "plugpass-test", "interface": {"displayName": "Plugpass test plugins"}, "plugins": []}` when it's absent, and add `{"name": "{manifest name}", "source": {"source": "local", "path": "./plugins/{manifest name}"}}` to its `plugins` when no entry has that name. Run `{codex} plugin marketplace add "$HOME/.codex/plugpass-test"`, then `{codex} plugin add {manifest name}@plugpass-test`, even when it's already installed. In `~/.codex/config.toml`, set `enabled = false` in each `[plugins."{manifest name}@<marketplace>"]` table other than `plugpass-test`'s that has `enabled = true`, unless `<marketplace>` ends in `-remote`, and add each `{manifest name}@<marketplace>` you turn off to `codex`'s list in `.plugpass/test-plugin.json`.
+
+  Then post the following, leaving out " & enable the real {plugin display name} one again" when `codex`'s list is empty. When `{listing url}` is present:
+
+  > **Load the test plugin in Codex**
+  > 1. If {plugin display name} is installed from the ChatGPT Plugin Directory, [uninstall it]({listing url})
+  > 2. Start a new Codex session. If you're testing in the ChatGPT desktop app, restart the app first
+  >
+  > Let me know when you're done testing (or run `{done command}`), and I'll uninstall the test plugin & enable the real {plugin display name} one again.
+
+  and otherwise:
+
+  > Start a new Codex session to load the test plugin. If you're testing in the ChatGPT desktop app, restart the app first.
+  >
+  > Let me know when you're done testing (or run `{done command}`), and I'll uninstall the test plugin & enable the real {plugin display name} one again.
 
 ## Step 5: Open the Test as user link
 
@@ -139,3 +162,13 @@ If `{test users}` has `has_unpublished_changes` true, add:
 > When you're done testing, publish your changes in Plugpass to make them live.
 >
 > [Publish plugin](https://plugpass.ai/dashboard/plugin/{plugin slug}/publish)
+
+## Switching back
+
+When the user says they're done testing, or ARGUMENTS starts with `done`, switch back on `{product}`: the product named after `done`, else the one tested in this chat, else the one they choose when asked with USER_INPUT_TOOL "Which AI product are you done testing on?", offering `{products}` as step 2 does.
+
+- **`codex`:** with `{codex}` as step 4 defines it, run `{codex} plugin remove {manifest name}@plugpass-test`, remove the `{manifest name}` entry from `~/.codex/plugpass-test/.agents/plugins/marketplace.json`, and run `{codex} plugin marketplace remove plugpass-test` when no entries remain. In `~/.codex/config.toml`, set `enabled = true` in the table of each install on `codex`'s list in `.plugpass/test-plugin.json`, then empty the list. Tell the user "Start a new Codex session to load the real {plugin display name}. If you're using the ChatGPT desktop app, restart the app first.", or when the list was empty, "Start a new Codex session to finish removing the test plugin. If you're using the ChatGPT desktop app, restart the app first." When `{listing url}` is present, add:
+
+  > If you uninstalled {plugin display name} from the ChatGPT Plugin Directory, [end your test session]({plugin origin}/test-session/end) and [reinstall it]({listing url}).
+- **`claude_code`:** delete `$HOME/.claude/skills/{manifest name}`, run `claude plugin enable` on each install on `claude_code`'s list in `.plugpass/test-plugin.json`, then empty the list. Tell the user "Start a new Claude Code session to load the real {plugin display name}.", or when the list was empty, "Start a new Claude Code session to finish removing the test plugin."
+- **`claude` and `chatgpt`:** post that product's step 4 lines that begin "When you're done testing", with their values as step 4 defines them. When ChatGPT was tested through the `codex` steps, follow `codex` instead.
