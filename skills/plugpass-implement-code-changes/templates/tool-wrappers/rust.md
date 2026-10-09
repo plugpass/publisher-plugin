@@ -117,10 +117,13 @@ const RETIRED_TTL: Duration = Duration::from_secs(300);
 const RETIRED_FAILURE_TTL: Duration = Duration::from_secs(60);
 
 pub async fn retired_audiences(cfg: &PlugpassConfig) -> HashSet<String> {
-    if let Some((urls, expires)) = RETIRED.lock().unwrap().as_ref() {
-        if Instant::now() < *expires {
-            return urls.clone();
-        }
+    if let Some((urls, _)) = RETIRED
+        .lock()
+        .unwrap()
+        .as_ref()
+        .filter(|(_, expires)| Instant::now() < *expires)
+    {
+        return urls.clone();
     }
     #[derive(serde::Deserialize)]
     struct Body { retired: Vec<String> }
@@ -191,7 +194,10 @@ pub async fn enforced(cfg: &PlugpassConfig) -> bool {
         None => {
             // No answer yet: learn it before handling the request; strict until it arrives.
             refresh_enforcement(cfg).await;
-            ENFORCEMENT.lock().unwrap().map_or(true, |(enforced, _)| enforced)
+            ENFORCEMENT
+                .lock()
+                .unwrap()
+                .is_none_or(|(enforced, _)| enforced)
         }
         Some((false, expires_at)) => {
             if Instant::now() >= expires_at {
@@ -274,7 +280,7 @@ async fn verify_claims(token: &str, key: &DecodingKey, cfg: &PlugpassConfig, tes
 }
 ```
 
-The entitlement client (`entitlement(bearer, body, op, cfg)` over an `EntitlementBody { plugin_id, feature_id, current_count: Option<u64> }`, POSTing `{origin}/entitlement/{op}` via `http_client()` — 5s timeout per attempt with ONE retry after a 2s backoff on a transport error or a 5xx (4xx terminal, never retried); HTTP 401 → `ReauthRequired`, other non-200 or a failure after the retry → `Unavailable`), the `EntitlementResult` enum (its `NonAuthorized` variant carries `result_text: String`; its `Unavailable` variant carries nothing), the `non_authorized` rendering below, and the unavailable-grant `CallToolResult` follow the wire contract in TOOLS.md.
+The entitlement client (`entitlement(bearer, body, op, cfg)` over an `EntitlementBody { plugin_id, feature_id, call_id: Option<String>, quantities: Option<HashMap<String, u64>>, current_count: Option<u64>, adding: Option<u64> }` (deriving `Default`, each `Option` `skip_serializing_if = "Option::is_none"`; `Ok` carries `settle` and `output: Option<Output { key, max: Option<u64> }>`), POSTing `{origin}/entitlement/{op}` via `http_client()` — 5s timeout per attempt with ONE retry after a 2s backoff on a transport error or a 5xx (4xx terminal, never retried); HTTP 401 → `ReauthRequired`, other non-200 or a failure after the retry → `Unavailable`), the `EntitlementResult` enum (its `NonAuthorized` variant carries `result_text: String`; its `Unavailable` variant carries nothing), the `non_authorized` rendering below, and the unavailable-grant `CallToolResult` follow the wire contract in TOOLS.md.
 
 ```rust
 use rmcp::model::{CallToolResult, ContentBlock, JsonObject, MetaObject, RequestMetaObject};
@@ -524,7 +530,7 @@ async fn check_premium_access(
     if args.status_code == Some(true) {
         let probed = entitlement(
             &identity.bearer,
-            &EntitlementBody { plugin_id: args.plugin_id, feature_id: args.feature_id, current_count: None },
+            &EntitlementBody { plugin_id: args.plugin_id, feature_id: args.feature_id, ..Default::default() },
             "check_remaining",
             &self.cfg,
         ).await;
@@ -556,9 +562,9 @@ async fn check_premium_access(
 }
 ```
 
-**Solo paid tool wrapper** (consume-on-invocation; no `auth_token` parameter on this path): read `Identity` from the parts extensions — `None` (no bearer: the /mcp gate off, the plugin unpublished) runs the body with no entitlement call, as the tool ran before Plugpass; with one, call `track_usage` (`feature_id` = the tool's own plugpass-component-id, matching its `_meta`; the id's `tool_` prefix carries the feature type), branch: `Ok` → run the body scoped to `identity.sub`; `NonAuthorized` → `non_authorized_tool_response(&result_text, DeniedCall { name: "<tool name>".into(), arguments: serde_json::to_value(&args).unwrap_or(Value::Null) }, &paid_tool_meta(), &meta, &self.cfg, PAID_TOOL_FEATURE_ID)` — the args struct derives `serde::Serialize` beside `Deserialize` (`#[serde(skip_serializing_if = "Option::is_none")]` on each optional field, so the echo is the call as sent), every wrapped tool's handler extracts `meta: RequestMetaObject` (rmcp's request-`_meta` extractor, beside `Parameters` and `Extension`), and the renderer reads the tool's own registered `MetaObject` (its widget, who may call it) and the request's capabilities — never a baked per-tool constant; `ReauthRequired` → set the signal + placeholder; `Unavailable` → run the body (it consumed nothing and grants). Stamp `_meta` with the macro's `meta` attribute, `#[tool(name = "…", description = "…", meta = paid_tool_meta())]`, where `fn paid_tool_meta() -> MetaObject` builds the `MetaObject` carrying `plugpass_component_id` (from a `const PAID_TOOL_FEATURE_ID: &str`) (and, on a UI-backed tool, its `ui: { resourceUri, visibility }`) — the one function both the attribute and the marker rule read. Wrapped tools return `Result<CallToolResult, ErrorData>` — never a `Json<T>` typed result (no output schema: paywall/reauth responses are text-only). Re-derive the macro's `annotations(…)`: metering makes the tool neither read-only nor idempotent, whatever it was before the wrap — `read_only_hint = false, idempotent_hint = false`, the other two keeping the tool's own values; see TOOLS.md § Tool annotations.
+**Solo paid tool wrapper** (entry, body, settle; no `auth_token` parameter on this path): read `Identity` from the parts extensions — `None` (no bearer: the /mcp gate off, the plugin unpublished) runs the body with no entitlement call, as the tool ran before Plugpass; with one, call `track_usage` (`feature_id` = the tool's own plugpass-component-id, matching its `_meta`; the id's `tool_` prefix carries the feature type), branch: `Ok` → run the body scoped to `identity.sub`; `NonAuthorized` → `non_authorized_tool_response(&result_text, DeniedCall { name: "<tool name>".into(), arguments: serde_json::to_value(&args).unwrap_or(Value::Null) }, &paid_tool_meta(), &meta, &self.cfg, PAID_TOOL_FEATURE_ID)` — the args struct derives `serde::Serialize` beside `Deserialize` (`#[serde(skip_serializing_if = "Option::is_none")]` on each optional field, so the echo is the call as sent), every wrapped tool's handler extracts `meta: RequestMetaObject` (rmcp's request-`_meta` extractor, beside `Parameters` and `Extension`), and the renderer reads the tool's own registered `MetaObject` (its widget, who may call it) and the request's capabilities — never a baked per-tool constant; `ReauthRequired` → set the signal + placeholder; `Unavailable` → run the body (it consumed nothing and grants). Stamp `_meta` with the macro's `meta` attribute, `#[tool(name = "…", description = "…", meta = paid_tool_meta())]`, where `fn paid_tool_meta() -> MetaObject` builds the `MetaObject` carrying `plugpass_component_id` (from a `const PAID_TOOL_FEATURE_ID: &str`) (and, on a UI-backed tool, its `ui: { resourceUri, visibility }`) — the one function both the attribute and the marker rule read. Wrapped tools return `Result<CallToolResult, ErrorData>` — never a `Json<T>` typed result (no output schema: paywall/reauth responses are text-only). Re-derive the macro's `annotations(…)`: metering makes the tool neither read-only nor idempotent, whatever it was before the wrap — `read_only_hint = false, idempotent_hint = false`, the other two keeping the tool's own values; see TOOLS.md § Tool annotations. **The call id, the quantities, and the settle** (TOOLS.md → The settle, Reading a tool's quantities): mint the call id with `Uuid::new_v4().to_string()` before the entry and send it, with `quantities` — each recorded quantity's key mapped to an input's count from the arguments, or, when the tool takes a size argument, an output's requested size (its default when the caller omitted it) — on `track_usage`. On `ok`, cap the tool's size argument at `output.max` (null leaves it as asked) and keep `settle`; the unavailable grant is `settle: none`. Run the body; when it throws or returns an error result and `settle` isn't `none`, call `settle(bearer, &SettleBody { … }, &self.cfg)` with `outcome: "failure"` before failing as the tool would. On a success with `settle: always`, call it with `outcome: "success"` and the result's item count under `output.key`, then: `non_authorized` → the same denial as at entry; `ok` → `deliver_settled(result, &settled, trim, call, &paid_tool_meta())`, which trims every representation of the result to `deliver` (the tool's own `trim`, its text and its structured content alike) and adds `note` as a text block of its own and, when the result carries structured content, under its `limit_note` key, and `partial` on `_meta.plugpass_partial` beside the call echo; anything else (reauth included) → the whole result, with no note. The settle client POSTs `{origin}/entitlement/settle` with the entry's timeout and retry.
 
-**Paired-tool add side** (`operation: add`): same shape, and `feature_id` is the tool's OWN `plugpass_id` (its `tool_` prefix carries the feature type) exactly as for a solo tool — every gated artifact bakes its own component's id, and the `entitlement` subfield is identity, never a `feature_id`. Always **`check_remaining`**, passing the user's current count from the publisher's own store (scoped to `sub`) as `current_count` — see TOOLS.md → Reading the user's current count.
+**Paired-tool add side** (`operation: add`): same shape, and `feature_id` is the tool's OWN `plugpass_id` (its `tool_` prefix carries the feature type) exactly as for a solo tool — every gated artifact bakes its own component's id, and the `entitlement` subfield is identity, never a `feature_id`. Always **`check_remaining`**, passing the user's current count from the publisher's own store (scoped to `sub`) as `current_count` — see TOOLS.md → Reading the user's current count — and `adding`, how many records the call adds (`1`, or the list's length for a batch). No call id and no settle: a record add never consumes.
 
 **Identity tool** (the paired remove side, or any per-user free tool): no Entitlement API call — read `Identity` from the parts extensions and scope the body to its `sub`; with `None` (the /mcp gate off), answer that nobody is signed in and touch no record:
 
@@ -598,7 +604,7 @@ pub fn with_paywall(html: &str, csp: &UiResourceCsp, cfg: &PlugpassConfig) -> (S
     };
     let origin = origin_of(&cfg.paywall_script_url); // scheme + host (+ port), no path
     let mut widened = csp.clone();
-    if !widened.resource_domains.iter().any(|d| *d == origin) {
+    if !widened.resource_domains.contains(&origin) {
         widened.resource_domains.push(origin);
     }
     (injected, widened)

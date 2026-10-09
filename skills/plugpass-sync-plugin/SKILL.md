@@ -26,11 +26,11 @@ The Plugpass Publisher MCP server (this plugin's `.mcp.json` `plugpass-publisher
 
 **Presenting copy.** A `>` block is finished copy; the `>` characters delimit it here and are never part of it. Reproduce the text exactly — substituting each `{VARIABLE}` with its value — and never print the `>` characters, restyle the wording, or wrap it in a quote block. The surrounding step says where the copy goes: where it says to tell the publisher something, post it as your own message with nothing of your own before or after it, by whatever messaging method will be visible to them (especially if a tool call will follow it in the same turn). Copy given inline in double quotes is delivered the same way, without the quote marks.
 
-- PUBLISHER_PLUGIN_VERSION = `0.0.22` (stamped by the release pipeline). Include it as `publisher_plugin_version` on every Publisher MCP tool call in this skill.
+- PUBLISHER_PLUGIN_VERSION = `0.0.23` (stamped by the release pipeline). Include it as `publisher_plugin_version` on every Publisher MCP tool call in this skill.
 - USER_INPUT_TOOL = A tool that presents the user a question with selectable options and returns their choice (e.g. `AskUserQuestion`, `ask_user_input_v0`, etc.) that can be used in the default session state (not limited to a certain mode, e.g. plan mode). Where a prompt below calls for USER_INPUT_TOOL and no such tool is available, ask the question in chat and wait for the reply.
 - PLATFORM = If your system instructions indicate an OpenAI product (Codex or ChatGPT), then `openai`; otherwise (an Anthropic / Claude product) `claude`.
 - OS = If your system instructions indicate the platform is `darwin`, then `mac`; if `linux`, then `linux`; if `win32`, then `windows`.
-- If PLATFORM=`claude`: CODE_CLIENT = If (OS=`mac` || OS=`linux`), then Bash `echo "CLAUDE_CODE_ENTRYPOINT=$CLAUDE_CODE_ENTRYPOINT"`; if OS=`windows`, then PowerShell `Write-Output "CLAUDE_CODE_ENTRYPOINT=$env:CLAUDE_CODE_ENTRYPOINT"` (expected value: `cli` || `claude-desktop` || `remote`)
+- If PLATFORM=`claude`: CODE_CLIENT = If (OS=`mac` || OS=`linux`), then Bash `echo "CLAUDE_CODE_ENTRYPOINT=$CLAUDE_CODE_ENTRYPOINT"`; if OS=`windows`, then PowerShell `Write-Output "CLAUDE_CODE_ENTRYPOINT=$env:CLAUDE_CODE_ENTRYPOINT"` (the printed value is `cli` ? `cli` : `claude-desktop` ? `claude-desktop` : `remote`)
 - OPEN_URL_TOOL = If OS=`mac`, then Bash `open "<url>"`; if OS=`linux`, then Bash `xdg-open "<url>"`; if OS=`windows`, then PowerShell `Start-Process "<url>"`. (OPEN_URL_TOOL is undefined when CODE_CLIENT=`remote` — no local browser to open; where a step says to open a URL, present it as a markdown link instead.)
 - PUBLISHER_TOOLS_MISSING = If a Publisher MCP tool this skill needs is not in your tool catalog under any connector prefix (if not loaded, attempt to load it via tool search), the Publisher MCP server isn't connected: invoke the `plugpass-access-handler` skill and follow its instructions. When it returns after a successful connection, retry the call that needed the tool.
 
@@ -77,11 +77,11 @@ For each file, use `Read` to load it and parse the YAML frontmatter (the block b
 - `name` — required; if absent, fall back to the directory or file name without the extension.
 - `metadata.plugpass-component-id` — **SYNC mode only**: the existing Plugpass id from a prior run; may be absent if the component was added since. The plugpass_id (when present) is what makes rename detection work — `plugpass_sync_plugin` matches by id first and the canonical row's name gets updated to the current local name. **In REGISTER mode, ignore this field even if present** — a stale or copied id must not ride the payload; the server's name-fallback matching handles any relink.
 
-Track the file path next to each component so step 8 can write back to it, and keep each file's `description` + body content on hand — step 5 drafts pitch suggestions from them.
+Track the file path next to each component so step 8 can write back to it, and keep each file's `description` + body content on hand — step 5 proposes names and drafts pitch suggestions from them.
 
 ## Step 3: Discover local mcp_dependency components
 
-Read `.mcp.json` at the plugin root (when `{manifest}` is `.codex-plugin/plugin.json` and its `mcpServers` field names a different path, read that file instead; an inline `mcpServers` object there is the servers map itself). If the file is absent or its `mcpServers` object is empty, the discovered tool list and mcp_dependency list are both empty — skip to step 5 (pitch drafting still runs for the skills) with no MCP-server content in the payload.
+Read `.mcp.json` at the plugin root (when `{manifest}` is `.codex-plugin/plugin.json` and its `mcpServers` field names a different path, read that file instead; an inline `mcpServers` object there is the servers map itself). If the file is absent or its `mcpServers` object is empty, the discovered tool list and mcp_dependency list are both empty — skip to step 5 (which still runs for the skills) with no MCP-server content in the payload.
 
 Otherwise, parse `mcpServers`. **Before doing anything else with the parsed entries, filter out Plugpass-served MCP servers** — the platform's own hosts are never publisher-owned `mcp_dependencies` (connector audiences derive from plugin state, not from per-plugin source). Drop any `mcpServers` entry whose URL host (host:port for localhost entries) matches one of:
 
@@ -119,9 +119,9 @@ In SYNC mode, call the `plugpass_get_plugin_data` tool (under any connector pref
 Capture the response. From the `components` array:
 
 - **`mcp_dependency` entries** carry per-server `domain` (null for a server Plugpass has recorded as local), `ownership` (`unknown` / `owned` / `not_owned`) and `has_ungated_tools` (true when the server has at least one solo canonical tool that isn't already paid, OR when the server has no canonical tools at all yet). Build a `server_name → { plugpass_id, domain, ownership, has_ungated_tools }` map — Q1, Q2, and the local-server report below consume it.
-- **`tool` entries** carry the existing per-tool `entitlement` subfield + `operation`. Build a `(server_name, tool_name) → { plugpass_id, entitlement, operation }` map for tool enumeration's re-run identity match and paired-tool detection's pre-confirmation.
+- **`tool` entries** carry the existing per-tool `entitlement` subfield + `operation`, and a solo tool's recorded `quantities`. Build a `(server_name, tool_name) → { plugpass_id, entitlement, operation, quantities }` map for tool enumeration's re-run identity match, paired-tool detection's pre-confirmation, and quantity detection.
 
-**In REGISTER mode, skip the call** — there is no plugin id to query. Treat every server's effective state as empty: ownership `unknown`, `has_ungated_tools` true, no tool in any tier, no pre-confirmed pairs, and an empty plugpass-id map.
+**In REGISTER mode, skip the call** — there is no plugin id to query. Treat every server's effective state as empty: ownership `unknown`, `has_ungated_tools` true, no tool in any tier, no pre-confirmed pairs, no recorded quantities, and an empty plugpass-id map.
 
 ### Local servers Plugpass hasn't recorded yet
 
@@ -284,22 +284,35 @@ If "Yes", proceed to prompt 2.
 
 > What do you want to name the database records?
 
-Offer the AI's proposed sentence-case plural name as the recommended option, plus one alternate phrasing the AI thought of. Example for `add_brainstorm_topic` ↔ `remove_brainstorm_topic`: "Brainstorm topics" (preferred) and "Topics" (alternate). The auto-appended "Other" option (where the tool provides one) handles full free-text override.
+Offer your proposed plural name as the recommended option, plus one alternate phrasing. Example for `add_brainstorm_topic` ↔ `remove_brainstorm_topic`: "brainstorm topics" (recommended) and "topics" (alternate). The auto-appended "Other" option (where the tool provides one) handles full free-text override.
 
-The publisher's chosen string becomes the database record's `title`. The AI then derives `name` by:
+The chosen name, in lowercase except a proper noun's capitals, becomes the database record's `title`. Derive its `name` by:
 
 1. Lowercase the title.
 2. Replace runs of non-alphanumeric characters with a single underscore.
 3. Strip leading and trailing underscores.
 
-Example: "Brainstorm topics" → `brainstorm_topics`. "Saved chart views!" → `saved_chart_views`. The server re-derives `name` from `title` using the same rule and rejects the call if the AI's `name` doesn't match — clients shouldn't trust their own derivation when ours is canonical.
+Example: "brainstorm topics" → `brainstorm_topics`. "GitHub repos" → `github_repos`. The server re-derives `name` from `title` using the same rule and rejects the call if the AI's `name` doesn't match — clients shouldn't trust their own derivation when ours is canonical.
+
+Derive the record's `singular` from the title yourself, without asking ("brainstorm topics" → "brainstorm topic").
 
 For each confirmed pair (pre-confirmed or newly confirmed), emit:
 
-- One `entitlement` component entry carrying `name` + `title` (`plugpass_id` present for pre-confirmed pairs, omitted for newly-confirmed ones).
+- One `entitlement` component entry carrying `name` + `title` (`plugpass_id` present for pre-confirmed pairs, omitted for newly-confirmed ones), and `singular` for a newly-confirmed one.
 - The two paired `tool` entries each carry `entitlement_name` (matching the `entitlement` entry's `name`) and `operation` (`add` for the tool that adds a database record, `remove` for the tool that removes a database record).
 
 **SYNC mode:** for previously-confirmed pairs that are no longer detected (e.g., the publisher renamed one of the tools so the pattern no longer matches) or that the publisher un-confirms this run, omit the `entitlement` entry and omit `entitlement_name` + `operation` on both partner tool entries. `plugpass_sync_plugin` reconciles by clearing `entitlement_id` + `operation` on both partner `mcp_tools` rows and dropping the orphaned entitlement from the draft.
+
+### For each enumerated server: quantity detection
+
+For each solo tool (not a member of a confirmed pair), read its handler and pick out the counts it handles per call that would read naturally as a pricing-page limit for what it does ("2000 leads / mo"): an **input** list it processes item by item, or an **output** list or count it returns. Don't offer incidental counts (tags, fields, options).
+
+- **Recorded quantities carry forward.** A tool's quantities from the pre-check go back in its `quantities` exactly as returned, with no prompt. Drop one only when the tool no longer handles that count, or when the publisher asks.
+- **Name each new quantity yourself, without asking**: its plural, and from it its `singular` and snake_case `key`.
+- **A name is a plain noun for one unit of what's counted**, specific enough to read on its own with no feature name: for an output, the thing returned ("leads", "search results"); for an input, the work done to each thing given ("lead enrichments", "web searches"). Names are lowercase except for proper nouns.
+- **No two names on the plugin match.** Compare a new name with every other quantity's and database record's on the plugin, recorded and new, and make it more specific where tools would share one ("web search results" and "news search results").
+- **The default.** Mark the quantity most natural to charge for as the tool's `default`. Exactly one per tool that has any.
+- When the publisher asks during this run to limit a tool by something else, or to stop offering a quantity, record or drop it.
 
 ### Assemble the tool component list
 
@@ -312,19 +325,23 @@ For each tool on each enumerated server, emit a `tool` component:
 - `entitlement_name` — set only when this tool is part of a confirmed pair (references the `entitlement` entry in the same call by name); omit otherwise.
 - `operation` — set only when this tool is part of a confirmed pair (`add` for the tool that adds a database record, `remove` for the tool that removes a database record); omit otherwise. `entitlement_name` and `operation` move together — either both present (paired) or both omitted (solo).
 - `plugpass_id` — SYNC mode: from the registration's `_meta.plugpass_component_id`, else the pre-check map, if either has one; omitted otherwise. Always absent in REGISTER mode.
+- `title` — solo tools only: the proposed name from step 5. Omit on a paired tool.
+- `quantities` — solo tools only: every quantity from quantity detection, recorded ones as returned and new ones named, each `{ key, source, singular, plural, default }` (`source` is `input` or `output`). `[]` for a solo tool with none. Omit on a paired tool.
 
 **All discovered `mcp_dependency` entries from step 3 are included in the payload regardless of Q2 outcome** — they're how Plugpass persists per-server `ownership` and tracks dependency identity. Entries for `not_owned` servers carry their ownership and never contribute tools. Entries for effectively-owned servers contribute tools only when they're in the enumerated set.
 
-## Step 5: Draft suggested pitches
+## Step 5: Propose names and draft suggested pitches
 
-Draft one suggested pitch per component going into the payload — skills and tools on enumerated servers, paired tools included. The drafts ride the `plugpass_sync_plugin` payload as `suggested_pitch` fields; they are suggestions only, pre-filling the dashboard's features page where the publisher reviews, edits, and confirms them. **Don't show the drafts to the publisher or ask for confirmation here** — the features page is the review surface.
+Propose a name for every skill and solo tool going into the payload, sent as its `title`: a plain name for what it does, in lowercase except a proper noun's capitals ("find leads", "GitHub search").
+
+Draft one suggested pitch per component going into the payload — skills and tools on enumerated servers, paired tools included. The drafts ride the `plugpass_sync_plugin` payload as `suggested_pitch` fields; they are suggestions only, pre-filling the dashboard's features page where the publisher reviews, edits, and confirms them. **Don't show the names or drafts to the publisher or ask for confirmation here** — the features page is the review surface.
 
 **Always draft and send `suggested_pitch` for every component, on every run.** The server's reconcile rule makes this safe and keeps this skill stateless about pitch status: a publisher-confirmed pitch is never overwritten (the suggestion isn't even stored for it), while an unconfirmed component's suggestion gets refreshed — so a component whose body changed picks up a fresher draft automatically.
 
 Each pitch is the predicate completing the component's fixed sentence form (the same sentence end users see in the premium feature access messages and on the public plans page):
 
-- Skill: "The {name} skill ___."
-- Solo tool: "The {tool_name} tool ___."
+- Skill: "The {title} skill ___."
+- Solo tool: "The {title} tool ___."
 - Paired tool: "{the pair's title} ___." (the title carries the whole noun phrase — no "The", no type word — and is **plural**, so the predicate takes the plural verb form: "Brainstorm topics **track** the topics you have saved", never "tracks"). Both sides of a pair draft against this same form: the approved pitch is the pair's.
 
 Drafting rules:
@@ -353,7 +370,7 @@ Call the `plugpass_sync_plugin` tool (under any connector prefix) with the full 
     "source": { "repository": "{repository from step 1b}", "subdirectory": "{subdirectory from step 1b}" }
   },
   "components": [
-    { "type": "skill",          "name": "{name}", "plugpass_id": "{from frontmatter, omit if absent}", "suggested_pitch": "{drafted pitch, omit if none}" },
+    { "type": "skill",          "name": "{name}", "title": "{proposed name}", "plugpass_id": "{from frontmatter, omit if absent}", "suggested_pitch": "{drafted pitch, omit if none}" },
     { "type": "mcp_dependency",
       "name": "{server-key}",
       "domain": "{hostname; omit for a local server}",
@@ -363,7 +380,8 @@ Call the `plugpass_sync_plugin` tool (under any connector prefix) with the full 
     },
     { "type": "entitlement",
       "name": "{derived snake_case identifier}",
-      "title": "{publisher-chosen sentence-case plural display label}",
+      "title": "{the record name the publisher chose}",
+      "singular": "{derived singular, on first confirmation only}",
       "plugpass_id": "{from the pre-check if pre-confirmed, omit on first confirmation}"
     },
     { "type": "tool",
@@ -372,9 +390,11 @@ Call the `plugpass_sync_plugin` tool (under any connector prefix) with the full 
       "visibility": "{model | app | both, from the registration}",
       "ui_backed": "{true | false, from the registration}",
       "plugpass_id": "{from _meta or the pre-check map, omit if absent}",
+      "title": "{proposed name, omit for a paired tool}",
       "entitlement_name": "{matching entitlement entry's name, omit for solo}",
       "operation": "{add | remove, omit for solo}",
-      "suggested_pitch": "{drafted pitch, omit if none}"
+      "suggested_pitch": "{drafted pitch, omit if none}",
+      "quantities": [{ "key": "{snake_case}", "source": "{input | output}", "singular": "{lead}", "plural": "{leads}", "default": true }]
     }
   ],
   "publisher_plugin_version": "{PUBLISHER_PLUGIN_VERSION}"
@@ -389,6 +409,7 @@ Capture from the successful response:
 - `components` — array of `{ type, plugpass_id, ...type-specific fields }` for every component the server now knows about.
 - `continuation_url` — points at the dashboard page the server chose as this sync's follow-up surface: the plugin settings (confirmation) page normally, the plans page when an already-published plugin gained new components (which need assigning to plans there), or the page that fixes an outstanding connector-setup gap.
 - `continuation_message` — optional. Present when the plugin's connector state needs the publisher's attention (e.g. connector setup to complete, which the message lists as errors to fix, or the connector switching back to the Plugpass-hosted one). Relay it VERBATIM in Step 10 — never paraphrase or omit it.
+- `changes` — what the sync changed for plans, each naming a feature and the plans affected: `quantity_dropped` (`feature`, `quantity`, `plans`) and `pair_broken` (`feature`, `plans`). Step 10 reports each.
 
 ## Step 7: Write plugpass-plugin-id back to every manifest
 
@@ -417,6 +438,11 @@ Tell the publisher what happened, by mode:
 
 - **REGISTER mode:** "The {plugin-name} plugin was successfully registered with Plugpass. Continue setup in the Plugpass dashboard in your browser."
 - **SYNC mode:** "The {plugin-name} plugin was successfully updated in Plugpass. Continue in the Plugpass dashboard to confirm the changes, assign any new features to plans, & publish the plugin updates."
+
+Then, for each entry in the response's `changes`, one line, `{plans}` listing the plan names as "a & b" or "a, b, & c", and `{Feature}` being `{feature}` with its first letter capitalized unless its first word already has a capital:
+
+- `quantity_dropped`: "The {feature} tool is no longer limited by {quantity}. Its limits on the {plans} {plan | plans} now count uses." For an empty `plans`: "The {feature} tool is no longer limited by {quantity}. Its credit cost is now per use."
+- `pair_broken`: "{Feature} are no longer limited on the {plans} {plan | plans}, since their add & remove tools are no longer paired. The add tool is free until you price it again."
 
 If `{new-local-servers}` is non-empty, follow that with this as its own paragraph — for exactly one server:
 

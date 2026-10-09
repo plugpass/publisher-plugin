@@ -300,7 +300,15 @@ export interface ReauthSignal { triggered: boolean }
 // ---------------------------------------------------------------------------
 
 export type EntitlementResult =
-  | { status: 'ok'; remaining: number | null }
+  // `settle` says what follows the body; `output`, the output quantity the
+  // call is counted in and the most it may deliver (null: unbounded), which
+  // the wrapper caps the tool's size argument at.
+  | {
+      status: 'ok';
+      remaining: number | null;
+      settle: 'none' | 'on_failure' | 'always';
+      output: { key: string; max: number | null } | null;
+    }
   // result_text is the complete server-composed check result — emitted
   // VERBATIM as the tool's text (never parsed or re-serialized).
   | { status: 'non_authorized'; result_text: string }
@@ -337,7 +345,16 @@ export async function entitlementPost(url: string, bearer: string, body: unknown
 // to `unavailable`, which grants.
 export async function entitlement(
   bearer: string,
-  body: { plugin_id: string; feature_id: string; current_count?: number },
+  body: {
+    plugin_id: string;
+    feature_id: string;
+    // A solo paid tool's entry: the call's id and its quantities.
+    call_id?: string;
+    quantities?: Record<string, number>;
+    // A database-record add: the user's current count and how many it adds.
+    current_count?: number;
+    adding?: number;
+  },
   op: 'check_remaining' | 'track_usage',
   cfg: PlugpassConfig,
 ): Promise<EntitlementResult> {
@@ -349,6 +366,69 @@ export async function entitlement(
   } catch {
     return { status: 'unavailable' };
   }
+}
+
+// The settle closing a solo paid tool's call: what a failed call's entry took
+// is given back; a success reports its output count and is told how many items
+// to deliver, with a note when the result was cut short. Every failure maps to
+// `unavailable`, which delivers everything.
+export type SettleResult =
+  | { status: 'ok'; deliver: number | null; note: string | null; partial: string | null }
+  | { status: 'non_authorized'; result_text: string }
+  | { status: 'unavailable' };
+
+export async function settle(
+  bearer: string,
+  body: {
+    plugin_id: string;
+    feature_id: string;
+    call_id: string;
+    outcome: 'success' | 'failure';
+    quantities?: Record<string, number>;
+  },
+  cfg: PlugpassConfig,
+): Promise<SettleResult> {
+  try {
+    const res = await entitlementPost(`${cfg.entitlementApiOrigin}/entitlement/settle`, bearer, body);
+    if (!res.ok) return { status: 'unavailable' };
+    const data = (await res.json()) as SettleResult | { status: 'reauth_required' };
+    return data.status === 'reauth_required' ? { status: 'unavailable' } : data;
+  } catch {
+    return { status: 'unavailable' };
+  }
+}
+
+// A success settle applied to the tool's result: trimmed to `deliver` items in
+// every representation (`trim` is the tool's own — its text and its
+// structured content alike), the note added as a text block of its own and
+// under the structured content's `limit_note` (a host may give the model the
+// structured content alone), and the note in the composed check result's shape
+// on `_meta.plugpass_partial`, beside the call echo, for the in-widget paywall.
+export function deliverSettled(
+  result: CallToolResult,
+  settled: Extract<SettleResult, { status: 'ok' }>,
+  trim: (deliver: number) => CallToolResult,
+  call: DeniedCall,
+  toolMeta: ToolMeta,
+): CallToolResult {
+  const delivered = settled.deliver === null ? result : trim(settled.deliver);
+  if (settled.note === null) return delivered;
+  return {
+    ...delivered,
+    content: [...delivered.content, { type: 'text', text: settled.note }],
+    ...(delivered.structuredContent === undefined
+      ? {}
+      : { structuredContent: { ...delivered.structuredContent, limit_note: settled.note } }),
+    _meta: {
+      ...delivered._meta,
+      ...(settled.partial === null
+        ? {}
+        : {
+            plugpass_partial: settled.partial,
+            plugpass_denied_call: { ...call, widget_callable: widgetCallable(toolMeta) },
+          }),
+    },
+  };
 }
 
 // non_authorized → result_text verbatim — a single-field pipe (the trigger keys
@@ -655,7 +735,7 @@ export function registerCheckPremiumAccess(server: McpServer, cfg: PlugpassConfi
 }
 ```
 
-**Solo paid tool wrapper** (consume-on-invocation; identity + bearer from `extra.authInfo` — there is no `auth_token` parameter on this path):
+**Solo paid tool wrapper** (entry, body, settle; identity + bearer from `extra.authInfo` — there is no `auth_token` parameter on this path). The example tool returns a list of leads, limited by `limit`, and is recorded with one output quantity, `leads`; report every recorded quantity this way (TOOLS.md → Reading a tool's quantities):
 
 ```ts
 // The registration's `_meta`, hoisted so the marker rule reads the same object
@@ -663,9 +743,10 @@ export function registerCheckPremiumAccess(server: McpServer, cfg: PlugpassConfi
 // visibility }` here beside the id.
 const PAID_TOOL_FEATURE_ID = '<plugpass_id>';
 const PAID_TOOL_META: ToolMeta = { plugpass_component_id: PAID_TOOL_FEATURE_ID };
+const DEFAULT_LIMIT = 25; // the tool's own default for its size argument
 
 server.registerTool(
-  'paid_tool',
+  'find_leads',
   {
     /* …existing config… */
     /* a wrapped tool declares no outputSchema — paywall/reauth replies are text */
@@ -677,32 +758,74 @@ server.registerTool(
   async (args, ctx) => {
     const bearer = bearerFrom(ctx.http?.authInfo);
     const sub = subFrom(ctx.http?.authInfo);
+    // The tool's own body, given the size argument to use.
+    const run = async (limit: number): Promise<{ leads: Lead[] }> => {
+      /* …existing tool body — keyed / scoped to `sub` (empty with no bearer)… */
+    };
+    // Every representation of the result, from its items.
+    const render = (leads: Lead[]): CallToolResult => ({
+      content: [{ type: 'text', text: JSON.stringify(leads) }],
+      structuredContent: { leads },
+    });
+    const requested = args.limit ?? DEFAULT_LIMIT;
     // No bearer is the /mcp gate off (the plugin unpublished): the tool runs as
-    // it did before Plugpass, with no entitlement call. With one, consume.
-    if (bearer !== undefined) {
-      const r = await entitlement(bearer, { plugin_id: cfg.pluginId, feature_id: PAID_TOOL_FEATURE_ID }, 'track_usage', cfg);
-      if (r.status === 'reauth_required') { reauth.triggered = true; return { content: [{ type: 'text', text: 'Re-authentication required.' }] }; }
-      // The denial names this call (the tool's name and its actual arguments); the
-      // renderer reads the tool's own registered `_meta` (its widget, who may call
-      // it) and the request's envelope: never a baked per-tool constant.
-      if (r.status === 'non_authorized') {
-        return nonAuthorizedToolResponse(
-          r,
-          { name: 'paid_tool', arguments: args },
-          PAID_TOOL_META,
-          ctx.mcpReq.envelope,
-          cfg,
-          PAID_TOOL_FEATURE_ID,
-        );
-      }
-      // `ok` runs the body; `unavailable` consumed nothing and grants.
+    // it did before Plugpass, with no entitlement call.
+    if (bearer === undefined) return render((await run(requested)).leads);
+
+    const call = { name: 'find_leads', arguments: args };
+    const callId = crypto.randomUUID();
+    const r = await entitlement(
+      bearer,
+      {
+        plugin_id: cfg.pluginId,
+        feature_id: PAID_TOOL_FEATURE_ID,
+        call_id: callId,
+        // Each recorded quantity: an input's count, an output's requested size.
+        quantities: { leads: requested },
+      },
+      'track_usage',
+      cfg,
+    );
+    if (r.status === 'reauth_required') { reauth.triggered = true; return { content: [{ type: 'text', text: 'Re-authentication required.' }] }; }
+    // The denial names this call (the tool's name and its actual arguments); the
+    // renderer reads the tool's own registered `_meta` (its widget, who may call
+    // it) and the request's envelope: never a baked per-tool constant.
+    if (r.status === 'non_authorized') {
+      return nonAuthorizedToolResponse(r, call, PAID_TOOL_META, ctx.mcpReq.envelope, cfg, PAID_TOOL_FEATURE_ID);
     }
-    /* …existing tool body — keyed / scoped to `sub` (empty with no bearer)… */
+    // `unavailable` consumed nothing and grants: nothing to settle.
+    const settleMode = r.status === 'ok' ? r.settle : 'none';
+    const max = r.status === 'ok' ? (r.output?.max ?? null) : null;
+    const ids = { plugin_id: cfg.pluginId, feature_id: PAID_TOOL_FEATURE_ID, call_id: callId };
+
+    let leads: Lead[];
+    try {
+      leads = (await run(max === null ? requested : Math.min(requested, max))).leads;
+    } catch (err) {
+      // A failed call gets back what its entry took.
+      if (settleMode !== 'none') await settle(bearer, { ...ids, outcome: 'failure' }, cfg);
+      throw err;
+    }
+    const result = render(leads);
+    if (settleMode !== 'always') return result;
+    const settled = await settle(
+      bearer,
+      { ...ids, outcome: 'success', quantities: { leads: leads.length } },
+      cfg,
+    );
+    if (settled.status === 'non_authorized') {
+      return nonAuthorizedToolResponse(settled, call, PAID_TOOL_META, ctx.mcpReq.envelope, cfg, PAID_TOOL_FEATURE_ID);
+    }
+    // The unavailable grant delivers everything, with no note.
+    if (settled.status !== 'ok') return result;
+    return deliverSettled(result, settled, (deliver) => render(leads.slice(0, deliver)), call, PAID_TOOL_META);
   },
 );
 ```
 
-**Paired-tool add side** (`operation: add`): same shape, and `feature_id: '<the tool's own plugpass_id>'` exactly as for a solo tool (its `tool_` prefix carries the feature type) — every gated artifact bakes its own component's id, and the `entitlement` subfield is identity, never a `feature_id`. Always **`check_remaining`**, passing the user's current count from the publisher's own store (scoped to `sub`) as `current_count` — see TOOLS.md → Reading the user's current count.
+A tool that reports an error result rather than throwing settles the same failure before returning it. A tool with no output quantity settles only on a failure (`on_failure`) and returns its result as it is; an input quantity is counted from the arguments (`quantities: { enrichments: args.leads.length }`). An output quantity of a tool with no size argument is reported only at the settle, its body uncapped.
+
+**Paired-tool add side** (`operation: add`): same shape as the entry, and `feature_id: '<the tool's own plugpass_id>'` exactly as for a solo tool (its `tool_` prefix carries the feature type) — every gated artifact bakes its own component's id, and the `entitlement` subfield is identity, never a `feature_id`. Always **`check_remaining`**, passing the user's current count from the publisher's own store (scoped to `sub`) as `current_count` — see TOOLS.md → Reading the user's current count — and `adding`, how many records the call adds (`1`, or the list's length for a batch). No call id and no settle: a record add never consumes.
 
 **Identity tool** (the paired remove side, or any per-user free tool): no Entitlement API call at all — read `subFrom(ctx.http?.authInfo)` and scope the body to it; with no identity (the /mcp gate off), answer that nobody is signed in and touch no record. Zero Plugpass round-trips.
 

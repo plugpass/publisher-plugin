@@ -15,6 +15,8 @@ import asyncio
 import json
 import re
 import time
+import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 from urllib.parse import urlsplit
@@ -266,7 +268,11 @@ def identity(ctx: Context) -> AccessToken | None:
 # Entitlement API client (paid tools + the check proxy).
 # ---------------------------------------------------------------------------
 
-# Result: {"status": "ok", "remaining": int|None}
+# Body: {"plugin_id", "feature_id"} plus a solo paid tool's "call_id" and
+# "quantities", or a database-record add's "current_count" and "adding".
+# Result: {"status": "ok", "remaining": int|None,
+#          "settle": "none"|"on_failure"|"always",   ← what follows the body
+#          "output": {"key": str, "max": int|None}|None}   ← cap the size argument at max
 #       | {"status": "reauth_required"}
 #       | {"status": "non_authorized", "result_text": str}
 #       | {"status": "unavailable"}   ← Plugpass could not answer; the caller GRANTS
@@ -303,6 +309,47 @@ async def entitlement(bearer: str, body: dict, op: str, cfg: PlugpassConfig) -> 
         except Exception:
             return {"status": "unavailable"}
     return {"status": "unavailable"}
+
+
+async def settle(bearer: str, body: dict, cfg: PlugpassConfig) -> dict:
+    """The settle closing a solo paid tool's call — body {"plugin_id",
+    "feature_id", "call_id", "outcome": "success"|"failure", "quantities"?}: what
+    a failed call's entry took is given back; a success reports its output count
+    and is answered {"status": "ok", "deliver": int|None, "note": str|None,
+    "partial": str|None}, or a denial when nothing could be delivered. The
+    entry's timeout and retry; every other outcome (reauth included) is
+    "unavailable", which delivers everything."""
+    result = await entitlement(bearer, body, "settle", cfg)
+    return {"status": "unavailable"} if result["status"] == "reauth_required" else result
+
+
+def deliver_settled(
+    result: types.CallToolResult,
+    settled: dict,
+    trim: Callable[[int], types.CallToolResult],
+    call: dict[str, Any],
+    tool_meta: dict[str, Any],
+) -> types.CallToolResult:
+    """A success settle applied to the tool's result: trimmed to `deliver` items
+    in every representation (`trim` is the tool's own — its text and its
+    structured content alike), the note added as a text block of its own and
+    under the structured content's `limit_note` (a host may give the model the
+    structured content alone), and the note in the composed check result's
+    shape on `_meta.plugpass_partial`, beside the call echo, for the in-widget
+    paywall."""
+    delivered = result if settled["deliver"] is None else trim(settled["deliver"])
+    if settled["note"] is None:
+        return delivered
+    meta = dict(delivered.meta or {})
+    if settled["partial"] is not None:
+        meta["plugpass_partial"] = settled["partial"]
+        meta["plugpass_denied_call"] = {**call, "widget_callable": widget_callable(tool_meta)}
+    structured = delivered.structured_content
+    return types.CallToolResult(
+        content=[*delivered.content, types.TextContent(type="text", text=settled["note"])],
+        structuredContent=None if structured is None else {**structured, "limit_note": settled["note"]},
+        _meta=meta,
+    )
 
 
 def non_authorized_text(result: dict) -> str:
@@ -646,7 +693,7 @@ async def check_premium_access(
     return result["result_text"]  # verbatim — byte-identical to the native tool
 ```
 
-**Solo paid tool wrapper** (consume-on-invocation; no `auth_token` parameter on this path):
+**Solo paid tool wrapper** (entry, body, settle; no `auth_token` parameter on this path). The example tool returns a list of leads, limited by `limit`, and is recorded with one output quantity, `leads`; report every recorded quantity this way (TOOLS.md → Reading a tool's quantities):
 
 ```python
 # The registration's meta, hoisted so the marker rule reads the same object the
@@ -654,42 +701,88 @@ async def check_premium_access(
 # "visibility": …} here beside the id.
 PAID_TOOL_FEATURE_ID = "<plugpass_id>"
 PAID_TOOL_META: dict[str, Any] = {"plugpass_component_id": PAID_TOOL_FEATURE_ID}
+DEFAULT_LIMIT = 25  # the tool's own default for its size argument
 
-@mcp.tool(name="paid_tool", description="...", structured_output=False,
+@mcp.tool(name="find_leads", description="...", structured_output=False,
           # Metering makes this tool neither read-only nor idempotent, whatever it
           # was before the wrap. The other two hints keep the tool's own values.
           annotations=types.ToolAnnotations(
               readOnlyHint=False, destructiveHint=<the tool's own value>,
               idempotentHint=False, openWorldHint=<the tool's own value>),
           meta=PAID_TOOL_META)
-async def paid_tool(..., ctx: Context) -> str:
+async def find_leads(query: str, ctx: Context, limit: int | None = None) -> types.CallToolResult:
     request = ctx.request_context.request
     access = identity(ctx)
     sub = access.subject if access is not None else ""
-    # No identity is the /mcp gate off (the plugin unpublished): the tool runs as
-    # it did before Plugpass, with no entitlement call. With one, consume.
-    if access is not None:
-        result = await entitlement(
-            access.token,
-            {"plugin_id": cfg.plugin_id, "feature_id": PAID_TOOL_FEATURE_ID},
-            "track_usage", cfg,
+
+    async def run(size: int) -> list[Lead]:
+        ...  # existing tool body — keyed / scoped to `sub` (empty with no identity)
+
+    def render(leads: list[Lead]) -> types.CallToolResult:
+        # Every representation of the result, from its items.
+        items = [lead.model_dump() for lead in leads]
+        return types.CallToolResult(
+            content=[types.TextContent(type="text", text=json.dumps(items))],
+            structuredContent={"leads": items},
         )
-        if result["status"] == "reauth_required":
-            request.state.plugpass_reauth_required = True
-            return "Re-authentication required."
-        # The denial names this call (the tool's name and its actual arguments); the
-        # renderer reads the tool's own registered meta (its widget, who may call it)
-        # and the request: never a baked per-tool constant.
-        if result["status"] == "non_authorized":
-            return non_authorized_tool_response(
-                result, {"name": "paid_tool", "arguments": {...the call's arguments...}},
-                PAID_TOOL_META, ctx, cfg, PAID_TOOL_FEATURE_ID,
-            )
-        # "ok" runs the body; "unavailable" consumed nothing and grants.
-    # ...existing tool body — keyed / scoped to `sub` (empty with no identity)...
+
+    requested = limit if limit is not None else DEFAULT_LIMIT
+    # No identity is the /mcp gate off (the plugin unpublished): the tool runs as
+    # it did before Plugpass, with no entitlement call.
+    if access is None:
+        return render(await run(requested))
+
+    call = {"name": "find_leads", "arguments": {"query": query, "limit": limit}}
+    call_id = str(uuid.uuid4())
+    result = await entitlement(
+        access.token,
+        {
+            "plugin_id": cfg.plugin_id,
+            "feature_id": PAID_TOOL_FEATURE_ID,
+            "call_id": call_id,
+            # Each recorded quantity: an input's count, an output's requested size.
+            "quantities": {"leads": requested},
+        },
+        "track_usage", cfg,
+    )
+    if result["status"] == "reauth_required":
+        request.state.plugpass_reauth_required = True
+        return types.CallToolResult(content=[types.TextContent(type="text", text="Re-authentication required.")])
+    # The denial names this call (the tool's name and its actual arguments); the
+    # renderer reads the tool's own registered meta (its widget, who may call it)
+    # and the request: never a baked per-tool constant.
+    if result["status"] == "non_authorized":
+        return non_authorized_tool_response(result, call, PAID_TOOL_META, ctx, cfg, PAID_TOOL_FEATURE_ID)
+    # "unavailable" consumed nothing and grants: nothing to settle.
+    settle_mode = result["settle"] if result["status"] == "ok" else "none"
+    output = result.get("output") if result["status"] == "ok" else None
+    cap = output["max"] if output is not None else None
+    ids = {"plugin_id": cfg.plugin_id, "feature_id": PAID_TOOL_FEATURE_ID, "call_id": call_id}
+
+    try:
+        leads = await run(requested if cap is None else min(requested, cap))
+    except Exception:
+        # A failed call gets back what its entry took.
+        if settle_mode != "none":
+            await settle(access.token, {**ids, "outcome": "failure"}, cfg)
+        raise
+    full = render(leads)
+    if settle_mode != "always":
+        return full
+    settled = await settle(
+        access.token, {**ids, "outcome": "success", "quantities": {"leads": len(leads)}}, cfg
+    )
+    if settled["status"] == "non_authorized":
+        return non_authorized_tool_response(settled, call, PAID_TOOL_META, ctx, cfg, PAID_TOOL_FEATURE_ID)
+    # The unavailable grant delivers everything, with no note.
+    if settled["status"] != "ok":
+        return full
+    return deliver_settled(full, settled, lambda deliver: render(leads[:deliver]), call, PAID_TOOL_META)
 ```
 
-**Paired-tool add side** (`operation: add`): same shape, and `feature_id: "<the tool's own plugpass_id>"` exactly as for a solo tool (its `tool_` prefix carries the feature type) — every gated artifact bakes its own component's id, and the `entitlement` subfield is identity, never a `feature_id`. Always **`check_remaining`**, passing the user's current count from the publisher's own store (scoped to `sub`) as `current_count` — see TOOLS.md → Reading the user's current count.
+A tool that returns an error result (`is_error`) rather than raising settles the same failure before returning it. A tool with no output quantity settles only on a failure (`on_failure`) and returns its result as it is; an input quantity is counted from the arguments (`"quantities": {"enrichments": len(leads)}`). An output quantity of a tool with no size argument is reported only at the settle, its body uncapped.
+
+**Paired-tool add side** (`operation: add`): same shape as the entry, and `feature_id: "<the tool's own plugpass_id>"` exactly as for a solo tool (its `tool_` prefix carries the feature type) — every gated artifact bakes its own component's id, and the `entitlement` subfield is identity, never a `feature_id`. Always **`check_remaining`**, passing the user's current count from the publisher's own store (scoped to `sub`) as `current_count` — see TOOLS.md → Reading the user's current count — and `adding`, how many records the call adds (`1`, or the list's length for a batch). No call id and no settle: a record add never consumes.
 
 **Identity tool** (the paired remove side, or any per-user free tool): no Entitlement API call — read `identity(ctx)` and scope the body to its `subject`; with none (the /mcp gate off), answer that nobody is signed in and touch no record:
 

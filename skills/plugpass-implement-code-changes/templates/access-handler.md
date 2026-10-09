@@ -24,7 +24,7 @@ Any variables defined by tool presence should be assessed purely from its presen
   - CLAUDE_PRODUCT = If your system instructions indicate your environment is Claude Code, then `code`; otherwise `claude`.
   - If CLAUDE_PRODUCT=`code`:
     - OS = If your system instructions indicate the platform is `darwin`, then `mac`; if `linux`, then `linux`; if `win32`, then `windows`.
-    - CODE_CLIENT = If (OS=`mac` || OS=`linux`), then Bash `echo "CLAUDE_CODE_ENTRYPOINT=$CLAUDE_CODE_ENTRYPOINT"`; if OS=`windows`, then PowerShell `Write-Output "CLAUDE_CODE_ENTRYPOINT=$env:CLAUDE_CODE_ENTRYPOINT"` (expected value: `cli` || `claude-desktop` || `remote`)
+    - CODE_CLIENT = If (OS=`mac` || OS=`linux`), then Bash `echo "CLAUDE_CODE_ENTRYPOINT=$CLAUDE_CODE_ENTRYPOINT"`; if OS=`windows`, then PowerShell `Write-Output "CLAUDE_CODE_ENTRYPOINT=$env:CLAUDE_CODE_ENTRYPOINT"` (the printed value is `cli` ? `cli` : `claude-desktop` ? `claude-desktop` : `remote`)
 - If PLATFORM=`openai`:
   - OPENAI_CLIENT = If your system instructions say you are Codex running inside the Codex desktop app, then `desktop`; if they identify you as Codex but don't say you are in the desktop app, then `codex-cli`; otherwise `chatgpt`.
 - OPEN_URL_TOOL = A tool that opens a URL in a browser for the user: a dedicated one (e.g. `open_in_codex`) if present, else a shell command (e.g. Bash `open "<url>"`, Bash `xdg-open "<url>"`, PowerShell `Start-Process "<url>"`). Never a web search, page fetch, remote browser, or other context where the user can't access the URL's page.
