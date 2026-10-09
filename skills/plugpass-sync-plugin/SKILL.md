@@ -26,7 +26,7 @@ The Plugpass Publisher MCP server (this plugin's `.mcp.json` `plugpass-publisher
 
 **Presenting copy.** A `>` block is finished copy; the `>` characters delimit it here and are never part of it. Reproduce the text exactly — substituting each `{VARIABLE}` with its value — and never print the `>` characters, restyle the wording, or wrap it in a quote block. The surrounding step says where the copy goes: where it says to tell the publisher something, post it as your own message with nothing of your own before or after it, by whatever messaging method will be visible to them (especially if a tool call will follow it in the same turn). Copy given inline in double quotes is delivered the same way, without the quote marks.
 
-- PUBLISHER_PLUGIN_VERSION = `0.0.23` (stamped by the release pipeline). Include it as `publisher_plugin_version` on every Publisher MCP tool call in this skill.
+- PUBLISHER_PLUGIN_VERSION = `0.0.24` (stamped by the release pipeline). Include it as `publisher_plugin_version` on every Publisher MCP tool call in this skill.
 - USER_INPUT_TOOL = A tool that presents the user a question with selectable options and returns their choice (e.g. `AskUserQuestion`, `ask_user_input_v0`, etc.) that can be used in the default session state (not limited to a certain mode, e.g. plan mode). Where a prompt below calls for USER_INPUT_TOOL and no such tool is available, ask the question in chat and wait for the reply.
 - PLATFORM = If your system instructions indicate an OpenAI product (Codex or ChatGPT), then `openai`; otherwise (an Anthropic / Claude product) `claude`.
 - OS = If your system instructions indicate the platform is `darwin`, then `mac`; if `linux`, then `linux`; if `win32`, then `windows`.
@@ -409,7 +409,7 @@ Capture from the successful response:
 - `components` — array of `{ type, plugpass_id, ...type-specific fields }` for every component the server now knows about.
 - `continuation_url` — points at the dashboard page the server chose as this sync's follow-up surface: the plugin settings (confirmation) page normally, the plans page when an already-published plugin gained new components (which need assigning to plans there), or the page that fixes an outstanding connector-setup gap.
 - `continuation_message` — optional. Present when the plugin's connector state needs the publisher's attention (e.g. connector setup to complete, which the message lists as errors to fix, or the connector switching back to the Plugpass-hosted one). Relay it VERBATIM in Step 10 — never paraphrase or omit it.
-- `changes` — what the sync changed for plans, each naming a feature and the plans affected: `quantity_dropped` (`feature`, `quantity`, `plans`) and `pair_broken` (`feature`, `plans`). Step 10 reports each.
+- `changes` — what the sync changed for plans, each naming a feature and the plans affected: `quantity_dropped` (`feature`, `quantity`, `credit_billed`, `plans`) and `pair_broken` (`feature`, `plans`). Step 10 reports each.
 
 ## Step 7: Write plugpass-plugin-id back to every manifest
 
@@ -441,7 +441,7 @@ Tell the publisher what happened, by mode:
 
 Then, for each entry in the response's `changes`, one line, `{plans}` listing the plan names as "a & b" or "a, b, & c", and `{Feature}` being `{feature}` with its first letter capitalized unless its first word already has a capital:
 
-- `quantity_dropped`: "The {feature} tool is no longer limited by {quantity}. Its limits on the {plans} {plan | plans} now count uses." For an empty `plans`: "The {feature} tool is no longer limited by {quantity}. Its credit cost is now per use."
+- `quantity_dropped`: "The {feature} tool is no longer limited by {quantity}. Its limits on the {plans} {plan | plans} now count uses." When `credit_billed` is true: "The {feature} tool is no longer limited by {quantity}. Its credit cost is now per use."
 - `pair_broken`: "{Feature} are no longer limited on the {plans} {plan | plans}, since their add & remove tools are no longer paired. The add tool is free until you price it again."
 
 If `{new-local-servers}` is non-empty, follow that with this as its own paragraph — for exactly one server:

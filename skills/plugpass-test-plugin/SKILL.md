@@ -21,7 +21,7 @@ The Plugpass Publisher MCP server (this plugin's `.mcp.json` `plugpass-publisher
 
 **Presenting copy.** A `>` block is finished copy; the `>` characters delimit it here and are never part of it. Reproduce the text exactly — substituting each `{VARIABLE}` with its value — and never print the `>` characters, restyle the wording, or wrap it in a quote block. Where a step says to tell the publisher something, post it as your own message with nothing of your own before or after it. Copy given inline in double quotes is delivered the same way, without the quote marks.
 
-- PUBLISHER_PLUGIN_VERSION = `0.0.23` (stamped by the release pipeline). Include it as `publisher_plugin_version` on every Publisher MCP tool call in this skill.
+- PUBLISHER_PLUGIN_VERSION = `0.0.24` (stamped by the release pipeline). Include it as `publisher_plugin_version` on every Publisher MCP tool call in this skill.
 - USER_INPUT_TOOL = A tool that presents the user a question with selectable options and returns their choice (e.g. `AskUserQuestion`, `ask_user_input_v0`, etc.) that can be used in the default session state. Where a prompt below calls for USER_INPUT_TOOL and no such tool is available, ask the question in chat and wait for the reply.
 - OS = If your system instructions indicate the platform is `darwin`, then `mac`; if `linux`, then `linux`; if `win32`, then `windows`.
 - OPEN_URL_TOOL = A tool that opens a URL in a browser for the user: a dedicated one (e.g. `open_in_codex`) if present, else a shell command (e.g. Bash `open "<url>"`, Bash `xdg-open "<url>"`, PowerShell `Start-Process "<url>"`). Never a web search or page fetch.
@@ -32,7 +32,7 @@ The Plugpass Publisher MCP server (this plugin's `.mcp.json` `plugpass-publisher
 
 Read `.claude-plugin/plugin.json` (else `.codex-plugin/plugin.json`). `{manifest name}` is its `name`; `{plugin-plugpass-id}` is `metadata.plugpass-plugin-id`. If the id is absent or empty, tell the user "This plugin isn't registered with Plugpass yet. Run the `plugpass-sync-plugin` skill first." and end the skill.
 
-Call `plugpass_get_plugin_data` with `plugin_id: {plugin-plugpass-id}`; keep its `plugin_slug` as `{plugin slug}`, its `plugin_display_name` as `{plugin display name}`, its `plugin_origin` as `{plugin origin}`, its `supported_products` as `{products}`, its `owned_servers` as `{owned servers}` (the publisher's own MCP servers, each with its `.mcp.json` key `server_name` and its `url`), its `connector` as `{connector}` (the plugin's connector, with its `.mcp.json` key `server_key` and its `url`), and its `chatgpt_install_url` as `{listing url}` (the plugin's ChatGPT Plugin Directory listing, or null). When the user is done testing, skip to Switching back.
+Call `plugpass_get_plugin_data` with `plugin_id: {plugin-plugpass-id}`; keep its `plugin_display_name` as `{plugin display name}`, its `plugin_origin` as `{plugin origin}`, its `dashboard_publish_url` as `{publish url}`, its `supported_products` as `{products}`, its `owned_servers` as `{owned servers}` (the publisher's own MCP servers, each with its `.mcp.json` key `server_name` and its `url`), its `connector` as `{connector}` (the plugin's connector, with its `.mcp.json` key `server_key` and its `url`), and its `chatgpt_install_url` as `{listing url}` (the plugin's ChatGPT Plugin Directory listing, or null). When the user is done testing, skip to Switching back.
 
 Call `plugpass_list_test_users` with `plugin_id: {plugin-plugpass-id}` and keep the response as `{test users}`. If `versions.draft` is present and its `outstanding` has an entry whose `code` starts with `impl_`, tell the user "This plugin's premium features aren't implemented yet. Run the `plugpass-implement-code-changes` skill first." and end the skill. If `any_version_ready` is false, tell the user "No version of this plugin is ready to test yet. Finish the plugin's setup in the Plugpass dashboard first." and end the skill. `{version}` is `draft` when `versions.draft` is present and `ready`, else `production`; `versions.{version}.plans` are the plans step 3 offers, and `users` the existing test users.
 
@@ -161,7 +161,7 @@ If `{test users}` has `has_unpublished_changes` true, add:
 
 > When you're done testing, publish your changes in Plugpass to make them live.
 >
-> [Publish plugin](https://plugpass.ai/dashboard/plugin/{plugin slug}/publish)
+> [Publish plugin]({publish url})
 
 ## Switching back
 

@@ -26,7 +26,7 @@ Unlike `plugpass-sync-plugin`, this skill has **no mode-check** — by the time 
 
 **Presenting copy.** A `>` block is finished copy; the `>` characters delimit it here and are never part of it. Reproduce the text exactly — substituting each `{VARIABLE}` with its value — and never print the `>` characters, restyle the wording, or wrap it in a quote block. The surrounding step says where the copy goes: where it says to tell the publisher something, post it as your own message with nothing of your own before or after it, by whatever messaging method will be visible to them (especially if a tool call will follow it in the same turn). Copy given inline in double quotes is delivered the same way, without the quote marks.
 
-- PUBLISHER_PLUGIN_VERSION = `0.0.23` (stamped by the release pipeline). Include it as `publisher_plugin_version` on every Publisher MCP tool call in this skill.
+- PUBLISHER_PLUGIN_VERSION = `0.0.24` (stamped by the release pipeline). Include it as `publisher_plugin_version` on every Publisher MCP tool call in this skill.
 - USER_INPUT_TOOL = A tool that presents the user a question with selectable options and returns their choice (e.g. `AskUserQuestion`, `ask_user_input_v0`, etc.) that can be used in the default session state (not limited to a certain mode, e.g. plan mode). Where a prompt below calls for USER_INPUT_TOOL and no such tool is available, ask the question in chat and wait for the reply.
 - PLATFORM = If your system instructions indicate an OpenAI product (Codex or ChatGPT), then `openai`; otherwise (an Anthropic / Claude product) `claude`.
 - SKILL_PREFIX = If PLATFORM=`openai`, then `$`; otherwise `/`. (How the publisher types a skill invocation in their client — every typed command below renders through it.)
@@ -70,6 +70,7 @@ Capture from the response:
 - `plugin_display_name` — the plugin's dashboard-authoritative display name, baked as `{PluginDisplayName}` into the access-handler skill and each paid body's block (the core wiring and body prepend). Always from here, never the manifest — the manifest's `displayName` is optional and can be stale once the publisher edits it on the dashboard.
 - `license` — `{ mode, eula }` (EULA-adoption state), consumed by the core wiring and the block's recital. When `mode` is `platform_license`, `eula` carries the rendered `LICENSE.md` + manifest value to write; otherwise the publisher's license is left untouched.
 - `last_published_plugin_version` — the plugin.json version stamped at the most recent publish (null when never published); the core wiring's version-bump anchor.
+- `dashboard_publish_url`, `dashboard_install_url` — the plugin's Publish and Install pages in the Plugpass dashboard.
 - `homepage_url`, `privacy_policy_url`, `terms_url`, `support_url`, `publisher_display_name`, `plugin_description`, `icon_url`, `listing_brand_color`, `former_plugin_origins` — the Codex listing instructions' inputs.
 
 `{codex-listing}` is true when `required_manifests` has an entry whose `path` is `.codex-plugin/plugin.json`. `{listing-fill}` is true when `{codex-listing}` is true and the Codex manifest exists with a listing field the Codex listing instructions fill still empty, or this run creates the manifest.
@@ -176,7 +177,7 @@ Run this **only when the implementation is fully complete** — every targeted c
 
 If anything is incomplete (a component with no local file, any component you couldn't bring to its end state, or a `{missing-manifests}` entry still missing), do **not** post the message below. Surface what's blocking and work through it with the publisher until every component is implemented; this handoff fires only once a run reaches full completion (possibly a later re-run, after they've resolved the blocker).
 
-- PUBLISH_URL = `https://plugpass.ai/dashboard/plugin/{plugin_slug}/publish`
+- PUBLISH_URL = `dashboard_publish_url` from Step 2.
 - MCP_TOOL_CHANGES = The server set (Step 3) is non-empty.
 
 Once everything is implemented, give the publisher this closing message verbatim, including the third paragraph only when MCP_TOOL_CHANGES (don't add a deploy checklist — the publish page owns it):
@@ -203,7 +204,7 @@ Tell the publisher, interpolating that entry's fields:
 
 > This plugin supports the {products_label}, and they need a {manifest_label} (`{path}`) that this repo doesn't have.
 >
-> Two ways forward: create the manifest, or deselect the {products_label} on the plugin's Install page (https://plugpass.ai/dashboard/plugin/{plugin_slug}/install).
+> Two ways forward: create the manifest, or deselect the {products_label} on the plugin's Install page ({dashboard_install_url}).
 
 Then ask with USER_INPUT_TOOL "Want help creating it?", offering "Create it now" and "I'll take care of it later".
 
