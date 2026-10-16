@@ -10,10 +10,11 @@ This skill works in the publisher's plugin repo: it reads and edits files in the
 
 After the publisher configures plans & benefits in the Plugpass dashboard, this skill writes the corresponding premium feature access checks into the plugin's local source — and, for a publisher-hosted plugin, into the publisher's own MCP server source — and reports back so the dashboard's implementation page can detect completion and unlock publish.
 
-It runs **entirely in this session — no agents**: you make the file edits yourself, ask the publisher questions when needed, and research external services when the work calls for it. The procedures live in four places:
+It runs **entirely in this session — no agents**: you make the file edits yourself, ask the publisher questions when needed, and research external services when the work calls for it. The procedures live in these places:
 
 - **A missing plugin manifest** — the "Missing manifest instructions" section below.
-- **The Codex manifest's listing fields** — the "Codex listing instructions" section below.
+- **The plugin's OpenAI listing** — the "OpenAI listing instructions" section below.
+- **The two MCP files** — the "MCP file agreement instructions" section below.
 - **Paid skill bodies** — the "Skill body prepend instructions" section below.
 - **Once-per-plugin core wiring** — the "Core wiring instructions" section below (including the connector directives).
 - **Publisher MCP server scaffolding** — [TOOLS.md](TOOLS.md), read only when the run has publisher-server work: the plugin's connector is the publisher's own MCP server (`connector.hosting` is `publisher`), or the run's components include `tool` entries.
@@ -26,7 +27,7 @@ Unlike `plugpass-sync-plugin`, this skill has **no mode-check** — by the time 
 
 **Presenting copy.** A `>` block is finished copy; the `>` characters delimit it here and are never part of it. Reproduce the text exactly — substituting each `{VARIABLE}` with its value — and never print the `>` characters, restyle the wording, or wrap it in a quote block. The surrounding step says where the copy goes: where it says to tell the publisher something, post it as your own message with nothing of your own before or after it, by whatever messaging method will be visible to them (especially if a tool call will follow it in the same turn). Copy given inline in double quotes is delivered the same way, without the quote marks.
 
-- PUBLISHER_PLUGIN_VERSION = `0.0.25` (stamped by the release pipeline). Include it as `publisher_plugin_version` on every Publisher MCP tool call in this skill.
+- PUBLISHER_PLUGIN_VERSION = `0.0.26` (stamped by the release pipeline). Include it as `publisher_plugin_version` on every Publisher MCP tool call in this skill.
 - USER_INPUT_TOOL = A tool that presents the user a question with selectable options and returns their choice (e.g. `AskUserQuestion`, `ask_user_input_v0`, etc.) that can be used in the default session state (not limited to a certain mode, e.g. plan mode). Where a prompt below calls for USER_INPUT_TOOL and no such tool is available, ask the question in chat and wait for the reply.
 - PLATFORM = If your system instructions indicate an OpenAI product (Codex or ChatGPT), then `openai`; otherwise (an Anthropic / Claude product) `claude`.
 - SKILL_PREFIX = If PLATFORM=`openai`, then `$`; otherwise `/`. (How the publisher types a skill invocation in their client — every typed command below renders through it.)
@@ -38,9 +39,9 @@ Unlike `plugpass-sync-plugin`, this skill has **no mode-check** — by the time 
 
 ## Step 1: Read the plugpass-plugin-id
 
-Read the plugin manifest from the current working directory (the publisher's plugin repo root): `.claude-plugin/plugin.json` when present, else `.codex-plugin/plugin.json` (a Codex-only plugin — same one-repo format). The file you read is `{manifest}` for every later manifest read in this skill; the other manifest, when it exists alongside `{manifest}` or this run creates it, is `{other-manifest}` (the core wiring keeps its `license` + `version` in step with `{manifest}`). If neither exists, tell the user "No Claude or Codex plugin manifest found. Run this skill again from inside your plugin repo." and end the skill.
+Find the plugin manifests in the current working directory (the publisher's plugin repo root): `.claude-plugin/plugin.json`, a root `plugin.json` whose `$schema` starts with `https://agent-plugins.org/schemas/` (the Agent Plugins manifest), and `.codex-plugin/plugin.json`. `{manifest}` — the manifest every later read in this skill uses — is `.claude-plugin/plugin.json` when present, else the Agent Plugins manifest, else `.codex-plugin/plugin.json`. `{other-manifests}` is every other manifest present, plus any this run creates (the core wiring keeps their `license` + `version` in step with `{manifest}`). If none exists, tell the user "No plugin manifest found. Run this skill again from inside your plugin repo." and end the skill.
 
-Extract `metadata.plugpass-plugin-id`. If it is absent, the plugin isn't linked to Plugpass in this working copy (a fresh checkout, or a wiped/regenerated manifest) — silently invoke the `plugpass-sync-plugin` skill. Do not announce the relink or state whether the plugin is registered — you don't know yet, and the sync skill reconciles it either way: it relinks to the existing registration when the plugin is already registered under this manifest `name`, or registers it fresh otherwise, and writes the id back to the manifest. Then re-read `{manifest}` and re-extract `metadata.plugpass-plugin-id`. If it is still absent (the publisher cancelled, or registration didn't complete), tell the user "I couldn't link this plugin to Plugpass. Run `{SKILL_PREFIX}plugpass-sync-plugin`, then re-run `{SKILL_PREFIX}plugpass-implement-code-changes`." and end the skill. Capture the resulting value as `{plugin-plugpass-id}`. Also capture the manifest's current `version` and its `name` — the latter is `{PluginName}`, the plugin's lowercase manifest identifier, used verbatim as the plugin's tool-ID namespace. The display name is **not** read from the manifest: `{PluginDisplayName}` comes from the `plugpass_get_plugin_data` response (Step 2), the dashboard-authoritative value.
+Extract `{manifest}`'s plugpass-plugin-id: `metadata.plugpass-plugin-id` in a Claude or Codex manifest, `extensions["ai.plugpass"].pluginId` in the Agent Plugins manifest. If it is absent, the plugin isn't linked to Plugpass in this working copy (a fresh checkout, or a wiped/regenerated manifest) — silently invoke the `plugpass-sync-plugin` skill. Do not announce the relink or state whether the plugin is registered — you don't know yet, and the sync skill reconciles it either way: it relinks to the existing registration when the plugin is already registered under this manifest `name`, or registers it fresh otherwise, and writes the id back to the manifests. Then re-read `{manifest}` and re-extract its plugpass-plugin-id. If it is still absent (the publisher cancelled, or registration didn't complete), tell the user "I couldn't link this plugin to Plugpass. Run `{SKILL_PREFIX}plugpass-sync-plugin`, then re-run `{SKILL_PREFIX}plugpass-implement-code-changes`." and end the skill. Capture the resulting value as `{plugin-plugpass-id}`. Also capture the manifest's current `version` and its `name` — the latter is `{PluginName}`, the plugin's lowercase manifest identifier, used verbatim as the plugin's tool-ID namespace. The display name is **not** read from the manifest: `{PluginDisplayName}` comes from the `plugpass_get_plugin_data` response (Step 2), the dashboard-authoritative value.
 
 Determine the run mode: if the user invoked the skill with `--reconcile` (or asked for a full re-check), this is a **reconcile run**; otherwise it is a normal **changeset run**. A changeset run rewrites an artifact only when the response says something changed — its gating, or the Plugpass template it was written from (Step 3) — and otherwise verifies it is present and structurally intact without rendering it; a reconcile run additionally re-audits every `unchanged` tool's wrapper and each in-set server's scaffolding probe by probe, per TOOLS.md's Reconcile runs section — the escape hatch for drift the server's record cannot see (a reverted or restored repo).
 
@@ -64,18 +65,18 @@ Capture from the response:
 - `connector_change_since_last_implement` — `unchanged` | `added` (no run has recorded a connector yet) | `changed` — with `previous_connector` (`{ hosting, server_key, url, issuer, identity_kind }`; `issuer` null on a record from before it was tracked) alongside when `changed`. Any field differing reads as `changed`, including an issuer change alone (the plugin's authorization server moved, so a publisher server's baked `ISSUER` / PRM is stale even though its own URL isn't). The connector-directive key: the core wiring's connector work is mechanical off this value + `connector.hosting`, no inference.
 - `mcp_server_url` — the plugin's connector URL (identical to `connector.url`), surfaced top-level as one of the two values this skill bakes.
 - `entitlement_api_origin`, `paywall_script_url`, `plugpass_issuer`, `plugpass_jwks_url`, `owned_servers` — the publisher-server scaffolding's baked-default inputs (TOOLS.md's runtime constants). `plugpass_issuer` is the plugin's own subdomain origin (its authorization server) and `plugpass_jwks_url` that host's key-set document — per plugin, and a custom-domain change never moves either. `paywall_script_url` is where the in-widget paywall script loads from (the plugin's own host). `owned_servers` maps each owned server's `server_name` to its registered connector-shape URL (its `RESOURCE_URL`), its **scaffolding directive** — `scaffolding.layers`, the layers TOOLS.md writes and verifies for that server (`resource_server`, `check_proxy`, `tool_wrappers`, and `ui_paywall` on a server that renders MCP Apps widgets); execute exactly the layers named — and `resource_url_changed`, `true` when the server moved since its code was baked. Ignore all five when the run has no publisher-server work.
-- `required_manifests` — the plugin manifests to check, as `{ family, path, manifest_label, products_label }`. `Read` each `path` at the plugin repo root; `{missing-manifests}` is the entries whose file is absent. Check exactly these entries, whatever else the repo carries.
+- `required_manifests` — the plugin manifests to check, one entry per platform: `{ platform, formats, create_format, manifest_label, products_label }`, where `formats` lists the manifest formats the platform accepts, each `{ format, path }` plus, for `agent_plugins`, `schema`, `mcp_path`, and `mcp_schema`. A format is present when its `path` exists at the plugin repo root and, for a format with a `schema`, the file's `$schema` equals it. `{missing-manifests}` is the entries with none of their formats present. Check exactly these entries, whatever else the repo carries.
 - `plugin_slug` — the plugin's Plugpass slug (platform-assigned — never guess it from the manifest), baked as `{PluginSlug}` into the access-handler skill by the core wiring.
 - `plugin_origin` — the plugin's pages ORIGIN (scheme + host, no path; https on every real deployment, http on dev's `*.localhost` hosts — the server composes the scheme, you never do) — the `{PluginOrigin}` slot the core wiring bakes the access-handler NOT_CONNECTED links on. Server-supplied because only the platform knows the active custom hostname and the environment's scheme.
 - `plugin_display_name` — the plugin's dashboard-authoritative display name, baked as `{PluginDisplayName}` into the access-handler skill and each paid body's block (the core wiring and body prepend). Always from here, never the manifest — the manifest's `displayName` is optional and can be stale once the publisher edits it on the dashboard.
 - `license` — `{ mode, eula }` (EULA-adoption state), consumed by the core wiring and the block's recital. When `mode` is `platform_license`, `eula` carries the rendered `LICENSE.md` + manifest value to write; otherwise the publisher's license is left untouched.
-- `last_published_plugin_version` — the plugin.json version stamped at the most recent publish (null when never published); the core wiring's version-bump anchor.
+- `last_published_plugin_version` — the manifest version stamped at the most recent publish (null when never published); the core wiring's version-bump anchor.
 - `dashboard_publish_url`, `dashboard_install_url` — the plugin's Publish and Install pages in the Plugpass dashboard.
-- `homepage_url`, `privacy_policy_url`, `terms_url`, `support_url`, `publisher_display_name`, `plugin_description`, `icon_url`, `listing_brand_color`, `former_plugin_origins` — the Codex listing instructions' inputs.
+- `homepage_url`, `privacy_policy_url`, `terms_url`, `support_url`, `publisher_display_name`, `plugin_description`, `icon_url`, `listing_brand_color`, `former_plugin_origins` — the OpenAI listing instructions' inputs.
 
-`{codex-listing}` is true when `required_manifests` has an entry whose `path` is `.codex-plugin/plugin.json`. `{listing-fill}` is true when `{codex-listing}` is true and the Codex manifest exists with a listing field the Codex listing instructions fill still empty, or this run creates the manifest.
+`{openai-listing}` is true when `required_manifests` has an `openai` entry. `{listing-fill}` is true when `{openai-listing}` is true and the OpenAI listing (located per the OpenAI listing instructions) has a field those instructions fill still empty, or this run creates the OpenAI manifest. `{agent-plugins}` is true when the `openai` entry's `agent_plugins` format is present or this run creates it. `{mcp-disagreement}` is true when `{agent-plugins}` is true and the MCP file agreement instructions find a server to name.
 
-On a run with an empty `components` array, `connector_change_since_last_implement` of `unchanged`, an empty `{missing-manifests}`, **and** `{listing-fill}` false, there is nothing to implement: run the Codex listing instructions' notes when `{codex-listing}` is true, then tell the publisher "Your plugin's code is already up to date with your plan configuration." and skip to Step 7 (still report, so the page reflects current state). A run with an empty `components` array but a connector change (`added` / `changed`), or a non-empty `{missing-manifests}`, **proceeds** — the connector directives still have real work (re-pointing or retiring a stale `.mcp.json` entry after a domain or hosting change), a missing manifest is this run's to resolve, and Step 7's report records both. (On a run with components, a pure connector flip never even looks empty — the gated set always returns, `unchanged` entries included — and proceeds through the full sequence: verified bodies, connector directives, scaffolding.)
+On a run with an empty `components` array, `connector_change_since_last_implement` of `unchanged`, an empty `{missing-manifests}`, `{mcp-disagreement}` false, **and** `{listing-fill}` false, there is nothing to implement: run the OpenAI listing instructions' notes when `{openai-listing}` is true, then tell the publisher "Your plugin's code is already up to date with your plan configuration." and skip to Step 7 (still report, so the page reflects current state). A run with an empty `components` array but a connector change (`added` / `changed`), a non-empty `{missing-manifests}`, or `{mcp-disagreement}` true **proceeds** — the connector directives still have real work (re-pointing or retiring a stale MCP file entry after a domain or hosting change), a missing manifest or an MCP file disagreement is this run's to resolve, and Step 7's report records them. (On a run with components, a pure connector flip never even looks empty — the gated set always returns, `unchanged` entries included — and proceeds through the full sequence: verified bodies, connector directives, scaffolding.)
 
 ## Step 3: Partition the work and locate local files
 
@@ -117,7 +118,7 @@ Wait for the publisher's reply, then continue to Step 5 — whether they committ
 Create one tracked task per item of work so the publisher sees per-component progress as the run advances. One task per **changeset** item and per **template refresh** item (skip any the Step 3 checks dropped for a missing local file or an unlocatable server — those are surfaced to the publisher, not tracked here); the verify set gets no tasks of its own (a version-only block refresh is incidental). Additionally:
 
 - One task per `{missing-manifests}` entry — `subject` "Add the {manifest_label} to the plugin repo", `activeForm` "Adding the {manifest_label} to the plugin repo".
-- One task when `{listing-fill}` is true — `subject` "Fill in the Codex manifest's listing details", `activeForm` "Filling in the Codex manifest's listing details".
+- One task when `{listing-fill}` is true — `subject` "Fill in the plugin's OpenAI listing", `activeForm` "Filling in the plugin's OpenAI listing".
 - One task for the once-per-plugin **core wiring**, when the run includes it — there is at least one gated skill or tool among the returned components, **or** the EULA is adopted (`license.mode` is `platform_license`), **or** `connector_change_since_last_implement` is not `unchanged` (the connector directives always have work then).
 - One task per located **server** in the server set, for its scaffolding work (the layers its `scaffolding.layers` directive names — the resource-server layer, the check proxy on the check host, and the in-widget paywall on a server that renders widgets).
 
@@ -136,11 +137,12 @@ All tasks start `pending`. Execution is sequential in this one session, so statu
 Work through the items sequentially, transitioning task statuses as you go:
 
 1. **Missing manifests** — when `{missing-manifests}` is non-empty, follow the "Missing manifest instructions" below.
-2. **Codex listing** — when `{codex-listing}` is true and the Codex manifest exists, follow the "Codex listing instructions" below.
-3. **Resolve the version bump** (Core wiring instructions, item 4) — before any body writes, so every block written or refreshed this run embeds the post-bump version.
-4. **Skill bodies** — follow the "Skill body prepend instructions" below: write the block for the changeset's `added` skills and the template refresh set's skills, strip it for `removed` skills, and verify every verify-set skill (rewriting only a block whose embedded version is behind).
-5. **Core wiring** — when the run includes it (Step 5's condition), follow the "Core wiring instructions" below (items 1–3, including the connector directives; item 4 was resolved up front).
-6. **Publisher-server work** — when the server set is non-empty, follow [TOOLS.md](TOOLS.md) per server, executing the layers its `scaffolding.layers` directive names: the resource-server layer (`resource_server`), the check proxy (`check_proxy`, check host), and the in-widget paywall (`ui_paywall`, a server that renders widgets) — each regenerated when `server_scaffolding_template_stale` or missing, verified otherwise — and the tool wrappers (`tool_wrappers`) (the changeset's add / strip, the template refresh set's rewrite, the verify set's presence check), finishing each server with TOOLS.md's per-server verification.
+2. **OpenAI listing** — when `{openai-listing}` is true and an OpenAI manifest exists, follow the "OpenAI listing instructions" below.
+3. **MCP files** — when `{agent-plugins}` is true, follow the "MCP file agreement instructions" below.
+4. **Resolve the version bump** (Core wiring instructions, item 4) — before any body writes, so every block written or refreshed this run embeds the post-bump version.
+5. **Skill bodies** — follow the "Skill body prepend instructions" below: write the block for the changeset's `added` skills and the template refresh set's skills, strip it for `removed` skills, and verify every verify-set skill (rewriting only a block whose embedded version is behind).
+6. **Core wiring** — when the run includes it (Step 5's condition), follow the "Core wiring instructions" below (items 1–3, including the connector directives; item 4 was resolved up front).
+7. **Publisher-server work** — when the server set is non-empty, follow [TOOLS.md](TOOLS.md) per server, executing the layers its `scaffolding.layers` directive names: the resource-server layer (`resource_server`), the check proxy (`check_proxy`, check host), and the in-widget paywall (`ui_paywall`, a server that renders widgets) — each regenerated when `server_scaffolding_template_stale` or missing, verified otherwise — and the tool wrappers (`tool_wrappers`) (the changeset's add / strip, the template refresh set's rewrite, the verify set's presence check), finishing each server with TOOLS.md's per-server verification.
 
 Track every repository the run edits — the plugin repo, plus each server repo TOOLS.md's work touched — identified by its git toplevel's directory basename, for the report. Record per repo:
 
@@ -159,23 +161,23 @@ Call the `plugpass_log_implementation` tool (under any connector prefix) with:
   "plugin_id": "{plugin-plugpass-id}",
   "implemented_component_ids": ["{plugpass_id of each successfully-implemented skill / tool}"],
   "implemented_connector": { "hosting": "{connector.hosting}", "server_key": "{connector.server_key}", "url": "{connector.url}", "issuer": "{connector.issuer}", "identity_kind": "{connector.identity_kind}", "pages_origin": "{plugin_origin}" },
-  "connector_reference_present": "{true when the run confirmed the connector's .mcp.json entry is present by URL; omit otherwise}",
+  "connector_reference_present": "{true when the run confirmed the connector's entry is present by URL in .mcp.json, and in mcp.json when {agent-plugins} is true; omit otherwise}",
   "edited_repos": [{ "name": "{repo basename}", "roles": ["{plugin | mcp_server | other}", "…"], "default_branch": "{default branch — omit when unresolvable}", "current_branch": "{branch HEAD was on — omit when detached/unresolvable}", "mcp_server_names": ["{each MCP server the run edited in this repo — include for an mcp_server-role repo}"] }],
-  "manifest_families_present": ["{the `family` of each required_manifests entry whose file is present at the end of this run}"],
+  "manifest_formats_present": ["{the `format` of each required_manifests format present at the end of this run}"],
   "implemented_servers": [{ "server_key": "{server_name}", "resource_url": "{the RESOURCE_URL baked}" }],
   "deployed_servers": ["{server_name of each server this run deployed — Step 8's deploy-first answer; omit on the Step 7 report}"],
-  "plugin_version": "{the plugin.json version after Step 6 — post-bump when one applied}",
+  "plugin_version": "{the manifest version after Step 6 — post-bump when one applied}",
   "publisher_plugin_version": "{PUBLISHER_PLUGIN_VERSION}"
 }
 ```
 
-Report **only successes** — a half-done or partially-blocked run still records the parts that landed and a re-run picks up the rest. A component that couldn't be brought to its end state is never reported (its task stays open). Include every returned component the run brought to **or confirmed in** its end state — the rewritten changeset and template-refresh entries and the verify set's confirmed entries alike: the server records this run's `publisher_plugin_version` against each as the template version its code now stands at, which is what clears `template_stale`. `implemented_connector` is **required on every run** and is exactly the Step 2 response's `connector` (hosting, server key, URL, issuer, identity kind) plus `pages_origin` — the Step 2 response's `plugin_origin`, the origin this run baked the access handler's NOT_CONNECTED links on. Together they are the connector this run actually wired for; the platform records it verbatim and compares the current target against it, which is how a connector change after (or mid-) run reads back as outstanding. **Never send the report when the core wiring didn't reach its end state** — the connector's `.mcp.json` work, the access-handler skill, and the license files alike (the server records the handler's template version off this report, and the connector off `implemented_connector`). If any of that failed (e.g. the check host's scaffolding couldn't be completed, or the publisher-hosted `.mcp.json` entry is missing), stop before Step 7: make no `plugpass_log_implementation` call at all if nothing else succeeded, or, when other components did land, report them on a follow-up run after the core wiring completes — recording a connector or handler the code doesn't actually implement would falsely satisfy the publish gate or hide a stale handler. `connector_reference_present` is add-only server-side; send `true` only after the by-URL presence check actually passed (the native entry the core wiring ensured, or the publisher's own existing entry it verified). `manifest_families_present` is **required on every run**: the `family` of every `required_manifests` entry whose file exists at the end of the run — those Step 2 found plus any this run created, never one still missing. The server replaces the recorded set with it, so list every present family each run. Include `implemented_servers` only when the run wrote or verified a resource-server layer: one entry per such server, with the `RESOURCE_URL` it now carries. Include `deployed_servers` only on the re-report Step 8's deploy-first answer makes, naming each server deployed: the platform records the moment and the fingerprint of the code it deployed, and the publish that later ships this implementation pre-marks that server's deploy task done rather than asking again. Include `edited_repos` only when the run edited at least one repo; each entry carries the repo's basename `name`, its **non-empty `roles` set**, `mcp_server_names` for an `mcp_server`-role repo, and its `default_branch` / `current_branch` when resolved (omit any field that couldn't be resolved). The platform **union-merges** each run's `edited_repos` into the recorded set, so reporting only this run's repos is correct even across multiple runs: a later partial run adds to the deploy checklist rather than replacing it. Always include `plugin_version`. The server stamps each reported component's current draft gating fingerprint, which is what the dashboard's implementation page reads back to detect completion.
+Report **only successes** — a half-done or partially-blocked run still records the parts that landed and a re-run picks up the rest. A component that couldn't be brought to its end state is never reported (its task stays open). Include every returned component the run brought to **or confirmed in** its end state — the rewritten changeset and template-refresh entries and the verify set's confirmed entries alike: the server records this run's `publisher_plugin_version` against each as the template version its code now stands at, which is what clears `template_stale`. `implemented_connector` is **required on every run** and is exactly the Step 2 response's `connector` (hosting, server key, URL, issuer, identity kind) plus `pages_origin` — the Step 2 response's `plugin_origin`, the origin this run baked the access handler's NOT_CONNECTED links on. Together they are the connector this run actually wired for; the platform records it verbatim and compares the current target against it, which is how a connector change after (or mid-) run reads back as outstanding. **Never send the report when the core wiring didn't reach its end state** — the connector's `.mcp.json` work, the access-handler skill, and the license files alike (the server records the handler's template version off this report, and the connector off `implemented_connector`). If any of that failed (e.g. the check host's scaffolding couldn't be completed, or the publisher-hosted `.mcp.json` entry is missing), stop before Step 7: make no `plugpass_log_implementation` call at all if nothing else succeeded, or, when other components did land, report them on a follow-up run after the core wiring completes — recording a connector or handler the code doesn't actually implement would falsely satisfy the publish gate or hide a stale handler. `connector_reference_present` is add-only server-side; send `true` only after the by-URL presence check actually passed in `.mcp.json`, and in `mcp.json` when `{agent-plugins}` is true (the native entry the core wiring ensured, or the publisher's own existing entry it verified). `manifest_formats_present` is **required on every run**: the `format` of every format listed in `required_manifests` that is present at the end of the run — those Step 2 found plus any this run created, never one still missing. The server replaces the recorded set with it, so list every present format each run. Include `implemented_servers` only when the run wrote or verified a resource-server layer: one entry per such server, with the `RESOURCE_URL` it now carries. Include `deployed_servers` only on the re-report Step 8's deploy-first answer makes, naming each server deployed: the platform records the moment and the fingerprint of the code it deployed, and the publish that later ships this implementation pre-marks that server's deploy task done rather than asking again. Include `edited_repos` only when the run edited at least one repo; each entry carries the repo's basename `name`, its **non-empty `roles` set**, `mcp_server_names` for an `mcp_server`-role repo, and its `default_branch` / `current_branch` when resolved (omit any field that couldn't be resolved). The platform **union-merges** each run's `edited_repos` into the recorded set, so reporting only this run's repos is correct even across multiple runs: a later partial run adds to the deploy checklist rather than replacing it. Always include `plugin_version`. The server stamps each reported component's current draft gating fingerprint, which is what the dashboard's implementation page reads back to detect completion.
 
 ## Step 8: Hand off to the dashboard
 
 Run this **only when the implementation is fully complete** — every targeted component successfully implemented, nothing failed or left pending.
 
-If anything is incomplete (a component with no local file, any component you couldn't bring to its end state, or a `{missing-manifests}` entry still missing), do **not** post the message below. Surface what's blocking and work through it with the publisher until every component is implemented; this handoff fires only once a run reaches full completion (possibly a later re-run, after they've resolved the blocker).
+If anything is incomplete (a component with no local file, any component you couldn't bring to its end state, a `{missing-manifests}` entry still missing, or an MCP file disagreement left in place), do **not** post the message below. Surface what's blocking and work through it with the publisher until every component is implemented; this handoff fires only once a run reaches full completion (possibly a later re-run, after they've resolved the blocker).
 
 - PUBLISH_URL = `dashboard_publish_url` from Step 2.
 - MCP_TOOL_CHANGES = The server set (Step 3) is non-empty.
@@ -198,9 +200,15 @@ Then ask with USER_INPUT_TOOL, offering "Yes", "Yes, but deploy my MCP tool chan
 
 ## Missing manifest instructions
 
-Work through `{missing-manifests}` one entry at a time.
+Work through `{missing-manifests}` one entry at a time. `{path}` is the `path` of the entry's `create_format`.
 
-Tell the publisher, interpolating that entry's fields:
+When the entry is `openai` and a root `plugin.json` exists whose `$schema` starts with `https://agent-plugins.org/schemas/` but isn't the `agent_plugins` format's `schema`, tell the publisher
+
+> `plugin.json` declares an Agent Plugins version OpenAI doesn't support. Change its `$schema` to version 1.0.0 and run this skill again.
+
+then leave the task pending, leave the entry out of Step 7's report, and continue the run.
+
+Otherwise, tell the publisher, interpolating that entry's fields:
 
 > This plugin supports the {products_label}, and they need a {manifest_label} (`{path}`) that this repo doesn't have.
 >
@@ -208,20 +216,30 @@ Tell the publisher, interpolating that entry's fields:
 
 Then ask with USER_INPUT_TOOL "Want help creating it?", offering "Create it now" and "I'll take care of it later".
 
-If they choose "I'll take care of it later": leave the task pending, leave that entry's `family` out of Step 7's report, and continue the run.
+If they choose "I'll take care of it later": leave the task pending, leave the entry out of Step 7's report, and continue the run.
 
-If they choose "Create it now":
+If they choose "Create it now", write the entry's `create_format`, except that `agent_plugins` gives way to `codex` in two cases, each told to the publisher first:
 
-1. Find the current specification for that manifest with WebSearch and read it with WebFetch (the platform's own documentation or schema). Write the file from that specification, not from memory.
-2. Copy every field the specification shares with `{manifest}` from `{manifest}`, `name` verbatim.
-3. Set `metadata.plugpass-plugin-id` to `{plugin-plugpass-id}`.
-4. For a Codex manifest, fill its `interface` from the Codex listing instructions' fields first. For each remaining required field, ask the publisher with USER_INPUT_TOOL, or in chat when the answer is free text. A Codex manifest's `interface` block is what users see at install: ask the publisher for its other values rather than inferring them. Use only values the publisher gives or the Step 2 response carries, and files that exist in the repo; omit an optional field you have no value for.
-5. If a required field still has no value, tell the publisher which one, leave the task pending, leave the entry's `family` out of Step 7's report, and continue the run.
-6. Write `{path}` with `Write`, then mark the task completed and count the entry's `family` as present in Step 7's report.
+- `{PluginName}` breaks the Agent Plugins name rule (lowercase letters, digits, `.` and `-`, at most 64 characters, starting and ending with a letter or digit, with no `--` or `..`):
 
-## Codex listing instructions
+  > {PluginName} can't be an Agent Plugins name, so I'll create the Codex manifest instead.
 
-The Codex manifest's `interface` block is the plugin's ChatGPT Plugin Directory listing. Fill each of these fields that is absent or empty in `.codex-plugin/plugin.json` from the Step 2 response, skipping one whose source is null or empty, and never change a field that has a value. `Edit`, preserving every other field.
+- A root `plugin.json` exists that isn't an Agent Plugins manifest:
+
+  > This repo's `plugin.json` isn't an Agent Plugins manifest, so I'll create the Codex manifest instead.
+
+Then:
+
+1. Find the current specification for that format with WebSearch and read it with WebFetch (the platform's own documentation or schema). Write the file from that specification, not from memory.
+2. For the Claude or Codex format, copy every field the specification shares with `{manifest}` from `{manifest}`, `name` verbatim, and set `metadata.plugpass-plugin-id` to `{plugin-plugpass-id}`. For the Agent Plugins format, set `$schema` to the format's `schema`, `name` verbatim, copy `version`, `description`, `author`, `homepage`, `repository`, `license`, and `keywords` from `{manifest}` where present, and set `extensions["ai.plugpass"].pluginId` to `{plugin-plugpass-id}`.
+3. For an OpenAI format, fill its listing (the Codex format's `interface`, the Agent Plugins format's `extensions["com.openai"].interface`) from the OpenAI listing instructions' fields first. For each remaining required field, ask the publisher with USER_INPUT_TOOL, or in chat when the answer is free text. The listing is what users see at install: ask the publisher for its other values rather than inferring them. Use only values the publisher gives or the Step 2 response carries, and files that exist in the repo; omit an optional field you have no value for.
+4. If a required field still has no value, tell the publisher which one, leave the task pending, leave the entry out of Step 7's report, and continue the run.
+5. Write the manifest at its format's `path` with `Write`. For the Agent Plugins format, also write `mcp.json` at the format's `mcp_path`, with `mcp_schema` as its `$schema` and every server in `.mcp.json` in the specification's entry shape (a `{ "type": "http", "url" }` entry becomes `{ "type": "streamable-http", "url" }`).
+6. Mark the task completed and count the format as present in Step 7's report.
+
+## OpenAI listing instructions
+
+The plugin's OpenAI listing is its ChatGPT Plugin Directory listing: `extensions["com.openai"].interface` in the Agent Plugins manifest when that manifest carries `extensions["com.openai"]` or there is no `.codex-plugin/plugin.json`, else the `interface` in `.codex-plugin/plugin.json`. Fill each of these fields that is absent or empty there from the Step 2 response, skipping one whose source is null or empty, and never change a field that has a value. `Edit`, preserving every other field.
 
 - `displayName` ← `plugin_display_name`
 - `developerName` ← `publisher_display_name`
@@ -235,7 +253,7 @@ The Codex manifest's `interface` block is the plugin's ChatGPT Plugin Directory 
 
 Then post each of these notes that applies, together in one message, and change nothing for them:
 
-- For each `interface` URL field whose origin is in `former_plugin_origins`:
+- For each listing URL field whose origin is in `former_plugin_origins`:
 
   > `{field}` points to {url}, where {PluginDisplayName}'s pages are no longer served.
 
@@ -243,9 +261,24 @@ Then post each of these notes that applies, together in one message, and change 
 
   > `{field}` is {count} characters. The ChatGPT Plugin Directory accepts 30 at most.
 
-- For each of `displayName`, `shortDescription`, `longDescription`, `developerName`, `category`, `capabilities`, `websiteURL`, `supportURL`, `privacyPolicyURL`, `termsOfServiceURL`, `logo`, and `composerIcon` still empty:
+- For each of `displayName`, `shortDescription`, `longDescription`, `developerName`, `category`, `capabilities`, `websiteURL`, `supportURL`, `privacyPolicyURL`, `termsOfServiceURL`, `logo`, and `composerIcon` still empty, leaving out `capabilities` and `composerIcon` when the listing is in the Agent Plugins manifest:
 
   > `{field}` is empty. The ChatGPT Plugin Directory requires it.
+
+## MCP file agreement instructions
+
+Compare `.mcp.json` and `mcp.json` by server key, skipping Plugpass's own entries, which the connector directives keep in step: any whose `url` is a native `connector.url` or `previous_connector.url`, and the retired shared connector's (Core wiring item 1). For each server to name:
+
+- In only one of the files: ask with USER_INPUT_TOOL, offering "Yes" and "No",
+
+  > {server-key} is in `{file}` but not `{other-file}`, so {platform-name} users won't get it. Want me to add it?
+
+  with `{platform-name}` "Claude" for a server missing from `.mcp.json` and "ChatGPT and Codex" for one missing from `mcp.json`. On "Yes", add it to the other file in that file's entry shape (`{ "type": "http", "url" }` in `.mcp.json`, `{ "type": "streamable-http", "url" }` in `mcp.json`).
+- With a different `url` in each: ask with USER_INPUT_TOOL, offering the two URLs,
+
+  > {server-key} points to {url} in `.mcp.json` but {other-url} in `mcp.json`. Which one is right?
+
+  and set the other file's `url` to the one chosen.
 
 ## Skill body prepend instructions
 
@@ -269,7 +302,7 @@ Slot values (all from this component's `plugpass_get_plugin_data` entry unless n
 
 - `{PluginName}` → as captured in Step 1; `{PluginPublicId}` → the plugin's public short id (the `{plugin-plugpass-id}` captured in Step 1 — a bare base58 id, baked as the check call's `plugin_id`); `{CheckToolName}` → the plugin data's `check_tool_name`; `{AccessHandlerSkillName}` → the plugin data's `access_handler_skill_name`; `{ConnectorKey}` → `connector.server_key` from Step 2.
 - `{FeatureType}` → the component's `FeatureType` (`skill`) — a **recital-only** slot (its "this {FeatureType}" wording), not sent on the check call and not passed on the invoke. `{FeatureId}` → its `FeatureId` (the component's public short id, prefixed `skill_` — the prefix carries the feature type everywhere it's needed at runtime; the block dual-bakes it into both the check call's `feature_id` and the invoke's single `FEATURE_ID` argument).
-- `{PluginVersion}` → the plugin's current `plugin.json` version (after Step 6's bump resolution). A verified block whose embedded value is behind this is re-reproduced (the verify procedure below) so the version it reports stays current; template changes reach a block through its `template_stale` flag, never through a blanket re-render.
+- `{PluginVersion}` → the plugin's current manifest `version` (after Step 6's bump resolution). A verified block whose embedded value is behind this is re-reproduced (the verify procedure below) so the version it reports stays current; template changes reach a block through its `template_stale` flag, never through a blanket re-render.
 - `{PluginDisplayName}` → the plugin's display name, from `plugin_display_name` on the `plugpass_get_plugin_data` response (dashboard-authoritative — never the manifest). Used only in the legal recital.
 
 The block bakes **zero merchandising or plan-structure facts** — no pitch, no name copy, no free-plan hint. All state copy arrives server-composed in the check result at runtime, so copy edits and free↔paid flips never require a re-implement run.
@@ -292,12 +325,12 @@ The server's changeset can only order work against implementations it has record
 
 The once-per-plugin Plugpass wiring — up to four items, each gated independently, so the run does only the relevant subset. Items 1–2 apply when the plugin has at least one gated skill or tool among the returned components (item 1 additionally whenever `connector_change_since_last_implement` is not `unchanged` — a connector change always has `.mcp.json` work, even on an otherwise-empty run); item 3 when the EULA is adopted; item 4 whenever the run changes any file in the plugin repo.
 
-### 1. The `.mcp.json` connector reference — the connector directives
+### 1. The connector references — the connector directives
 
-The `.mcp.json` work is **mechanical, keyed entirely off `connector_change_since_last_implement` + the hosting values — no inference.** Read `.mcp.json` at the plugin repo root first (if it is missing, create it with an empty `{ "mcpServers": {} }` object), then apply the matching directive:
+The MCP file work is **mechanical, keyed entirely off `connector_change_since_last_implement` + the hosting values — no inference.** It applies to `.mcp.json` and, when `{agent-plugins}` is true, to `mcp.json` exactly the same way. Read each at the plugin repo root first (create a missing `.mcp.json` as `{ "mcpServers": {} }`, and a missing `mcp.json` as `{ "$schema": "{mcp_schema}", "mcpServers": {} }` with the `agent_plugins` format's `mcp_schema`), then apply the matching directive to each:
 
 - **`unchanged` / `added`, hosting `native`** — ensure the Plugpass-hosted entry (the **native ensure**, below).
-- **`unchanged` / `added`, hosting `publisher`** — **no new entry.** The connector is the publisher's own server, whose entry is how sync registered it — verify an entry whose `url` equals `connector.url` is present (match by URL, not key). If none is, the plugin repo and the registration disagree (the publisher removed or changed their server's entry locally without re-syncing) — tell them "Plugpass has {connector.url} registered as this plugin's premium access check server, but your `.mcp.json` no longer has an entry for it. Run `{SKILL_PREFIX}plugpass-sync-plugin` to re-sync, then re-run `{SKILL_PREFIX}plugpass-implement-code-changes`." and end the skill.
+- **`unchanged` / `added`, hosting `publisher`** — **no new entry.** The connector is the publisher's own server, whose entry is how sync registered it — verify an entry whose `url` equals `connector.url` is present (match by URL, not key). If `.mcp.json` has none, the plugin repo and the registration disagree (the publisher removed or changed their server's entry locally without re-syncing) — tell them "Plugpass has {connector.url} registered as this plugin's premium access check server, but your `.mcp.json` no longer has an entry for it. Run `{SKILL_PREFIX}plugpass-sync-plugin` to re-sync, then re-run `{SKILL_PREFIX}plugpass-implement-code-changes`." and end the skill.
 - **`changed`, native→publisher** (`previous_connector.hosting` `native`, `connector.hosting` `publisher`) — remove the entry whose `url` equals `previous_connector.url` (the plugin's own retired native connector — the generalized retire-stale exception), then proceed as `added` + `publisher` above.
 - **`changed`, publisher→native** — run the native ensure; remove **nothing** (the publisher already deleted their server's entry — that's how sync knew — or it legitimately remains for a server that still serves tools).
 - **`changed`, publisher→publisher** (a check-host reselect) — verify the NEW check host's entry is present by URL, exactly as `added` + `publisher`; remove nothing here (both entries are the publisher's own servers). The server-side half — scaffolding the new check host — is TOOLS.md's work, per the connector directive it receives. The old check host keeps its proxy tool: installed copies and a ChatGPT listing still call it.
@@ -307,17 +340,23 @@ The `.mcp.json` work is **mechanical, keyed entirely off `connector_change_since
 **The native ensure:**
 
 1. **Match by URL, not by key.** If any entry under `mcpServers` has `url` equal to `connector.url`, the reference is already present — do nothing further (idempotent).
-2. Otherwise, add one entry under the key `{ConnectorKey}` (the `connector.server_key` — the plugin's own manifest name, so the connect moment reads as the plugin's own):
+2. Otherwise, add one entry under the key `{ConnectorKey}` (the `connector.server_key` — the plugin's own manifest name, so the connect moment reads as the plugin's own) — in `.mcp.json`:
 
    ```json
    "{ConnectorKey}": { "type": "http", "url": "<connector.url>" }
    ```
 
-   Preserve every existing `mcpServers` entry and all other `.mcp.json` content exactly; only add the one key. Use the `url` verbatim — never hardcode a platform URL yourself; it is derived per-plugin (the plugin's own domain + `/mcp`), differs between dev and production, and is always supplied by `plugpass_get_plugin_data`.
+   and in `mcp.json`:
+
+   ```json
+   "{ConnectorKey}": { "type": "streamable-http", "url": "<connector.url>" }
+   ```
+
+   Preserve every existing `mcpServers` entry and all other file content exactly; only add the one key. Use the `url` verbatim — never hardcode a platform URL yourself; it is derived per-plugin (the plugin's own domain + `/mcp`), differs between dev and production, and is always supplied by `plugpass_get_plugin_data`.
 
 3. **Retire stale platform entries.** If `mcpServers` still carries an entry for the RETIRED shared Plugpass connector — the key `premium-check`, or any entry whose URL host is `auth.plugpass.ai` or `localhost:8788` — remove that one entry (it points at a decommissioned host; leaving it gives every user of the plugin a dead, un-connectable server).
 
-This reference is required whenever the plugin has a gated skill: their premium blocks call `{CheckToolName}` on this connector. (A publisher-hosted plugin's reference is the publisher's own server entry — verified, never written, per the directives above.)
+This reference is required whenever the plugin has a gated skill: their premium blocks call `{CheckToolName}` on this connector. (A publisher-hosted plugin's reference is the publisher's own server entry — verified, never written, per the directives above; one missing from `mcp.json` alone is the MCP file agreement's to add.)
 
 **Add-only.** Never remove or rewrite any existing reference beyond the two retire exceptions above (the legacy shared-connector entries, and the plugin's own previous native connector on a native→publisher flip) — both are the plugin's own dead platform entries, never the publisher's servers. A listed-but-unused connector entry is inert — mere presence triggers no auth; its tools run only when actually called — while removing an entry a user has already connected severs that connection. **Never register the native connector as an `mcp_dependency`** and never send it to `plugpass_sync_plugin`: it is platform-served and its audience derives from plugin state; this is a pure local-source write with no server-side row (the exact complement of the platform-MCP filter in `plugpass-sync-plugin`).
 
@@ -337,7 +376,7 @@ Write nothing else into the publisher's plugin for the flows — there is no `.c
 _Only when `license.mode` is `platform_license` (then `license.eula` is non-null)._
 
 1. Write `license.eula.license_md` **verbatim** to `LICENSE.md` at the plugin repo root, overwriting any existing `LICENSE.md`. The content is the fully rendered EULA (cover page + Bonterms base), composed server-side with all tokens already filled — never edit, re-wrap, summarize, or regenerate it yourself. (Idempotent — if the file already matches, it's a no-op.)
-2. Set the manifest `license` field in `{manifest}` to `license.eula.manifest_license`. Use `Edit`, preserving every other field exactly; add the `license` key if absent. When `{other-manifest}` exists too, set its `license` field the same way — the same Edit-preserving-every-other-field rule; the two manifests describe one plugin and must agree.
+2. Set the manifest `license` field in `{manifest}` to `license.eula.manifest_license`. Use `Edit`, preserving every other field exactly; add the `license` key if absent. Set the `license` field of every manifest in `{other-manifests}` the same way — the same Edit-preserving-every-other-field rule; every manifest describes one plugin, so they must agree.
 
 Never touch `LICENSE.md` or the manifest `license` field when `license.mode` is anything other than `platform_license` — the publisher keeps their own license.
 
@@ -345,7 +384,7 @@ Never touch `LICENSE.md` or the manifest `license` field when `license.mode` is 
 
 Resolved **first**, before any body writes (Step 6), so every refreshed block embeds the post-bump version. The bump is what makes rolling plugin updates actually deliver the new bodies to users — without it, pinned-version installs never see the update.
 
-1. Determine whether this run will change any plugin-repo file **aside from the bump itself** — by the read-only checks above, never by rendering: a changeset skill edit, a template refresh set skill, a verify-set block that is missing, broken, or behind on its embedded version, an access-handler regenerate (item 2's conditions), a manifest this run creates (Step 6's item 1), a Codex listing field this run fills (Step 6's item 2), or a core wiring write (items 1 or 3) that isn't already current. If nothing else would change, the run is a no-op for the plugin repo — no bump, and every verified body is left untouched.
-2. The **current version** is `{manifest}`'s `version` — or, when `{other-manifest}` exists too and the two disagree, the **higher** of the two (semver order): the two manifests describe one plugin and must report one version, and unifying upward never rolls back a version that is already out there on either platform.
+1. Determine whether this run will change any plugin-repo file **aside from the bump itself** — by the read-only checks above, never by rendering: a changeset skill edit, a template refresh set skill, a verify-set block that is missing, broken, or behind on its embedded version, an access-handler regenerate (item 2's conditions), a manifest this run creates (Step 6's item 1), an OpenAI listing field this run fills (Step 6's item 2), an MCP file entry this run adds or corrects (Step 6's item 3), or a core wiring write (items 1 or 3) that isn't already current. If nothing else would change, the run is a no-op for the plugin repo — no bump, and every verified body is left untouched.
+2. The **current version** is `{manifest}`'s `version` — or, when the manifests in `{other-manifests}` disagree with it, the **highest** of them (semver order): every manifest describes one plugin and must report one version, and unifying upward never rolls back a version that is already out there on any platform.
 3. When the run will change the plugin repo: bump the current version (patch — e.g. `1.2.3` → `1.2.4`) **only if** it still equals `last_published_plugin_version` from Step 2. A never-published plugin (null anchor), or one whose version the publisher already bumped themselves, is left alone — re-runs never inflate the version (idempotent: the first bump makes current ≠ anchor, so subsequent runs skip it until the next publish re-anchors).
-4. Either way, the version the bodies embed as `{PluginVersion}` is the current version **after** this resolution, and it is written to `{manifest}` — and to `{other-manifest}` when it exists — wherever it differs (Edit, preserving every other field). Codex reads `.codex-plugin/plugin.json` first, so the two must agree.
+4. Either way, the version the bodies embed as `{PluginVersion}` is the current version **after** this resolution, and it is written to `{manifest}` and every manifest in `{other-manifests}` wherever it differs (Edit, preserving every other field).

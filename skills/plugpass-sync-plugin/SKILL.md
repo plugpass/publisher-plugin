@@ -26,7 +26,7 @@ The Plugpass Publisher MCP server (this plugin's `.mcp.json` `plugpass-publisher
 
 **Presenting copy.** A `>` block is finished copy; the `>` characters delimit it here and are never part of it. Reproduce the text exactly — substituting each `{VARIABLE}` with its value — and never print the `>` characters, restyle the wording, or wrap it in a quote block. The surrounding step says where the copy goes: where it says to tell the publisher something, post it as your own message with nothing of your own before or after it, by whatever messaging method will be visible to them (especially if a tool call will follow it in the same turn). Copy given inline in double quotes is delivered the same way, without the quote marks.
 
-- PUBLISHER_PLUGIN_VERSION = `0.0.25` (stamped by the release pipeline). Include it as `publisher_plugin_version` on every Publisher MCP tool call in this skill.
+- PUBLISHER_PLUGIN_VERSION = `0.0.26` (stamped by the release pipeline). Include it as `publisher_plugin_version` on every Publisher MCP tool call in this skill.
 - USER_INPUT_TOOL = A tool that presents the user a question with selectable options and returns their choice (e.g. `AskUserQuestion`, `ask_user_input_v0`, etc.) that can be used in the default session state (not limited to a certain mode, e.g. plan mode). Where a prompt below calls for USER_INPUT_TOOL and no such tool is available, ask the question in chat and wait for the reply.
 - PLATFORM = If your system instructions indicate an OpenAI product (Codex or ChatGPT), then `openai`; otherwise (an Anthropic / Claude product) `claude`.
 - OS = If your system instructions indicate the platform is `darwin`, then `mac`; if `linux`, then `linux`; if `win32`, then `windows`.
@@ -36,11 +36,11 @@ The Plugpass Publisher MCP server (this plugin's `.mcp.json` `plugpass-publisher
 
 ## Step 0: Mode check
 
-Check the current working directory (the publisher's plugin repo root) for both plugin manifests: `.claude-plugin/plugin.json` (family `claude`) and `.codex-plugin/plugin.json` (family `codex`). A plugin repo may carry either or both. `{manifests}` is the list of families present, and step 7 writes the plugpass-plugin-id back to every one of them. If neither exists, tell the user "No Claude or Codex plugin manifest found. Run this skill again from inside your plugin repo." and end the skill.
+Check the current working directory (the publisher's plugin repo root) for the three plugin manifest formats: `.claude-plugin/plugin.json` (format `claude`), a root `plugin.json` whose `$schema` starts with `https://agent-plugins.org/schemas/` (format `agent_plugins`), and `.codex-plugin/plugin.json` (format `codex`). A plugin repo may carry any of them. `{manifests}` is the list of formats present, and step 7 writes the plugpass-plugin-id back to every one of them. If none exists, tell the user "No plugin manifest found. Run this skill again from inside your plugin repo." and end the skill.
 
-`{manifest}` — where this skill reads the plugin's metadata — is `.claude-plugin/plugin.json` when present, else `.codex-plugin/plugin.json`. Read it.
+`{manifest}` — where this skill reads the plugin's metadata — is `.claude-plugin/plugin.json` when present, else the root `plugin.json` when it is format `agent_plugins`, else `.codex-plugin/plugin.json`. Read it, and read every other manifest in `{manifests}`.
 
-Check `{manifest}`'s `metadata.plugpass-plugin-id` field:
+A manifest's plugpass-plugin-id is `metadata.plugpass-plugin-id` in a `claude` or `codex` manifest, and `extensions["ai.plugpass"].pluginId` in an `agent_plugins` one. Check `{manifest}`'s plugpass-plugin-id:
 
 - Set to a non-empty value → **SYNC mode**. Capture the value as `{plugin-plugpass-id}`.
 - Absent or empty → **REGISTER mode**. (If the plugin is actually registered server-side under this manifest `name` — e.g., the manifest was wiped or regenerated — `plugpass_sync_plugin` relinks to the existing registration automatically; REGISTER mode needs no special handling for that case, and you must not announce or guess whether the plugin is already registered — you don't know.)
@@ -50,7 +50,7 @@ Check `{manifest}`'s `metadata.plugpass-plugin-id` field:
 From `{manifest}`, extract:
 
 - `name` — required.
-- `displayName` — the manifest's human-readable display name, if present and non-empty: the top-level `displayName` in `.claude-plugin/plugin.json`, or `interface.displayName` in `.codex-plugin/plugin.json`. When the manifest carries it, the manifest is authoritative: it seeds the plugin's Plugpass display name on create and is re-written on every re-sync. When the manifest omits it, the display name is title-cased from `name` on create and is publisher-owned on the dashboard afterward — re-sync never touches it.
+- `displayName` — the plugin's human-readable display name, if present and non-empty: the top-level `displayName` in `.claude-plugin/plugin.json`; else the OpenAI listing's `interface.displayName`, under `extensions["com.openai"]` in the `agent_plugins` manifest when it carries `extensions["com.openai"]`, otherwise in `.codex-plugin/plugin.json`. When the manifests carry it, they are authoritative: it seeds the plugin's Plugpass display name on create and is re-written on every re-sync. When they omit it, the display name is title-cased from `name` on create and is publisher-owned on the dashboard afterward — re-sync never touches it.
 - `description` — may be absent.
 - `version` — informational only.
 - `license` — the SPDX license id (e.g. `MIT`), if present; may be absent. Pass it through to `plugpass_sync_plugin` so Plugpass can offer "keep your existing license" in the dashboard.
@@ -81,9 +81,13 @@ Track the file path next to each component so step 8 can write back to it, and k
 
 ## Step 3: Discover local mcp_dependency components
 
-Read `.mcp.json` at the plugin root (when `{manifest}` is `.codex-plugin/plugin.json` and its `mcpServers` field names a different path, read that file instead; an inline `mcpServers` object there is the servers map itself). If the file is absent or its `mcpServers` object is empty, the discovered tool list and mcp_dependency list are both empty — skip to step 5 (which still runs for the skills) with no MCP-server content in the payload.
+Read `.mcp.json` at the plugin root (when `{manifest}` is `.codex-plugin/plugin.json` and its `mcpServers` field names a different path, read that file instead; an inline `mcpServers` object there is the servers map itself), and, when `{manifests}` includes `agent_plugins`, `mcp.json` at the plugin root too. The servers are the union of the files' `mcpServers`, by key. When a key carries a different `url` in each file, tell the publisher
 
-Otherwise, parse `mcpServers`. **Before doing anything else with the parsed entries, filter out Plugpass-served MCP servers** — the platform's own hosts are never publisher-owned `mcp_dependencies` (connector audiences derive from plugin state, not from per-plugin source). Drop any `mcpServers` entry whose URL host (host:port for localhost entries) matches one of:
+> {server-key} points to {url} in `.mcp.json` but {other-url} in `mcp.json`. Make them match and I'll continue.
+
+and wait for the fix, then read both files again. If no file exists or the union is empty, the discovered tool list and mcp_dependency list are both empty — skip to step 5 (which still runs for the skills) with no MCP-server content in the payload.
+
+Otherwise, parse the servers. **Before doing anything else with the parsed entries, filter out Plugpass-served MCP servers** — the platform's own hosts are never publisher-owned `mcp_dependencies` (connector audiences derive from plugin state, not from per-plugin source). Drop any server whose URL host (host:port for localhost entries) matches one of:
 
 - `plugpass.ai` or ANY `*.plugpass.ai` subdomain — every Plugpass-hosted plugin connector lives at `{slug}.plugpass.ai` (typically under the plugin's own manifest-name key, placed by `plugpass-implement-code-changes`), and the Publisher MCP at `publisher.plugpass.ai` (included only in the `plugpass` publisher plugin)
 - `localhost:3000` or any `*.localhost:3000` subdomain (dev-mode apex + plugin-connector host forms)
@@ -92,7 +96,7 @@ Otherwise, parse `mcpServers`. **Before doing anything else with the parsed entr
 
 **SYNC mode only, once step 4's pre-check response is in hand:** additionally drop any parsed entry whose URL host equals the host of the pre-check's `plugin_origin` — the plugin's connector served on its active custom domain, which host shape alone can't recognize. (In both modes `plugpass_sync_plugin` rejects these server-side as a backstop — if a sync fails naming a domain as "a plugin's active custom domain", drop that entry and re-send.)
 
-These are platform-served hosts the publisher cannot monetize; they never surface in the step 4 elicitation and never appear as `mcp_dependency` components in the `plugpass_sync_plugin` payload. If filtering leaves zero remaining `mcpServers` entries, step 4 is skipped just as it would be for a plugin with no `.mcp.json`.
+These are platform-served hosts the publisher cannot monetize; they never surface in the step 4 elicitation and never appear as `mcp_dependency` components in the `plugpass_sync_plugin` payload. If filtering leaves no servers, step 4 is skipped just as it would be for a plugin with no MCP config.
 
 Each remaining entry (after filtering) is one of two kinds. An entry with a `url` field is a **remote server**. An entry without one — it carries a `command`, so the plugin runs the server as a process on the user's own machine — is a **local (stdio) server**, and `{local-servers}` is the list of those. Plugpass can't restrict the features a local server provides, so it is registered by name and nothing more: no question is asked about it and none of its tools are read.
 
@@ -102,11 +106,11 @@ Emit an `mcp_dependency` component for every entry:
 - `domain` — remote servers only: the bare hostname extracted from the server's `url` field. Take the substring between `://` and the next `/`, then strip any trailing `:{port}`. Examples: `"url": "https://mcp.example.com/mcp"` → `mcp.example.com`; `"url": "http://localhost:9000/mcp"` → `localhost`.
 - `url` — remote servers only: the entry's `url` field verbatim (the same value `domain` was extracted from). The server cross-checks it against `domain` and enforces the owned-server URL shape below.
 
-`mcp_dependency` entries have no source-file slot for plugpass-id (`.mcp.json` has no per-server metadata block). On SYNC runs `plugpass_sync_plugin` matches them by `(plugin_id, type, name)` — i.e., server_name.
+`mcp_dependency` entries have no source-file slot for plugpass-id (`.mcp.json` and `mcp.json` have no per-server metadata block). On SYNC runs `plugpass_sync_plugin` matches them by `(plugin_id, type, name)` — i.e., server_name.
 
 ## Step 4: Ownership + premium tool elicitation
 
-If step 3 produced no `mcp_dependency` entries (no `.mcp.json` or empty `mcpServers`, post-Plugpass-filter), skip this entire step — including the SYNC-mode pre-check below. The tool list is empty.
+If step 3 produced no `mcp_dependency` entries (no MCP config or no servers, post-Plugpass-filter), skip this entire step — including the SYNC-mode pre-check below. The tool list is empty.
 
 ### Pre-check: fetch current entitlement state (SYNC mode only)
 
@@ -198,17 +202,17 @@ If one does, tell the publisher:
 
 > Your {server-name} MCP server is hosted on a shared-hosting domain ({root-domain}). You need to move your MCP server to a domain you own to continue. Let me know what domain you want to use and I'll help you update your MCP server and plugin code.
 
-Then help them fix it: point the server at the domain they name, deploy it, and update that server's `.mcp.json` `url`. Do not stop the run or ask them to re-run this skill. Continue with the remaining instructions once the server is serving on their own domain.
+Then help them fix it: point the server at the domain they name, deploy it, and update that server's `url` in `.mcp.json`, and in `mcp.json` when the plugin has one. Do not stop the run or ask them to re-run this skill. Continue with the remaining instructions once the server is serving on their own domain.
 
 ### Owned-server https check
 
-Validate the same set of owned servers (effective ownership `owned`, local-development hosts skipped): the `.mcp.json` `url` must be `https`. Any path and port are fine.
+Validate the same set of owned servers (effective ownership `owned`, local-development hosts skipped): the server's `url` must be `https`. Any path and port are fine.
 
 If one isn't https, tell the publisher:
 
 > The {server-name} MCP server is registered at {url}. A server you own has to be served over https. Update it to https, update `.mcp.json` to match, and I'll continue.
 
-Then help them fix it in place, as above.
+Then help them fix it in place, as above, in both files when the plugin has `mcp.json`.
 
 ### Question 2 — tool restriction
 
@@ -366,7 +370,7 @@ Call the `plugpass_sync_plugin` tool (under any connector prefix) with the full 
     "description": "{description, omit if absent}",
     "license": "{plugin.json license id, omit if absent}",
     "plugpass_id": "{plugin-plugpass-id from step 0 — SYNC mode only; omit in REGISTER mode}",
-    "manifests": ["{each family from {manifests} — \"claude\", \"codex\", or both}"],
+    "manifests": ["{each format from {manifests} — \"claude\", \"agent_plugins\", \"codex\"}"],
     "source": { "repository": "{repository from step 1b}", "subdirectory": "{subdirectory from step 1b}" }
   },
   "components": [
@@ -374,7 +378,7 @@ Call the `plugpass_sync_plugin` tool (under any connector prefix) with the full 
     { "type": "mcp_dependency",
       "name": "{server-key}",
       "domain": "{hostname; omit for a local server}",
-      "url": "{full .mcp.json url, verbatim; omit for a local server}",
+      "url": "{the server's full url, verbatim; omit for a local server}",
       "plugpass_id": "{from the pre-check, omit if newly-discovered or in REGISTER mode}",
       "ownership": "{owned | not_owned, ONLY when Q1 just collected the answer for this server; omit when server-side ownership is already known, and always for a local server}"
     },
@@ -413,7 +417,7 @@ Capture from the successful response:
 
 ## Step 7: Write plugpass-plugin-id back to every manifest
 
-For each manifest in `{manifests}`: if its `metadata.plugpass-plugin-id` doesn't match the returned `plugin_id`, use `Edit` to set it. Add a `metadata` block if one doesn't exist yet. Preserve all other manifest fields exactly; leave a manifest already carrying the right id alone. (In SYNC mode the ids should already match — this is a verify; in REGISTER mode this is the write that links the working copy. A repo that has gained a second manifest since the last run picks the id up here.)
+For each manifest in `{manifests}`: if its plugpass-plugin-id doesn't match the returned `plugin_id`, use `Edit` to set it in its format's place — `metadata.plugpass-plugin-id` in a `claude` or `codex` manifest, adding the `metadata` block when absent, and `extensions["ai.plugpass"].pluginId` in an `agent_plugins` one, adding the `extensions` and `ai.plugpass` objects when absent. Preserve all other manifest fields exactly; leave a manifest already carrying the right id alone. (In SYNC mode the ids should already match — this is a verify; in REGISTER mode this is the write that links the working copy. A repo that has gained another manifest since the last run picks the id up here.)
 
 ## Step 8: Write plugpass-component-ids back to source
 
@@ -426,7 +430,7 @@ Preserve indentation, comments, and unrelated frontmatter fields. Do not modify 
 
 For every `tool` component in the response, stamp its plugpass id into the publisher's MCP server source so renames stay detectable across runs. Go back to the registration you read in Step 4 and add (or correct) a `_meta` field carrying `plugpass_component_id: "{plugpass_id}"`. Placement follows the server's MCP SDK — e.g. the tool-config object passed to `registerTool` in the TS SDK (`{ title, description, inputSchema, _meta: { plugpass_component_id } }`); adapt to the server's language (requires MCP protocol revision 2025-06-18+). Leave every other `_meta` field alone — `_meta.ui` is the publisher's. This is **identity only** — not the premium feature access check wrapper, which `plugpass-implement-code-changes` adds later once plans are configured. Idempotent: if `_meta.plugpass_component_id` already matches, leave it — this is also how renames stay linked across runs.
 
-`mcp_dependency` components skip this step — `.mcp.json` has no metadata slot to write an id into.
+`mcp_dependency` components skip this step — the MCP config has no metadata slot to write an id into.
 
 ## Step 9: Open the dashboard
 
